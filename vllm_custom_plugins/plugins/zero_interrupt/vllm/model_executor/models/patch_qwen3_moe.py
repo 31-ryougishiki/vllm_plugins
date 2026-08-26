@@ -1,0 +1,771 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# Copyright 2024 The Qwen team.
+# Copyright 2023 The vLLM team.
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in this library. It has been modified from its
+# original forms to accommodate minor architectural differences compared
+# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Inference-only Qwen3 MoE model compatible with HuggingFace weights."""
+
+import typing
+from collections.abc import Callable, Iterable
+from itertools import islice
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.distributed import (
+    get_ep_group,
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_gather,
+)
+
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
+from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.sequence import IntermediateTensors
+
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    MixtureOfExperts,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsPP,
+)
+from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    extract_layer_index,
+    is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
+    make_layers,
+    maybe_prefix,
+)
+
+from vllm_custom_plugins.plugins.zero_interrupt.vllm.model_executor.layers.patch_linear import (
+    QKVParallelLinearAsymmetric,
+    RowParallelLinearAsymmetric
+)
+from vllm_custom_plugins.plugins.zero_interrupt.vllm.model_executor.layers.patch_vocab_parallel_embedding import (
+    VocabParallelEmbeddingAsymmetric,
+    ParallelLMHeadAsymmetric,
+)
+
+from vllm.model_executor.models.qwen3_moe import (
+    Qwen3MoeDecoderLayer,
+    Qwen3MoeSparseMoeBlock
+)
+
+from vllm_custom_plugins.plugins.zero_interrupt.vllm.v1.executor.utils import get_tp_asymmetric_shardings
+
+
+
+
+# class PatchQwen3MoeAttention(nn.Module):
+#     """Qwen3 MoE Attention with asymmetric TP partitioning.
+
+#     [h30014172] 非对称改造：
+#     - 移除 assert self.total_num_heads % tp_size == 0
+#     - num_heads / num_kv_heads 使用非对称计算，余量归最后一个 rank
+#     - 各 rank 的 kv_size 可能不同，但 Attention 计算后经 o_proj + AllReduce
+#       仍得到正确结果（各卡输出 shape 均为 hidden_size，通信组无需修改）
+#     """
+
+#     def __init__(
+#         self,
+#         hidden_size: int,
+#         num_heads: int,
+#         num_kv_heads: int,
+#         rope_parameters: dict[str, Any],
+#         max_position_embeddings: int = 8192,
+#         head_dim: int | None = None,
+#         rms_norm_eps: float = 1e-06,
+#         qkv_bias: bool = False,
+#         cache_config: CacheConfig | None = None,
+#         quant_config: QuantizationConfig | None = None,
+#         prefix: str = "",
+#         dual_chunk_attention_config: dict[str, Any] | None = None,
+#     ) -> None:
+#         super().__init__()
+#         self.hidden_size = hidden_size
+#         tp_size = get_tensor_model_parallel_world_size()
+#         tp_rank = get_tensor_model_parallel_rank()
+#         self.total_num_heads = num_heads
+#         self.total_num_kv_heads = num_kv_heads
+#         if True:
+#             tp_asymmetric_shardings = get_tp_shardings()
+#             world_split_size = sum(tp_asymmetric_shardings)
+#             split_size = tp_asymmetric_shardings[get_tensor_model_parallel_rank()]
+#             self.num_heads = self.total_num_heads * split_size // world_split_size
+#             self.num_kv_heads = max(1, self.total_num_kv_heads * split_size // world_split_size)
+#         else:
+#             assert self.total_num_heads % tp_size == 0
+#             self.num_heads = self.total_num_heads // tp_size
+
+#             if self.total_num_kv_heads >= tp_size:
+#                 assert self.total_num_kv_heads % tp_size == 0
+#             else:
+#                 assert tp_size % self.total_num_kv_heads == 0
+#             self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+#         self.head_dim = head_dim or hidden_size // self.total_num_heads
+#         self.q_size = self.num_heads * self.head_dim
+#         self.kv_size = self.num_kv_heads * self.head_dim
+#         self.scaling = self.head_dim**-0.5
+#         self.dual_chunk_attention_config = dual_chunk_attention_config
+
+#         # from vllm.model_executor.layers.linear import QKVParallelLinear
+#         from .ops.patch_ascend_linear import PatchAscendQKVParallelLinear
+#         self.qkv_proj = PatchAscendQKVParallelLinear(
+#             hidden_size,
+#             self.head_dim,
+#             self.total_num_heads,
+#             self.total_num_kv_heads,
+#             bias=qkv_bias,
+#             quant_config=quant_config,
+#             prefix=f"{prefix}.qkv_proj",
+#             uneven_split=(self.total_num_heads % tp_size != 0 or self.total_num_kv_heads % tp_size != 0),
+#         )
+
+#         # from vllm.model_executor.layers.linear import RowParallelLinear
+#         from .ops.patch_ascend_linear import PatchAscendRowParallelLinear
+#         self.o_proj = PatchAscendRowParallelLinear(
+#             self.total_num_heads * self.head_dim,
+#             hidden_size,
+#             bias=False,
+#             quant_config=quant_config,
+#             prefix=f"{prefix}.o_proj",
+#         )
+
+#         self.rotary_emb = get_rope(
+#             self.head_dim,
+#             max_position=max_position_embeddings,
+#             rope_parameters=rope_parameters,
+#             dual_chunk_attention_config=dual_chunk_attention_config,
+#         )
+#         self.attn = Attention(
+#             self.num_heads,
+#             self.head_dim,
+#             self.scaling,
+#             num_kv_heads=self.num_kv_heads,
+#             cache_config=cache_config,
+#             quant_config=quant_config,
+#             prefix=f"{prefix}.attn",
+#             **{
+#                 "layer_idx": extract_layer_index(prefix),
+#                 "dual_chunk_attention_config": dual_chunk_attention_config,
+#             }
+#             if dual_chunk_attention_config
+#             else {},
+#         )
+#         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+#         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+
+#     def forward(
+#             self,
+#             positions: torch.Tensor,
+#             hidden_states: torch.Tensor,
+#     ) -> torch.Tensor:
+#         qkv, _ = self.qkv_proj(hidden_states)
+#         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+#         # Add qk-norm
+#         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+#         q_by_head = self.q_norm(q_by_head)
+#         q = q_by_head.view(q.shape)
+
+#         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+#         k_by_head = self.k_norm(k_by_head)
+#         k = k_by_head.view(k.shape)
+#         q, k = self.rotary_emb(positions, q, k)
+#         attn_output = self.attn(q, k, v)
+#         output, _ = self.o_proj(attn_output)
+#         return output
+
+
+# def extract_layer_index(prefix: str) -> int | None:
+#     """Extract layer index from prefix like 'model.layers.0.self_attn'."""
+#     parts = prefix.split('.')
+#     for part in parts:
+#         if part.isdigit():
+#             return int(part)
+#     return None
+
+# z30055003 支持非对称的Qwen3MoeAttention
+class Qwen3MoeAttentionAsymmetric(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        rope_parameters: dict[str, Any],
+        max_position_embeddings: int = 8192,
+        head_dim: int | None = None,
+        rms_norm_eps: float = 1e-06,
+        qkv_bias: bool = False,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        dual_chunk_attention_config: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = num_heads
+        self.total_num_kv_heads = num_kv_heads
+
+        from vllm.config import get_current_vllm_config
+        vllm_config = get_current_vllm_config()
+        additional_config = getattr(vllm_config, "additional_config", None)
+        zero_interrupt_config = additional_config.get("zero_interrupt_config", None)
+        asym = zero_interrupt_config is not None
+        # asym = True
+        if asym:
+            # tp_asymmetric_shardings = [1,1,2] if tp_size == 3 else [1,1,1,1]
+            tp_asymmetric_shardings = get_tp_asymmetric_shardings(zero_interrupt_config)
+        else:
+            tp_asymmetric_shardings = None
+        # 适配非对称的qwenattn 注意
+        if asym: # 新增计算attention head的逻辑
+            world_split_size = sum(tp_asymmetric_shardings)
+            split_size = tp_asymmetric_shardings[get_tensor_model_parallel_rank()]
+            self.num_heads = self.total_num_heads * split_size // world_split_size 
+            self.num_kv_heads = max(1, self.total_num_kv_heads * split_size // world_split_size)
+        else:
+            assert self.total_num_heads % tp_size == 0
+            self.num_heads = self.total_num_heads // tp_size
+            
+            if self.total_num_kv_heads >= tp_size:
+                # Number of KV heads is greater than TP size, so we partition
+                # the KV heads across multiple tensor parallel GPUs.
+                assert self.total_num_kv_heads % tp_size == 0
+            else:
+                # Number of KV heads is less than TP size, so we replicate
+                # the KV heads across multiple tensor parallel GPUs.
+                assert tp_size % self.total_num_kv_heads == 0
+            self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        # end
+        self.head_dim = head_dim or (hidden_size // self.total_num_heads)
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.max_position_embeddings = max_position_embeddings
+        self.dual_chunk_attention_config = dual_chunk_attention_config
+
+        # 适配 qkv row的非对称
+        if asym:
+            self.qkv_proj = QKVParallelLinearAsymmetric(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+                tp_asymmetric_shardings=tp_asymmetric_shardings,
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.qkv_proj",
+            )
+
+        if asym:
+            self.o_proj = RowParallelLinearAsymmetric(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj",
+                tp_asymmetric_shardings=tp_asymmetric_shardings,
+            )
+        else:
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.o_proj",
+            )
+        # end
+        
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=max_position_embeddings,
+            rope_parameters=rope_parameters,
+            dual_chunk_attention_config=dual_chunk_attention_config,
+        )
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
+            **{
+                "layer_idx": extract_layer_index(prefix),
+                "dual_chunk_attention_config": dual_chunk_attention_config,
+            }
+            if dual_chunk_attention_config
+            else {},
+        )
+
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Add qk-norm
+        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+        q_by_head = self.q_norm(q_by_head)
+        q = q_by_head.view(q.shape)
+
+        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+        k_by_head = self.k_norm(k_by_head)
+        k = k_by_head.view(k.shape)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+@support_torch_compile
+class Qwen3MoeModelAsymmtric(nn.Module, EagleModelMixin):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        decoder_layer_type: type[torch.nn.Module] = Qwen3MoeDecoderLayer,
+    ):
+        super().__init__()
+
+        config = vllm_config.model_config.hf_text_config
+        quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config
+        eplb_config = parallel_config.eplb_config
+        self.num_redundant_experts = eplb_config.num_redundant_experts
+
+        self.vocab_size = config.vocab_size
+        self.config = config
+        self.quant_config = quant_config
+        
+        # 选择支持非对称的 VocabParallelEmbedding TODO: 缺少判断条件
+        vllm_config = get_current_vllm_config()
+        additional_config = getattr(vllm_config, "additional_config", None)
+        zero_interrupt_config = additional_config.get("zero_interrupt_config", None)
+        asym = zero_interrupt_config is not None
+        # asym = True
+        if asym:
+            # tp_asymmetric_shardings = [1,1,2]
+            tp_asymmetric_shardings = get_tp_asymmetric_shardings(zero_interrupt_config)
+            self.embed_tokens = VocabParallelEmbeddingAsymmetric(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+                tp_asymmetric_shardings=tp_asymmetric_shardings,
+            )
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        # end
+        
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: decoder_layer_type(vllm_config=vllm_config, prefix=prefix),
+            prefix=f"{prefix}.layers",
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
+        )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+
+        aux_hidden_states = self._maybe_add_hidden_state(
+            [], self.start_layer, hidden_states, residual
+        )
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            hidden_states, residual = layer(positions, hidden_states, residual)
+            self._maybe_add_hidden_state(
+                aux_hidden_states, layer_idx + 1, hidden_states, residual
+            )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+        hidden_states, _ = self.norm(hidden_states, residual)
+
+        # Return auxiliary hidden states if collected
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
+        return hidden_states
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        return SharedFusedMoE.make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+            num_redundant_experts=self.num_redundant_experts,
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        # Skip loading extra parameters for GPTQ/modelopt models.
+        ignore_suffixes = (
+            ".bias",
+            "_bias",
+            ".weight_scale",
+            "_weight_scale",
+            ".input_scale",
+            "_input_scale",
+        )
+
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        expert_params_mapping = self.get_expert_mapping()
+        for name, loaded_weight in weights:
+            if self.quant_config is not None and (
+                scale_name := self.quant_config.get_cache_scale(name)
+            ):
+                # Loading kv cache quantization scales
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                assert loaded_weight.numel() == 1, (
+                    f"KV scale numel {loaded_weight.numel()} != 1"
+                )
+                loaded_weight = loaded_weight.squeeze()
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                continue
+            if "scale" in name or "zero_point" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if "mlp.experts" in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+
+                # Skip loading extra parameters for GPTQ/modelopt models.
+                if name.endswith(ignore_suffixes) and name not in params_dict:
+                    continue
+
+                # Skip layers on other devices.
+                if is_pp_missing_parameter(name, self):
+                    continue
+                if name.endswith("scale"):
+                    # Remapping the name of FP8 kv-scale.
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                if weight_loader == default_weight_loader:
+                    weight_loader(param, loaded_weight)
+                else:
+                    weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                is_expert_weight = False
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+
+                    # Anyway, this is an expert weight and should not be
+                    # attempted to load as other weights later
+                    is_expert_weight = True
+
+                    # Do not modify `name` since the loop may continue here
+                    # Instead, create a new variable
+                    name_mapped = name.replace(weight_name, param_name)
+
+                    if is_pp_missing_parameter(name_mapped, self):
+                        continue
+
+                    # Skip loading extra parameters for GPTQ/modelopt models.
+                    if (
+                        name_mapped.endswith(ignore_suffixes)
+                        and name_mapped not in params_dict
+                    ):
+                        continue
+
+                    param = params_dict[name_mapped]
+                    # We should ask the weight loader to return success or not
+                    # here since otherwise we may skip experts with other
+                    # available replicas.
+                    weight_loader = typing.cast(
+                        Callable[..., bool], param.weight_loader
+                    )
+                    success = weight_loader(
+                        param,
+                        loaded_weight,
+                        name_mapped,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
+                    if success:
+                        name = name_mapped
+                        break
+                else:
+                    if is_expert_weight:
+                        # We've checked that this is an expert weight
+                        # However it's not mapped locally to this rank
+                        # So we simply skip it
+                        continue
+
+                    # Skip loading extra parameters for GPTQ/modelopt models.
+                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                        continue
+                    # Skip layers on other devices.
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    if name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+
+class Qwen3MoeForCausalLMAsymmtric(
+    nn.Module, SupportsPP, SupportsLoRA, SupportsEagle, SupportsEagle3, MixtureOfExperts
+):
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ]
+    }
+
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+
+    fall_back_to_pt_during_load = False
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_text_config
+        quant_config = vllm_config.quant_config
+        self.config = config
+        self.quant_config = quant_config
+        # Only perform the following mapping when Qwen3MoeMLP exists
+        if getattr(config, "mlp_only_layers", []):
+            self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+        self.model = Qwen3MoeModelAsymmtric(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+
+        # 选择支持非对称的lmhead TODO: 缺少判断使用哪个类的条件
+        vllm_config = get_current_vllm_config()
+        additional_config = getattr(vllm_config, "additional_config", None)
+        zero_interrupt_config = additional_config.get("zero_interrupt_config", None)
+        asym = zero_interrupt_config is not None
+        # asym = True
+        if asym:
+            
+            tp_asymmetric_shardings = get_tp_asymmetric_shardings(zero_interrupt_config)
+            # tp_asymmetric_shardings = [1,1,2]
+            self.lm_head = ParallelLMHeadAsymmetric(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+                tp_asymmetric_shardings=tp_asymmetric_shardings,
+            )
+        else:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        # end
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
+        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+
+        # Set MoE hyperparameters
+        self.expert_weights = []
+
+        self.moe_layers = []
+        example_layer = None
+        for layer in self.model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+
+            assert isinstance(layer, Qwen3MoeDecoderLayer)
+            if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
+                example_layer = layer.mlp
+                self.moe_layers.append(layer.mlp.experts)
+
+        if example_layer is None:
+            raise RuntimeError("No Qwen3MoE layer found in the model.layers.")
+
+        self.num_moe_layers = len(self.moe_layers)
+        self.num_expert_groups = 1
+        self.num_shared_experts = 0
+        self.num_logical_experts = example_layer.n_logical_experts
+        self.num_physical_experts = example_layer.n_physical_experts
+        self.num_local_physical_experts = example_layer.n_local_physical_experts
+        self.num_routed_experts = example_layer.n_routed_experts
+        self.num_redundant_experts = example_layer.n_redundant_experts
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
+                moe = layer.mlp
+                moe.n_local_physical_experts = num_local_physical_experts
+                moe.n_physical_experts = num_physical_experts
+                moe.n_redundant_experts = self.num_redundant_experts
+                moe.experts.update_expert_map()
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        hidden_states = self.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
+
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return self.model.get_expert_mapping()
