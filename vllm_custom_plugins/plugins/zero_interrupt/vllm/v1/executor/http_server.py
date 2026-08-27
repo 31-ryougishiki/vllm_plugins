@@ -168,6 +168,9 @@ class ITSHttpServer:
                 enable_expert_parallel=config.get("enable_expert_parallel", False),
                 new_dp=config.get("new_dp"),
                 new_tp=config.get("new_tp"),
+                tp_asymmetric_shardings=config.get(
+                    "tp_asymmetric_shardings", None
+                ),
             )
             for config in config_list
         ]
