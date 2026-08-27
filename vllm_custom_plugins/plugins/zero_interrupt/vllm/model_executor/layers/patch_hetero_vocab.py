@@ -15,6 +15,8 @@ from math import lcm
 
 _PATCHED = False
 
+DEFAULT_PADDING_SIZE = 64
+
 
 def _is_hetero_tp() -> bool:
     from vllm.config import get_current_vllm_config_or_none
@@ -32,14 +34,15 @@ def _patched_vllm_vocab_init(
     embedding_dim,
     params_dtype=None,
     org_num_embeddings=None,
-    padding_size=None,
+    padding_size=DEFAULT_PADDING_SIZE,
     *args,
     **kwargs,
 ):
+    if padding_size is None:
+        padding_size = DEFAULT_PADDING_SIZE
     if _is_hetero_tp():
         from vllm.distributed import get_tensor_model_parallel_world_size
 
-        padding_size = padding_size or 64
         padding_size = lcm(
             padding_size, get_tensor_model_parallel_world_size()
         )
@@ -61,14 +64,15 @@ def _patched_ascend_vocab_init(
     embedding_dim,
     params_dtype=None,
     org_num_embeddings=None,
-    padding_size=None,
+    padding_size=DEFAULT_PADDING_SIZE,
     *args,
     **kwargs,
 ):
+    if padding_size is None:
+        padding_size = DEFAULT_PADDING_SIZE
     if _is_hetero_tp():
         from vllm.distributed import get_tensor_model_parallel_world_size
 
-        padding_size = padding_size or 64
         padding_size = lcm(
             padding_size, get_tensor_model_parallel_world_size()
         )
