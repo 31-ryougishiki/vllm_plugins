@@ -25,6 +25,17 @@ def apply():
     """
     logger.info("Applying ITS plugin patch")
 
+    # API server 在加载模型前就会校验 --tool-call-parser 是否注册。
+    # 先补注册 deepseek_v4（不存在 v4 parser 时回退 v32/v31/v3），
+    # 避免 api_server.validate_api_server_args 报 invalid tool call parser。
+    try:
+        from .vllm.entrypoints.openai.patch_tool_parser import (
+            apply_deepseek_v4_tool_parser_patch,
+        )
+        apply_deepseek_v4_tool_parser_patch()
+    except Exception as e:
+        logger.warning(f"Failed to register deepseek_v4 tool parser: {e}")
+
     # 应用 EngineCore patch (使用相对导入)
     try:
         from .vllm.v1.engine import \
