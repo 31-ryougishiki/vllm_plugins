@@ -10,7 +10,15 @@ from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
-from vllm.model_executor.layers.fused_moe.layer import get_compressed_expert_map
+
+try:
+    # vLLM Ascend >= 0.23.0
+    from vllm_ascend.ops.fused_moe.fused_moe import get_compressed_expert_map
+except ImportError:
+    # vLLM Ascend 0.18.x
+    from vllm.model_executor.layers.fused_moe.layer import (
+        get_compressed_expert_map,
+    )
 from vllm_ascend.ops.fused_moe.fused_moe import (AscendFusedMoE, AscendUnquantizedFusedMoEMethod)
 
 from vllm_custom_plugins.plugins.zero_interrupt.vllm_ascend.eplb.core.patch_eplb_utils import patched_init_eplb_config

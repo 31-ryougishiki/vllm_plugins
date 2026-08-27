@@ -75,132 +75,153 @@ def apply():
         # AscendMultiprocExecutor 不可用，跳过
         logger.warning(f"Failed to patch ascend MultiprocExecutor: {e}")
 
-    # 模型计算相关patch
+    # 模型计算相关patch。
+    # v0.23.0 的 AscendFusedMoE/expert_map 已经由 hetero patch 处理，
+    # 不再用 0.18 时代的 PatchAscendFusedMoE 覆盖，避免旧 API 导入错误。
     try:
-        import vllm_ascend.ops.fused_moe.fused_moe as ascend_fused_moe_module
-        import vllm_ascend.eplb.core.eplb_utils as ascend_eplb_utils_module
-        from .vllm_ascend.eplb.core.patch_eplb_utils import patched_init_eplb_config
-        from .vllm_ascend.ops.fused_moe.patch_fused_moe import PatchAscendFusedMoE
+        import vllm
+        from packaging.version import Version
 
-        ascend_fused_moe_module.AscendFusedMoE = PatchAscendFusedMoE
-        ascend_eplb_utils_module.init_eplb_config = patched_init_eplb_config
-        logger.info("Replaced AscendFusedMoE with PatchAscendFusedMoE")
-        logger.info("Replaced init_eplb_config with patched_init_eplb_config")
-    except ImportError as e:
-        # AscendFusedMoE 不可用，跳过
-        logger.warning(f"Failed to patch AscendFusedMoE: {e}")
+        _vllm_ge_023 = vllm.__version__ == "dev" or Version(vllm.__version__) >= Version("0.23.0")
+    except Exception:
+        _vllm_ge_023 = False
+
+    if _vllm_ge_023:
+        logger.info("vllm>=0.23.0: skip legacy AscendFusedMoE replacement (hetero patches cover it)")
+    else:
+        try:
+            import vllm_ascend.ops.fused_moe.fused_moe as ascend_fused_moe_module
+            import vllm_ascend.eplb.core.eplb_utils as ascend_eplb_utils_module
+            from .vllm_ascend.eplb.core.patch_eplb_utils import patched_init_eplb_config
+            from .vllm_ascend.ops.fused_moe.patch_fused_moe import PatchAscendFusedMoE
+
+            ascend_fused_moe_module.AscendFusedMoE = PatchAscendFusedMoE
+            ascend_eplb_utils_module.init_eplb_config = patched_init_eplb_config
+            logger.info("Replaced AscendFusedMoE with PatchAscendFusedMoE")
+            logger.info("Replaced init_eplb_config with patched_init_eplb_config")
+        except ImportError as e:
+            # AscendFusedMoE 不可用，跳过
+            logger.warning(f"Failed to patch AscendFusedMoE: {e}")
 
     logger.info("ITS plugin patch applied successfully")
-    
 
-    #patch 适配qwen3-30B-A3B场景下非对称，并行相关的特性如sp等暂时不支持
-    
-    # qwen2
-    import vllm.model_executor.models.qwen2 as qwen2_model
-    from .vllm.model_executor.models.patch_qwen2 import qwen2_mlp_asymmetric_init
-    qwen2_model.Qwen2MLP.__init__  = qwen2_mlp_asymmetric_init
+    if _vllm_ge_023:
+        # v0.23 路径：不加载 0.18 时代的 Qwen/varlen 模型 patch。
+        # DeepSeek-V4 由后面的 heterogeneous-TP patches 处理。
+        logger.info("vllm>=0.23.0: skip legacy Qwen/varlen asymmetric patches")
 
-    # qwen3
-    import vllm.model_executor.models.qwen3 as qwen3_model
-    from .vllm.model_executor.models.patch_qwen3 import (
-        Qwen3ForCausalLMAsymmetric,
-        Qwen3AttentionAsymmetric
-    )
-    qwen3_model.Qwen3Attention = Qwen3AttentionAsymmetric
-    qwen3_model.Qwen3ForCausalLM = Qwen3ForCausalLMAsymmetric
+        import vllm.config.model
+        from .vllm.config.patch_model_v023 import verify_with_parallel_config
 
-    # TP非对称权重加载和头数分配
-    # qwen3_moe
-    import vllm.model_executor.models.qwen3_moe as qwen3_moe_model
-    from .vllm.model_executor.models.patch_qwen3_moe import (
-        Qwen3MoeForCausalLMAsymmtric,
-        Qwen3MoeAttentionAsymmetric
-    )
-    qwen3_moe_model.Qwen3MoeAttention = Qwen3MoeAttentionAsymmetric
-    logger.info("Replaced qwen3_moe.Qwen3MoeAttention with Qwen3MoeAttentionAsymmetric")
-    qwen3_moe_model.Qwen3MoeForCausalLM = Qwen3MoeForCausalLMAsymmtric
-    logger.info("Replaced qwen3_moe.Qwen3MoeForCausalLM with Qwen3MoeForCausalLMAsymmtric")
+        vllm.config.model.ModelConfig.verify_with_parallel_config = (
+            verify_with_parallel_config
+        )
+        logger.info(
+            "Replaced verify_with_parallel_config with v0.23 patched version"
+        )
 
-    # qwen3.5 dense model asymmetric TP support
-    import vllm.model_executor.models.qwen3_5 as qwen3_5_model
-    from .vllm.model_executor.models.patch_qwen3_5 import (
-        Qwen3_5DecoderLayerAsymmetric,
-        Qwen3_5ForCausalLMAsymmetric,
-        Qwen3_5ForConditionalGenerationAsymmetric,
-        Qwen3_5GatedDeltaNetAsymmetric,
-        Qwen3_5ModelAsymmetric,
-    )
-    # Patch all Qwen3.5 classes for asymmetric TP
-    qwen3_5_model.Qwen3_5ForCausalLMBase = Qwen3_5ForCausalLMAsymmetric
-    qwen3_5_model.Qwen3_5ForCausalLM = Qwen3_5ForCausalLMAsymmetric
-    qwen3_5_model.Qwen3_5ForConditionalGeneration = Qwen3_5ForConditionalGenerationAsymmetric
-    qwen3_5_model.Qwen3_5Model = Qwen3_5ModelAsymmetric
-    qwen3_5_model.Qwen3_5DecoderLayer = Qwen3_5DecoderLayerAsymmetric
-    qwen3_5_model.Qwen3_5GatedDeltaNet = Qwen3_5GatedDeltaNetAsymmetric
-    logger.info("Replaced qwen3_5 classes with asymmetric variants: ForCausalLM, ForConditionalGeneration, Model, DecoderLayer, GatedDeltaNet")
+        # 该方法由 EngineCore 使用，提前 patch（使用 v0.23 同源实现）。
+        from vllm.v1.core import kv_cache_utils
+        from .vllm.v1.core.patch_kv_cache_utils import get_kv_cache_configs
 
-    # Qwen3-VL multimodal vision module asymmetric TP support
-    import vllm.model_executor.models.qwen3_vl as qwen3_vl_model
-    from .vllm.model_executor.models.patch_qwen3_vl import (
-        Qwen3_VisionBlockAsymmetric,
-        Qwen3_VisionMLPAsymmetric,
-        Qwen3_VisionPatchMergerAsymmetric,
-        Qwen3_VisionTransformerAsymmetric,
-    )
-    qwen3_vl_model.Qwen3_VisionMLP = Qwen3_VisionMLPAsymmetric
-    qwen3_vl_model.Qwen3_VisionBlock = Qwen3_VisionBlockAsymmetric
-    qwen3_vl_model.Qwen3_VisionPatchMerger = Qwen3_VisionPatchMergerAsymmetric
-    qwen3_vl_model.Qwen3_VisionTransformer = Qwen3_VisionTransformerAsymmetric
-    logger.info("Replaced qwen3_vl vision classes with asymmetric variants: VisionMLP, VisionBlock, VisionPatchMerger, VisionTransformer")
+        kv_cache_utils.get_kv_cache_configs = get_kv_cache_configs
+        logger.info(
+            "Replaced vllm.v1.core.kv_cache_utils.get_kv_cache_configs "
+            "with v0.23 patched version"
+        )
+    else:
+        # ============ vLLM 0.18 legacy patch path ============
+        # qwen2
+        import vllm.model_executor.models.qwen2 as qwen2_model
+        from .vllm.model_executor.models.patch_qwen2 import qwen2_mlp_asymmetric_init
+        qwen2_model.Qwen2MLP.__init__ = qwen2_mlp_asymmetric_init
 
-    # Qwen2_moe multimodal vision module asymmetric TP support qwen3.5
-    import vllm.model_executor.models.qwen2_moe as qwen2_moe_model
-    from .vllm.model_executor.models.patch_qwen2_moe import Qwen2MoeMLPAsymmetric
-    qwen2_moe_model.Qwen2MoeMLP=Qwen2MoeMLPAsymmetric
-    logger.info("Replaced Qwen2MoeMLP with Qwen2MoeMLPAsymmetric")
+        # qwen3
+        import vllm.model_executor.models.qwen3 as qwen3_model
+        from .vllm.model_executor.models.patch_qwen3 import (
+            Qwen3ForCausalLMAsymmetric,
+            Qwen3AttentionAsymmetric,
+        )
+        qwen3_model.Qwen3Attention = Qwen3AttentionAsymmetric
+        qwen3_model.Qwen3ForCausalLM = Qwen3ForCausalLMAsymmetric
 
+        # qwen3_moe
+        import vllm.model_executor.models.qwen3_moe as qwen3_moe_model
+        from .vllm.model_executor.models.patch_qwen3_moe import (
+            Qwen3MoeForCausalLMAsymmtric,
+            Qwen3MoeAttentionAsymmetric,
+        )
+        qwen3_moe_model.Qwen3MoeAttention = Qwen3MoeAttentionAsymmetric
+        qwen3_moe_model.Qwen3MoeForCausalLM = Qwen3MoeForCausalLMAsymmtric
 
-    # 变长allgather 1
-    import vllm_ascend.ops.vocab_parallel_embedding
-    from .vllm.model_executor.layers.patch_logits_processor import LogitsProcessorVarlen
-    vllm_ascend.ops.vocab_parallel_embedding.AscendLogitsProcessor = LogitsProcessorVarlen
-    logger.info("Replaced vllm_ascend.ops.vocab_parallel_embedding.AscendLogitsProcessor with LogitsProcessorVarlen")
+        # qwen3.5
+        import vllm.model_executor.models.qwen3_5 as qwen3_5_model
+        from .vllm.model_executor.models.patch_qwen3_5 import (
+            Qwen3_5DecoderLayerAsymmetric,
+            Qwen3_5ForCausalLMAsymmetric,
+            Qwen3_5ForConditionalGenerationAsymmetric,
+            Qwen3_5GatedDeltaNetAsymmetric,
+            Qwen3_5ModelAsymmetric,
+        )
+        qwen3_5_model.Qwen3_5ForCausalLMBase = Qwen3_5ForCausalLMAsymmetric
+        qwen3_5_model.Qwen3_5ForCausalLM = Qwen3_5ForCausalLMAsymmetric
+        qwen3_5_model.Qwen3_5ForConditionalGeneration = Qwen3_5ForConditionalGenerationAsymmetric
+        qwen3_5_model.Qwen3_5Model = Qwen3_5ModelAsymmetric
+        qwen3_5_model.Qwen3_5DecoderLayer = Qwen3_5DecoderLayerAsymmetric
+        qwen3_5_model.Qwen3_5GatedDeltaNet = Qwen3_5GatedDeltaNetAsymmetric
 
-    # 变长allgather 2
-    from .vllm.distributed.communication_op import tensor_model_parallel_all_gather_varlen
-    import vllm.distributed
-    vllm.distributed.tensor_model_parallel_all_gather_varlen = tensor_model_parallel_all_gather_varlen
-    logger.info("Replaced vllm.distributed.tensor_model_parallel_all_gather_varlen with tensor_model_parallel_all_gather_varlen")
-    
-    # 变长allgather 3
-    import vllm_ascend.distributed.device_communicators.npu_communicator
-    from .vllm.distributed.device_communicators.patch_base_device_communicator import all_gather_varlen
-    vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator.all_gather_varlen = all_gather_varlen
-    logger.info("Add vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator.all_gather_varlen")
-    
-    import vllm.config.model
-    from .vllm.config.patch_model import verify_with_parallel_config
-    vllm.config.model.ModelConfig.verify_with_parallel_config = verify_with_parallel_config
-    logger.info("Replaced verify_with_parallel_config with patched version")
-    
-    # TP非对称权重加载和头数分配
-    # 此方法被EngineCore使用, 需要提前patch
-    # import vllm.v1.core
-    from vllm.v1.core import kv_cache_utils
-    from .vllm.v1.core.patch_kv_cache_utils import get_kv_cache_configs
+        # qwen3_vl
+        import vllm.model_executor.models.qwen3_vl as qwen3_vl_model
+        from .vllm.model_executor.models.patch_qwen3_vl import (
+            Qwen3_VisionBlockAsymmetric,
+            Qwen3_VisionMLPAsymmetric,
+            Qwen3_VisionPatchMergerAsymmetric,
+            Qwen3_VisionTransformerAsymmetric,
+        )
+        qwen3_vl_model.Qwen3_VisionMLP = Qwen3_VisionMLPAsymmetric
+        qwen3_vl_model.Qwen3_VisionBlock = Qwen3_VisionBlockAsymmetric
+        qwen3_vl_model.Qwen3_VisionPatchMerger = Qwen3_VisionPatchMergerAsymmetric
+        qwen3_vl_model.Qwen3_VisionTransformer = Qwen3_VisionTransformerAsymmetric
 
-    kv_cache_utils.get_kv_cache_configs = get_kv_cache_configs
-    logger.info("Replaced vllm.v1.core.kv_cache_utils.get_kv_cache_configs with patched version")
-    # end
+        # qwen2_moe
+        import vllm.model_executor.models.qwen2_moe as qwen2_moe_model
+        from .vllm.model_executor.models.patch_qwen2_moe import Qwen2MoeMLPAsymmetric
+        qwen2_moe_model.Qwen2MoeMLP = Qwen2MoeMLPAsymmetric
 
-    # Mamba layer asymmetric TP support
-    try:
-        import vllm.model_executor.layers.mamba.mamba_mixer2 as mamba_module
-        from .vllm.model_executor.layers.mamba.patch_mamba_mixer2 import mamba_v2_sharded_weight_loader_asymmetric
-        mamba_module.mamba_v2_sharded_weight_loader = mamba_v2_sharded_weight_loader_asymmetric
-        logger.info("Patched mamba_v2_sharded_weight_loader for asymmetric TP support")
-    except ImportError as e:
-        logger.warning(f"Failed to patch Mamba layer: {e}")
+        # 变长 allgather 系列
+        import vllm_ascend.ops.vocab_parallel_embedding
+        from .vllm.model_executor.layers.patch_logits_processor import LogitsProcessorVarlen
+        vllm_ascend.ops.vocab_parallel_embedding.AscendLogitsProcessor = LogitsProcessorVarlen
+
+        from .vllm.distributed.communication_op import tensor_model_parallel_all_gather_varlen
+        import vllm.distributed
+        vllm.distributed.tensor_model_parallel_all_gather_varlen = tensor_model_parallel_all_gather_varlen
+
+        import vllm_ascend.distributed.device_communicators.npu_communicator
+        from .vllm.distributed.device_communicators.patch_base_device_communicator import all_gather_varlen
+        vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator.all_gather_varlen = all_gather_varlen
+
+        import vllm.config.model
+        from .vllm.config.patch_model import verify_with_parallel_config
+
+        vllm.config.model.ModelConfig.verify_with_parallel_config = verify_with_parallel_config
+        logger.info("Replaced verify_with_parallel_config with patched version")
+
+        from vllm.v1.core import kv_cache_utils
+        from .vllm.v1.core.patch_kv_cache_utils import get_kv_cache_configs
+
+        kv_cache_utils.get_kv_cache_configs = get_kv_cache_configs
+        logger.info("Replaced vllm.v1.core.kv_cache_utils.get_kv_cache_configs with patched version")
+
+    # Mamba layer asymmetric TP support (legacy vLLM only)
+    if not _vllm_ge_023:
+        try:
+            import vllm.model_executor.layers.mamba.mamba_mixer2 as mamba_module
+            from .vllm.model_executor.layers.mamba.patch_mamba_mixer2 import mamba_v2_sharded_weight_loader_asymmetric
+            mamba_module.mamba_v2_sharded_weight_loader = mamba_v2_sharded_weight_loader_asymmetric
+            logger.info("Patched mamba_v2_sharded_weight_loader for asymmetric TP support")
+        except ImportError as e:
+            logger.warning(f"Failed to patch Mamba layer: {e}")
 
     # ==================================================================
     # DeepSeek-V4 DP4TP4 -> DP4TP(3,4,4,4) heterogeneous-TP restart

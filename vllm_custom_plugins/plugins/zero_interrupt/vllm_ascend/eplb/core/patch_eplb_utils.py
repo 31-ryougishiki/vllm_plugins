@@ -5,7 +5,17 @@ from collections import defaultdict
 import numpy as np
 import torch
 from vllm.logger import logger
-from vllm.model_executor.layers.fused_moe.layer import determine_expert_map
+
+try:
+    # vLLM >= 0.23.0
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+        determine_expert_map,
+    )
+except ImportError:
+    # vLLM 0.18.x
+    from vllm.model_executor.layers.fused_moe.layer import (
+        determine_expert_map,
+    )
 from vllm_ascend.eplb.core.eplb_utils import (
     expert_file_to_tensor,
     generate_global_placement,
