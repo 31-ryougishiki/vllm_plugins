@@ -23,6 +23,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+import msgspec
+
 if TYPE_CHECKING:
     from vllm.config import ParallelConfig, VllmConfig
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -34,6 +36,28 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger("vllm_custom_plugins")
+
+
+class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
+    """Extended Mooncake handshake metadata for heterogeneous TP.
+
+    Defined at module scope (instead of inside ``apply_hetero_mooncake_patch``)
+    so worker-constructed instances can be pickled across the
+    ``MessageQueue`` / ``collective_rpc`` boundary.  A class local to a
+    function has no importable ``__module__.<qualname>`` and therefore cannot
+    be serialized by ``pickle.dumps``.
+    """
+
+    engine_id: str
+    te_rpc_port: int
+    block_size: int
+    kv_caches_base_addr: list[int]
+    num_blocks: int
+    block_lens: list[int]
+    ssm_sizes: tuple[int, int]
+    local_ip: str = ""
+    handshake_port: int = 0
+    block_strides: list[int] = msgspec.field(default_factory=list)
 
 
 def get_dp_side_channel_port_offset(parallel_config: ParallelConfig) -> int:
@@ -956,32 +980,17 @@ def apply_hetero_mooncake_patch():
         dict with ``patched`` (list of patched symbols) and ``mismatches``
         (list of signature/missing-target problems).
     """
-    import msgspec
-
     import vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector as mod
 
     patched: list[str] = []
     mismatches: list[str] = []
 
     # The stock v0.23 MooncakeAgentMetadata lacks the fields introduced by
-    # hetero_cp.  Replace the module-level msgspec struct with an extended one
-    # so worker-constructed metadata carries handshake_port/block_strides and
-    # scheduler-side decodes keep working.
-    class PatchedMooncakeAgentMetadata(
-        msgspec.Struct, omit_defaults=True, dict=True
-    ):
-        engine_id: str
-        te_rpc_port: int
-        block_size: int
-        kv_caches_base_addr: list[int]
-        num_blocks: int
-        block_lens: list[int]
-        ssm_sizes: tuple[int, int]
-        local_ip: str = ""
-        handshake_port: int = 0
-        block_strides: list[int] = msgspec.field(default_factory=list)
-
-    mod.MooncakeAgentMetadata = PatchedMooncakeAgentMetadata
+    # hetero_cp.  Replace the module-level msgspec struct with the extended
+    # module-scope struct defined above so worker-constructed metadata carries
+    # handshake_port/block_strides and remains pickleable when returned through
+    # collective_rpc / MessageQueue.
+    mod.MooncakeAgentMetadata = MooncakeAgentMetadata
     patched.append("mooncake_hybrid_connector.MooncakeAgentMetadata")
 
     # Module-level helper.  Inject into the target module's globals so the
@@ -1054,6 +1063,7 @@ def apply_hetero_mooncake_patch():
 # ---------------------------------------------------------------------------
 # The stock v0.23 MooncakeAgentMetadata lacks the ``handshake_port`` and
 # ``block_strides`` fields introduced by hetero_cp.  apply_hetero_mooncake_patch
-# replaces the module-level msgspec struct with an extended subclass-style
-# struct (see PatchedMooncakeAgentMetadata above), so worker-constructed
-# metadata and scheduler-side decodes both carry the extra fields.
+# replaces the module-level msgspec struct with the extended module-scope
+# ``MooncakeAgentMetadata`` defined at the top of this file, so
+# worker-constructed metadata and scheduler-side decodes both carry the extra
+# fields and remain pickleable across worker/engine process boundaries.
