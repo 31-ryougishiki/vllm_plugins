@@ -69,6 +69,9 @@ def _patched_set_ascend_forward_context(
         forward_context.input_ids = input_ids
 
         import vllm_ascend.ascend_forward_context as afc
+        from vllm_ascend.ops.fused_moe.moe_comm_method import (
+            get_moe_comm_method,
+        )
 
         max_num_tokens = (
             int(num_tokens_across_dp.max().item())
@@ -78,7 +81,7 @@ def _patched_set_ascend_forward_context(
             max_num_tokens, vllm_config, is_draft_model
         )
         forward_context.moe_comm_type = moe_comm_type
-        forward_context.moe_comm_method = afc.get_moe_comm_method(moe_comm_type)
+        forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
 
         tp_world_size = get_tensor_model_parallel_world_size()
         forward_context.in_profile_run = in_profile_run
