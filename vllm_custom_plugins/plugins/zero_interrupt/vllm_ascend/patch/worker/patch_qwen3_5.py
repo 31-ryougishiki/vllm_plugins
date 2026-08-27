@@ -18,362 +18,24 @@
 
 
 import torch
-from einops import rearrange
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
-from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5GatedDeltaNet
+from vllm.distributed.parallel_state import get_pp_group
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention as _GDNBaseCls
+from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
+
+try:
+    from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MultiTokenPredictor
+    from vllm.sequence import IntermediateTensors
+except ImportError:
+    Qwen3_5MultiTokenPredictor = None
+    IntermediateTensors = None
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
-from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
-from vllm_ascend.ops.triton.fla.sigmoid_gating import fused_sigmoid_gating_delta_rule_update
-from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+from vllm_ascend.utils import is_310p
 
-
-def to_int64_tuple(t):
-    t = t.to(torch.int64)
-    if t.dim() == 0:
-        return (t.item(),)
-    return tuple(t.tolist())
-
-
-class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        output: torch.Tensor,
-    ):
-        """
-        Forward pass with three parts:
-        1. Input projection
-        2. Core attention (custom op)
-        3. Output projection
-        """
-
-        # ============================================================
-        # Part 1: Input Projection
-        # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        num_tokens = mixed_qkvz.size(0)
-        # Calculate local dimensions for asymmetric TP
-        # For asymmetric TP (TP=3 with shardings [1,1,2]):
-        # - TP0/1: split_size=1, world_split_size=4 -> local_qkv_size, local_z_size
-        # - TP2: split_size=2, world_split_size=4 -> local_qkv_size, local_z_size
-        if hasattr(self, 'asym') and self.asym and hasattr(self, 'tp_asymmetric_shardings') and self.tp_asymmetric_shardings is not None:
-            world_split_size = sum(self.tp_asymmetric_shardings)
-            split_size = self.tp_asymmetric_shardings[self.tp_rank]
-            local_qkv_size = (self.key_dim * 2 + self.value_dim) * split_size // world_split_size
-            local_z_size = self.value_dim * split_size // world_split_size
-            local_num_v_heads = self.num_v_heads * split_size // world_split_size
-        else:
-            # Symmetric TP path
-            local_qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-            local_z_size = self.value_dim // self.tp_size
-            local_num_v_heads = self.num_v_heads // self.tp_size
-
-        mixed_qkv, z = mixed_qkvz.split([local_qkv_size, local_z_size], dim=-1)
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
-
-        ba, _ = self.in_proj_ba(hidden_states)
-
-        b, a = ba.chunk(2, dim=-1)
-        b = b.contiguous()
-        a = a.contiguous()
-
-        # ============================================================
-        # Part 2: Core Attention (Custom Op)
-        # ============================================================
-        # Use local_num_v_heads computed above for asymmetric TP
-        core_attn_out = torch.zeros(
-            (num_tokens, local_num_v_heads, self.head_v_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
-        torch.ops.vllm.gdn_attention_core(
-            mixed_qkv,
-            b,
-            a,
-            core_attn_out,
-            self.prefix,
-        )
-
-
-
-        # ============================================================
-        # Part 3: Output Projection
-        # ============================================================
-        z_shape_og = z.shape
-        # Reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        o_out, _ = self.out_proj(core_attn_out)
-        actual_num_tokens = o_out.shape[0]
-        output[:actual_num_tokens] = o_out
-
-    def _forward_core(
-        self,
-        mixed_qkv: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        core_attn_out: torch.Tensor,
-    ):
-        # Core attention computation (called by custom op).
-
-        # NOTE: The processing logic of Qwen3_5GatedDeltaNet is the same as Qwen3NextGatedDeltaNet.
-        # However, because the ops `torch_npu.npu_recurrent_gated_delta_rule`
-        # currently does not support `ssm_state` inputs in float32 format,
-        # we temporarily retain the current _forward_core implementation.
-        # Once the ops supports float32 `ssm_state`, this patch should be removed.
-
-        forward_context = get_forward_context()
-        attn_metadata: AttentionMetadata = forward_context.attn_metadata
-
-        if attn_metadata is None:
-            # V1 profile run
-            return
-
-        assert isinstance(attn_metadata, dict)
-        attn_metadata = attn_metadata[self.prefix]
-        assert isinstance(attn_metadata, GDNAttentionMetadata)
-        has_initial_state = attn_metadata.has_initial_state
-        spec_query_start_loc = attn_metadata.spec_query_start_loc
-        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-        spec_sequence_masks = attn_metadata.spec_sequence_masks
-        spec_token_indx = attn_metadata.spec_token_indx
-        non_spec_token_indx = attn_metadata.non_spec_token_indx
-        spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
-        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
-        self_kv_cache = self.kv_cache[forward_context.virtual_engine if vllm_version_is("0.18.0") else 0]
-        conv_state = self_kv_cache[0].transpose(-1, -2)
-        ssm_state = self_kv_cache[1]
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        num_accepted_tokens = attn_metadata.num_accepted_tokens
-
-        mixed_qkv = mixed_qkv[:num_actual_tokens]
-        b = b[:num_actual_tokens]
-        a = a[:num_actual_tokens]
-
-        # 1. Convolution sequence transformation
-        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-        if spec_sequence_masks is not None:
-            if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-                mixed_qkv_spec = mixed_qkv
-                mixed_qkv_non_spec = None
-            else:
-                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
-                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
-        else:
-            mixed_qkv_spec = None
-            mixed_qkv_non_spec = mixed_qkv
-
-        # 1.1: Process the multi-query part
-        if spec_sequence_masks is not None:
-            mixed_qkv_spec = causal_conv1d_update(
-                mixed_qkv_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][: attn_metadata.num_spec_decodes],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                max_query_len=spec_state_indices_tensor.size(-1),
-                validate_data=False,
-            )
-
-        # 1.2: Process the remaining part
-        if attn_metadata.num_prefills > 0:
-            if mixed_qkv_non_spec is not None:
-                conv_weights_T = conv_weights.transpose(0, 1)
-                activation_num = 1 if self.activation else 0
-                mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
-                    mixed_qkv_non_spec,
-                    conv_weights_T,
-                    conv_state=self_kv_cache[0],
-                    bias_opt=self.conv1d.bias,
-                    query_start_loc_opt=to_int64_tuple(non_spec_query_start_loc),
-                    cache_indices_opt=to_int64_tuple(non_spec_state_indices_tensor),
-                    initial_state_mode_opt=to_int64_tuple(has_initial_state),
-                    num_accepted_tokens_opt=[],
-                    activation_mode=activation_num,
-                    pad_slot_id=PAD_SLOT_ID,
-                    run_mode=0,
-                )
-        elif attn_metadata.num_decodes > 0:
-            mixed_qkv_non_spec = causal_conv1d_update(
-                mixed_qkv_non_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_actual_tokens],
-                validate_data=True,
-            )
-        else:
-            mixed_qkv_non_spec = None
-        query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
-        query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
-
-        if attn_metadata.num_prefills > 0 or spec_sequence_masks is not None:
-            g, beta = fused_gdn_gating_patch(self.A_log, a, b, self.dt_bias)
-            if spec_sequence_masks is not None:
-                if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-                    g_spec = g
-                    beta_spec = beta
-                    g_non_spec = None
-                    beta_non_spec = None
-                else:
-                    g_spec = g.index_select(1, spec_token_indx)
-                    beta_spec = beta.index_select(1, spec_token_indx)
-                    g_non_spec = g.index_select(1, non_spec_token_indx)
-                    beta_non_spec = beta.index_select(1, non_spec_token_indx)
-            else:
-                g_spec = None
-                beta_spec = None
-                g_non_spec = g
-                beta_non_spec = beta
-
-            # 2. Recurrent attention
-
-            # 2.1: Process the multi-query part
-            if spec_sequence_masks is not None:
-                core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
-                    q=query_spec,
-                    k=key_spec,
-                    v=value_spec,
-                    g=g_spec,
-                    beta=beta_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
-                    ssm_state_indices=spec_state_indices_tensor,
-                    num_accepted_tokens=num_accepted_tokens,
-                    use_qk_l2norm_in_kernel=True,
-                )
-            else:
-                core_attn_out_spec, last_recurrent_state = None, None
-
-            # 2.2: Process the remaining part
-            if attn_metadata.num_prefills > 0:
-                initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
-                initial_state[~has_initial_state, ...] = 0
-                non_spec_chunked_prefill_meta = getattr(
-                    attn_metadata,
-                    "non_spec_chunked_prefill_meta",
-                    None,
-                )
-                (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
-                ) = chunk_gated_delta_rule(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc,
-                    prebuilt_meta=non_spec_chunked_prefill_meta,
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True,
-                )
-                # Init cache
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype)
-            elif attn_metadata.num_decodes > 0:
-                core_attn_out_non_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
-                    q=query_non_spec,
-                    k=key_non_spec,
-                    v=value_non_spec,
-                    g=g_non_spec,
-                    beta=beta_non_spec,
-                    initial_state=ssm_state,
-                    inplace_final_state=True,
-                    cu_seqlens=non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
-                    ssm_state_indices=non_spec_state_indices_tensor,
-                    use_qk_l2norm_in_kernel=True,
-                )
-            else:
-                core_attn_out_non_spec, last_recurrent_state = None, None
-
-        elif attn_metadata.num_decodes > 0:
-            core_attn_out_non_spec = fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log.contiguous(),
-                dt_bias=self.dt_bias.contiguous(),
-                q=query_non_spec.contiguous(),
-                k=key_non_spec.contiguous(),
-                v=value_non_spec.contiguous(),
-                a=a.contiguous(),
-                b=b.contiguous(),
-                initial_state_source=ssm_state,
-                initial_state_indices=non_spec_state_indices_tensor,
-                cu_seqlens=non_spec_query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-            )
-
-        # 3. Merge core attention output
-        if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
-            merged_out = torch.empty(
-                (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
-                dtype=core_attn_out_non_spec.dtype,
-                device=core_attn_out_non_spec.device,
-            )
-            merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
-            merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
-            core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
-        elif spec_sequence_masks is not None:
-            core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-        else:
-            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
-            
-        maybe_save_kv_layer_to_connector("", [])
-
-    def rearrange_mixed_qkv(self, mixed_qkv):
-        """Override rearrange_mixed_qkv for asymmetric TP support.
-
-        For asymmetric TP (TP=3 with shardings [1,1,2]):
-        - The mixed_qkv tensor already contains locally-sized QKV data
-        - We need to split it using local dimensions, not self.tp_size
-        """
-        if mixed_qkv is None:
-            return None, None, None
-
-        # Calculate local dimensions for asymmetric TP
-        if hasattr(self, 'asym') and self.asym and hasattr(self, 'tp_asymmetric_shardings') and self.tp_asymmetric_shardings is not None:
-            world_split_size = sum(self.tp_asymmetric_shardings)
-            split_size = self.tp_asymmetric_shardings[self.tp_rank]
-            local_key_size = self.key_dim * split_size // world_split_size
-            local_value_size = self.value_dim * split_size // world_split_size
-
-        else:
-            # Symmetric TP path
-            local_key_size = self.key_dim // self.tp_size
-            local_value_size = self.value_dim // self.tp_size
-
-        query, key, value = torch.split(
-            mixed_qkv,
-            [local_key_size, local_key_size, local_value_size],
-            dim=-1,
-        )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-            (query, key),
-        )
-        value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
-
-        return query.contiguous(), key.contiguous(), value.contiguous()
+_GDN_PATCH_TARGET = _GDNBaseCls
 
 
 class AscendQwen3NextAttention(Qwen3NextAttention):
@@ -486,8 +148,62 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
         return hidden_states, residual
 
 
-Qwen3_5GatedDeltaNet.forward = AscendQwen3_5GatedDeltaNet.forward
-Qwen3_5GatedDeltaNet._forward_core = AscendQwen3_5GatedDeltaNet._forward_core
-Qwen3_5GatedDeltaNet.rearrange_mixed_qkv = AscendQwen3_5GatedDeltaNet.rearrange_mixed_qkv
-Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
+if Qwen3_5MultiTokenPredictor is not None:
+
+    def qwen3_5_mtp_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        # Backport upstream Qwen3.5 MTP behavior: the local drafter runs on the
+        # last PP stage and should always combine token embeddings with the
+        # target hidden states instead of consuming PP intermediate tensors.
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+        inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+        hidden_states = self.pre_fc_norm_hidden(hidden_states)
+        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+        hidden_states = self.fc(hidden_states)
+        residual = None
+
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        hidden_states, residual = self.layers[current_step_idx](
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
+        )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
+    Qwen3_5MultiTokenPredictor.forward = qwen3_5_mtp_forward
+
+
 Qwen3_5DecoderLayer.forward = AscendQwen3_5DecoderLayer.forward
+Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
+_GDN_PATCH_TARGET._split_ba_for_tp = AscendGatedDeltaNetAttention._split_ba_for_tp
+_GDN_PATCH_TARGET.get_state_shape = AscendGatedDeltaNetAttention.get_state_shape
+_GDN_PATCH_TARGET.get_attn_backend = AscendGatedDeltaNetAttention.get_attn_backend
+
+if is_310p():
+    from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310
+
+    _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention310._forward_core
+    _GDN_PATCH_TARGET.get_state_dtype = AscendGatedDeltaNetAttention310.get_state_dtype
+else:
+    _GDN_PATCH_TARGET.forward = AscendGatedDeltaNetAttention.forward
+    _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention._forward_core
+    _GDN_PATCH_TARGET._warmup_prefill_kernels = AscendGatedDeltaNetAttention._warmup_prefill_kernels

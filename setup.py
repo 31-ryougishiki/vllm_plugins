@@ -49,7 +49,8 @@ if find_vllm_ascend_result.returncode == 0:
     print(f"Start replacing rotary_embedding.py...")
     vllm_ascend_path = find_vllm_ascend_result.stdout.strip()
     rotary_emb_path = os.path.join(os.path.dirname(vllm_ascend_path), 'ops', 'rotary_embedding.py')
-    src_path = os.path.join(os.path.dirname(__file__), 'vllm_custom_plugins', 'plugins', 'vllm_ascend','ops',
+    src_path = os.path.join(os.path.dirname(__file__), 'vllm_custom_plugins', 'plugins',
+                            'zero_interrupt', 'vllm_ascend', 'ops',
                             'triton', 'rotary_embedding.py')
     print(f"src_path={src_path}, rotary_emb_path={rotary_emb_path}")
     replace_file_content(src_path, rotary_emb_path)

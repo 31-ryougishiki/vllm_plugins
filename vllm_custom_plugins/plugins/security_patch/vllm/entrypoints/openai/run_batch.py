@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-import base64
+import contextlib
+import json
 import sys
 import tempfile
 from argparse import Namespace
@@ -13,12 +14,15 @@ from typing import Any, TypeAlias
 from urllib.parse import urlparse
 
 import aiohttp
+import pybase64 as base64
+import pydantic
 import torch
 from fastapi import UploadFile
 from prometheus_client import start_http_server
 from pydantic import Field, TypeAdapter, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 from starlette.datastructures import State
+from starlette.responses import JSONResponse
 from tqdm import tqdm
 from urllib3.util import parse_url
 
@@ -37,25 +41,28 @@ from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     OpenAIBaseModel,
 )
-from vllm.entrypoints.openai.speech_to_text.protocol import (
-    TranscriptionRequest,
-    TranscriptionResponse,
-    TranscriptionResponseVerbose,
-    TranslationRequest,
-    TranslationResponse,
-    TranslationResponseVerbose,
-)
 from vllm.entrypoints.pooling.embed.protocol import (
     EmbeddingRequest,
     EmbeddingResponse,
 )
-from vllm.entrypoints.pooling.score.protocol import (
+from vllm.entrypoints.pooling.scoring.protocol import (
     RerankRequest,
     RerankResponse,
     ScoreRequest,
     ScoreResponse,
 )
-from vllm.entrypoints.utils import create_error_response
+from vllm.entrypoints.serve.utils.error_response import create_error_response
+from vllm.entrypoints.speech_to_text.transcription.protocol import (
+    TranscriptionRequest,
+    TranscriptionResponse,
+    TranscriptionResponseVerbose,
+)
+from vllm.entrypoints.speech_to_text.translation.protocol import (
+    TranslationRequest,
+    TranslationResponse,
+    TranslationResponseVerbose,
+)
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.reasoning import ReasoningParserManager
 from vllm.utils import random_uuid
@@ -88,9 +95,10 @@ class BatchTranscriptionRequest(TranscriptionRequest):
     def validate_no_file(cls, data: Any):
         """Ensure file field is not provided in batch requests."""
         if isinstance(data, dict) and "file" in data:
-            raise ValueError(
+            raise VLLMValidationError(
                 "The 'file' field is not supported in batch requests. "
-                "Use 'file_url' instead."
+                "Use 'file_url' instead.",
+                parameter="file",
             )
         return data
 
@@ -118,9 +126,10 @@ class BatchTranslationRequest(TranslationRequest):
     def validate_no_file(cls, data: Any):
         """Ensure file field is not provided in batch requests."""
         if isinstance(data, dict) and "file" in data:
-            raise ValueError(
+            raise VLLMValidationError(
                 "The 'file' field is not supported in batch requests. "
-                "Use 'file_url' instead."
+                "Use 'file_url' instead.",
+                parameter="file",
             )
         return data
 
@@ -177,6 +186,18 @@ class BatchRequestInput(OpenAIBaseModel):
         return TypeAdapter(BatchRequestInputBody).validate_python(value)
 
 
+AllResponse: TypeAlias = (
+    ChatCompletionResponse
+    | EmbeddingResponse
+    | ScoreResponse
+    | RerankResponse
+    | TranscriptionResponse
+    | TranscriptionResponseVerbose
+    | TranslationResponse
+    | TranslationResponseVerbose
+)
+
+
 class BatchResponseData(OpenAIBaseModel):
     # HTTP status code of the response.
     status_code: int = 200
@@ -185,17 +206,7 @@ class BatchResponseData(OpenAIBaseModel):
     request_id: str
 
     # The body of the response.
-    body: (
-        ChatCompletionResponse
-        | EmbeddingResponse
-        | ScoreResponse
-        | RerankResponse
-        | TranscriptionResponse
-        | TranscriptionResponseVerbose
-        | TranslationResponse
-        | TranslationResponseVerbose
-        | None
-    ) = None
+    body: AllResponse | None = None
 
 
 class BatchRequestOutput(OpenAIBaseModel):
@@ -450,6 +461,7 @@ async def download_bytes_from_url(
         allowed_media_domains: If set, only HTTP/HTTPS URLs whose hostname
             is in this list are permitted. data: URLs are not subject to
             this restriction.
+
     Returns:
         Data as bytes
     """
@@ -532,19 +544,13 @@ async def run_request(
     except Exception as e:
         response = create_error_response(e)
 
-    if isinstance(
-        response,
-        (
-            ChatCompletionResponse,
-            EmbeddingResponse,
-            ScoreResponse,
-            RerankResponse,
-            TranscriptionResponse,
-            TranscriptionResponseVerbose,
-            TranslationResponse,
-            TranslationResponseVerbose,
-        ),
-    ):
+    if isinstance(response, JSONResponse):
+        with contextlib.suppress(pydantic.ValidationError):
+            response = TypeAdapter(AllResponse | ErrorResponse).validate_python(
+                json.loads(response.body)
+            )
+
+    if isinstance(response, AllResponse):
         batch_output = BatchRequestOutput(
             id=f"vllm-{random_uuid()}",
             custom_id=request.custom_id,
@@ -741,14 +747,14 @@ async def build_endpoint_registry(
         "score": {
             "url_matcher": lambda url: url.endswith("/score"),
             "handler_getter": lambda: (
-                serving_scores.create_score if serving_scores is not None else None
+                serving_scores if serving_scores is not None else None
             ),
             "wrapper_fn": None,
         },
         "rerank": {
             "url_matcher": lambda url: url.endswith("/rerank"),
             "handler_getter": lambda: (
-                serving_scores.do_rerank if serving_scores is not None else None
+                serving_scores if serving_scores is not None else None
             ),
             "wrapper_fn": None,
         },
@@ -858,7 +864,6 @@ async def main(args: Namespace):
     async with build_async_engine_client(
         args,
         usage_context=UsageContext.OPENAI_BATCH_RUNNER,
-        disable_frontend_multiprocessing=False,
     ) as engine_client:
         await run_batch(engine_client, args)
 

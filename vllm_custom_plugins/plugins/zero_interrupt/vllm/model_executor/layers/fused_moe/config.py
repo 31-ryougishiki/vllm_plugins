@@ -6,8 +6,8 @@ from typing import Union
 
 import torch
 
-import vllm.envs as envs
-from vllm.config import ParallelConfig
+from vllm.config import ParallelConfig, SchedulerConfig
+from vllm.config.kernel import MoEBackend
 from vllm.distributed import get_dp_group, get_pcp_group, get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -102,23 +102,31 @@ def _quant_flags_to_group_shape(
 class RoutingMethodType(IntEnum):
     # Default: Softmax -> TopK
     Default = (0,)
-    # Renormalize: TopK -> Softmax/Sigmoid
+    # Renormalize: TopK -> Softmax
     Renormalize = (1,)
     # DeepSeekV3: Sigmoid -> RoutingBiasAdd -> Top2 in group -> Top4 groups
     # -> Top8 experts from the Top4 groups
     DeepSeekV3 = (2,)
     # Llama4: Top1 -> Sigmoid
     Llama4 = (3,)
-    # RenormalizeNaive: Softmax/Sigmoid -> TopK -> Renormalize
+    # RenormalizeNaive: Softmax -> TopK -> Renormalize
     RenormalizeNaive = (4,)
     # TopK: TopK (no softmax)
     TopK = (5,)
-    # Custom
-    Custom = (6,)
-    # Simulated
-    Simulated = (7,)
+    # SigmoidRenorm: Sigmoid -> TopK -> Renormalize (divide by sum of top-K)
+    SigmoidRenorm = (6,)
+    # MiniMax2: Sigmoid + Bias -> TopK -> ScaledSumNormalize
+    # (routeScale=1.0, epsilon=1e-20)
+    MiniMax2 = (7,)
+    # Sigmoid: Sigmoid -> TopK (no renormalization)
+    Sigmoid = (8,)
     # Unspecified
-    Unspecified = 8.0
+    Unspecified = (9,)
+    # other routing types (not passed to FlashInfer kernels)
+    # Deepseek V4 -> sqrtsoftplus + Bias + Normalize
+    DeepseekV4 = (100,)
+    Custom = (101,)
+    Simulated = (102,)
 
 
 def get_routing_method_type(
@@ -127,22 +135,36 @@ def get_routing_method_type(
     renormalize: bool,
     num_expert_group: int | None,
     has_e_score_bias: bool,
+    routed_scaling_factor: float | None = 1.0,
 ) -> RoutingMethodType:
+    if scoring_func == "sqrtsoftplus":
+        # DeepSeek V4 uses sqrtsoftplus routing with optional routing bias
+        # and top-k renormalization.
+        if renormalize:
+            return RoutingMethodType.DeepseekV4
+        else:
+            return RoutingMethodType.Unspecified
+
     if has_e_score_bias:
-        if (num_expert_group or 0) > 0 and scoring_func == "sigmoid":
-            return RoutingMethodType.DeepSeekV3
+        if scoring_func == "sigmoid":
+            if not renormalize:
+                return RoutingMethodType.Unspecified
+            if (num_expert_group or 0) > 0:
+                return RoutingMethodType.DeepSeekV3
+            if routed_scaling_factor in (None, 1.0):
+                return RoutingMethodType.MiniMax2
+            return RoutingMethodType.Unspecified
         else:
             return RoutingMethodType.Unspecified
 
     if scoring_func == "sigmoid":
-        if top_k == 1:
-            return RoutingMethodType.Llama4
-        else:
-            return RoutingMethodType.Unspecified
+        if renormalize:
+            return RoutingMethodType.SigmoidRenorm
+        return RoutingMethodType.Sigmoid
 
     if scoring_func == "softmax":
         if renormalize:
-            return RoutingMethodType.Renormalize
+            return RoutingMethodType.RenormalizeNaive
         else:
             return RoutingMethodType.Default
 
@@ -228,7 +250,16 @@ class FusedMoEQuantConfig:
     _a2: FusedMoEQuantDesc
     _w1: FusedMoEQuantDesc
     _w2: FusedMoEQuantDesc
-    is_nvfp4_scale_swizzled: bool = True
+    is_scale_swizzled: bool = True
+
+    # MXFP4-specific TRTLLM parameters for SwiGLU activation clamping.
+    # These correspond to gemm1_alpha, gemm1_beta, gemm1_clamp_limit
+    # in TrtLlmMxfp4ExpertsBase.
+    gemm1_alpha: float | None = None
+    gemm1_beta: float | None = None
+    gemm1_clamp_limit: float | None = None
+
+    mx_alignment: int = 0
 
     def __post_init__(self):
         assert not self.per_act_token_quant or self.block_shape is None, (
@@ -346,7 +377,7 @@ class FusedMoEQuantConfig:
 
     @property
     def use_fp8_w8a8(self) -> bool:
-        return self.quant_dtype == torch.float8_e4m3fn
+        return self.quant_dtype == current_platform.fp8_dtype()
 
     @property
     def use_int8_w8a8(self) -> bool:
@@ -476,7 +507,10 @@ class FusedMoEQuantConfig:
         w1_zp: torch.Tensor | None = None,
         w2_zp: torch.Tensor | None = None,
         weight_dtype: torch.dtype | str | None = None,
-        is_nvfp4_scale_swizzled: bool = True,
+        is_scale_swizzled: bool = True,
+        gemm1_alpha: float | None = None,
+        gemm1_beta: float | None = None,
+        gemm1_clamp_limit: float | None = None,
     ) -> "FusedMoEQuantConfig":
         """
         General builder function for a FusedMoEQuantConfig.
@@ -506,7 +540,12 @@ class FusedMoEQuantConfig:
         - w2_bias: Optional biases for w1 (GPT OSS Triton).
         - w1_zp: Optional w1 zero points for int4/int8 quantization.
         - w2_zp: Optional w2 zero points for int4/int8 quantization.
-        - is_nvfp4_scale_swizzled: Whether to swizzle the nvfp4 scale swizzling.
+        - is_scale_swizzled: Whether the activation scale-factor layout is
+          swizzled. Pass through to the underlying quantization kernel for
+          dtypes that distinguish layouts (nvfp4, mxfp8). Defaults to True.
+        - gemm1_alpha: Optional MXFP4 TRTLLM SwiGLU alpha parameter.
+        - gemm1_beta: Optional MXFP4 TRTLLM SwiGLU beta parameter.
+        - gemm1_clamp_limit: Optional MXFP4 TRTLLM SwiGLU clamp limit.
         """
         assert not isinstance(quant_dtype, str) or quant_dtype in {
             "nvfp4",
@@ -539,7 +578,10 @@ class FusedMoEQuantConfig:
             _w2=FusedMoEQuantDesc(
                 weight_dtype, w_shape, w2_scale, g2_alphas, w2_zp, w2_bias
             ),
-            is_nvfp4_scale_swizzled=is_nvfp4_scale_swizzled,
+            is_scale_swizzled=is_scale_swizzled,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
         )
         assert quant_config.per_act_token_quant == per_act_token_quant
         assert quant_config.per_out_ch_quant == per_out_ch_quant
@@ -561,12 +603,13 @@ def fp8_w8a8_moe_quant_config(
     a2_gscale: torch.Tensor | None = None,
     g1_alphas: torch.Tensor | None = None,
     g2_alphas: torch.Tensor | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for fp8 activations and fp8 weights.
     """
     return FusedMoEQuantConfig.make(
-        torch.float8_e4m3fn,
+        current_platform.fp8_dtype(),
         w1_scale=w1_scale,
         g1_alphas=g1_alphas,
         w2_scale=w2_scale,
@@ -580,6 +623,7 @@ def fp8_w8a8_moe_quant_config(
         per_act_token_quant=per_act_token_quant,
         per_out_ch_quant=per_out_ch_quant,
         block_shape=block_shape,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -650,6 +694,9 @@ def mxfp4_w4a16_moe_quant_config(
     w2_scale: Union[torch.Tensor, "PrecisionConfig"],
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for unquantized activations and mxfp4 weights.
@@ -659,6 +706,9 @@ def mxfp4_w4a16_moe_quant_config(
         _a2=FusedMoEQuantDesc(),
         _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, None, None, w1_bias),
         _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, None, None, w2_bias),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -670,6 +720,11 @@ def mxfp4_mxfp8_moe_quant_config(
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     block_shape: list[int] | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
+    mx_alignment: int = 0,
+    is_scale_swizzled: bool = True,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for mxfp4 activations and mxfp4 weights.
@@ -679,6 +734,11 @@ def mxfp4_mxfp8_moe_quant_config(
         _a2=FusedMoEQuantDesc("mxfp8"),
         _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, None, None, w1_bias),
         _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, None, None, w2_bias),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        mx_alignment=mx_alignment,
+        is_scale_swizzled=is_scale_swizzled,
     )
 
 
@@ -690,6 +750,7 @@ def mxfp4_w4a8_moe_quant_config(
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     block_shape: list[int] | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for fp8 activations and mxfp4 weights.
@@ -699,6 +760,7 @@ def mxfp4_w4a8_moe_quant_config(
         _a2=FusedMoEQuantDesc("fp8", None, a2_scale, None, None, None),
         _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, None, None, w1_bias),
         _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, None, None, w2_bias),
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -712,6 +774,9 @@ def ocp_mx_moe_quant_config(
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     block_shape: list[int] | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    gemm1_clamp_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for mxfp4 activations and mxfp4 weights.
@@ -729,6 +794,9 @@ def ocp_mx_moe_quant_config(
         per_act_token_quant=False,
         per_out_ch_quant=False,
         block_shape=block_shape,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
     )
 
 
@@ -741,7 +809,8 @@ def nvfp4_moe_quant_config(
     w2_scale: torch.Tensor,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
-    is_nvfp4_scale_swizzled: bool = True,
+    is_scale_swizzled: bool = True,
+    gemm1_clamp_limit: float | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for mxfp4 activations and nvp4 weights.
@@ -759,7 +828,27 @@ def nvfp4_moe_quant_config(
         per_act_token_quant=False,
         per_out_ch_quant=False,
         block_shape=None,
-        is_nvfp4_scale_swizzled=is_nvfp4_scale_swizzled,
+        is_scale_swizzled=is_scale_swizzled,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+    )
+
+
+def mxfp4_moe_quant_config(
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> FusedMoEQuantConfig:
+    """
+    Construct a quant config for MXFP4 x MXFP4 MoE.
+    MXFP4 uses block scaling only (E8M0 scales, 32-element groups), with no
+    separate alphas / global activation scales in this config.
+    """
+    return FusedMoEQuantConfig.make(
+        "mxfp4",
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        per_act_token_quant=False,
+        per_out_ch_quant=False,
+        block_shape=None,
     )
 
 
@@ -785,39 +874,56 @@ def nvfp4_w4a16_moe_quant_config(
 def int4_w4a16_moe_quant_config(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    w1_zp: torch.Tensor | None,
-    w2_zp: torch.Tensor | None,
+    w1_zp: torch.Tensor | None = None,
+    w2_zp: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
     block_shape: list[int] | None = None,
+    a1_gscale: torch.Tensor | None = None,
+    a2_gscale: torch.Tensor | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for 16-bit float activations and int4 weights.
     """
     group_shape = GroupShape(*block_shape) if block_shape is not None else None
     return FusedMoEQuantConfig(
-        _a1=FusedMoEQuantDesc(shape=group_shape),
-        _a2=FusedMoEQuantDesc(shape=group_shape),
-        _w1=FusedMoEQuantDesc("int4", group_shape, w1_scale, None, w1_zp),
-        _w2=FusedMoEQuantDesc("int4", group_shape, w2_scale, None, w2_zp),
+        _a1=FusedMoEQuantDesc(shape=group_shape, alpha_or_gscale=a1_gscale),
+        _a2=FusedMoEQuantDesc(shape=group_shape, alpha_or_gscale=a2_gscale),
+        _w1=FusedMoEQuantDesc("int4", group_shape, w1_scale, None, w1_zp, w1_bias),
+        _w2=FusedMoEQuantDesc("int4", group_shape, w2_scale, None, w2_zp, w2_bias),
     )
 
 
 def fp8_w8a16_moe_quant_config(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
     block_shape: list[int] | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for 16-bit float activations and fp8 weights.
     """
     group_shape = GroupShape(*block_shape) if block_shape is not None else None
+    fp8_dtype = current_platform.fp8_dtype()
     return FusedMoEQuantConfig(
         _a1=FusedMoEQuantDesc(),
         _a2=FusedMoEQuantDesc(),
         _w1=FusedMoEQuantDesc(
-            current_platform.fp8_dtype(), group_shape, w1_scale, None, None
+            fp8_dtype,
+            group_shape,
+            w1_scale,
+            None,
+            None,
+            w1_bias,
         ),
         _w2=FusedMoEQuantDesc(
-            current_platform.fp8_dtype(), group_shape, w2_scale, None, None
+            fp8_dtype,
+            group_shape,
+            w2_scale,
+            None,
+            None,
+            w2_bias,
         ),
     )
 
@@ -825,19 +931,23 @@ def fp8_w8a16_moe_quant_config(
 def int8_w8a16_moe_quant_config(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
-    w1_zp: torch.Tensor | None,
-    w2_zp: torch.Tensor | None,
+    w1_zp: torch.Tensor | None = None,
+    w2_zp: torch.Tensor | None = None,
+    w1_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
     block_shape: list[int] | None = None,
+    a1_gscale: torch.Tensor | None = None,
+    a2_gscale: torch.Tensor | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for 16-bit float activations and int8 weights.
     """
     group_shape = GroupShape(*block_shape) if block_shape is not None else None
     return FusedMoEQuantConfig(
-        _a1=FusedMoEQuantDesc(shape=group_shape),
-        _a2=FusedMoEQuantDesc(shape=group_shape),
-        _w1=FusedMoEQuantDesc(torch.int8, group_shape, w1_scale, None, w1_zp),
-        _w2=FusedMoEQuantDesc(torch.int8, group_shape, w2_scale, None, w2_zp),
+        _a1=FusedMoEQuantDesc(shape=group_shape, alpha_or_gscale=a1_gscale),
+        _a2=FusedMoEQuantDesc(shape=group_shape, alpha_or_gscale=a2_gscale),
+        _w1=FusedMoEQuantDesc(torch.int8, group_shape, w1_scale, None, w1_zp, w1_bias),
+        _w2=FusedMoEQuantDesc(torch.int8, group_shape, w2_scale, None, w2_zp, w2_bias),
     )
 
 
@@ -863,42 +973,6 @@ def int4_w4afp8_moe_quant_config(
         per_out_ch_quant=per_out_ch_quant,
         block_shape=block_shape,
         weight_dtype="int4",  # weight dtype for weights
-    )
-
-
-def awq_marlin_moe_quant_config(
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    w1_zp: torch.Tensor | None,
-    w2_zp: torch.Tensor | None,
-    weight_bits: int,
-    group_size: int,
-    w1_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
-) -> FusedMoEQuantConfig:
-    """
-    Construct a quant config for awq marlin quantization.
-    """
-    from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
-
-    w_shape = None if group_size == -1 else GroupShape(row=1, col=group_size)
-
-    # Activations are NOT quantized for AWQ (fp16/bf16)
-    a_shape = w_shape  # Same as weight shape for alignment
-
-    # Determine weight dtype
-    if weight_bits == 4:
-        weight_dtype = "int4"
-    elif weight_bits == 8:
-        weight_dtype = torch.int8
-    else:
-        raise ValueError(f"Unsupported weight_bits: {weight_bits}")
-
-    return FusedMoEQuantConfig(
-        _a1=FusedMoEQuantDesc(dtype=None, shape=a_shape),
-        _a2=FusedMoEQuantDesc(dtype=None, shape=a_shape),
-        _w1=FusedMoEQuantDesc(weight_dtype, w_shape, w1_scale, None, w1_zp, w1_bias),
-        _w2=FusedMoEQuantDesc(weight_dtype, w_shape, w2_scale, None, w2_zp, w2_bias),
     )
 
 
@@ -972,17 +1046,25 @@ class FusedMoEParallelConfig:
 
     @property
     def use_batched_activation_format(self):
-        return self.use_deepep_ll_kernels
+        return self.use_deepep_ll_kernels or self.use_nixl_ep_kernels
 
     @property
-    def use_naive_all2all_kernels(self):
-        return self.use_all2all_kernels and (
-            self.all2all_backend in ["naive", "allgather_reducescatter"]
+    def needs_round_robin_routing_tables(self):
+        return self.use_deepep_ll_kernels or self.use_nixl_ep_kernels
+
+    @property
+    def use_ag_rs_all2all_kernels(self):
+        return (
+            self.use_all2all_kernels
+            and self.all2all_backend == "allgather_reducescatter"
         )
 
     @property
     def use_mori_kernels(self):
-        return self.use_all2all_kernels and self.all2all_backend == "mori"
+        return self.use_all2all_kernels and self.all2all_backend in (
+            "mori_high_throughput",
+            "mori_low_latency",
+        )
 
     @property
     def use_nixl_ep_kernels(self):
@@ -992,29 +1074,43 @@ class FusedMoEParallelConfig:
     def flatten_tp_across_dp_and_pcp(
         tp_size: int, dp_size: int, dp_rank: int, pcp_size: int, pcp_rank: int
     ) -> tuple[int, int]:
-        # TODO: [lqf] 非对称整改(need refactor)
-        from vllm.config import get_current_vllm_config
-        vllm_config = get_current_vllm_config()
-        additional_config = getattr(vllm_config, "additional_config", None)
-        zero_interrupt_config = additional_config.get("zero_interrupt_config", None)
-        asym = zero_interrupt_config is not None
-        
-        if asym:
-            from vllm.distributed.parallel_state import get_global_rank_asym, asym_world_size
-
-            tp_rank = 0 if tp_size == 1 else get_tensor_model_parallel_rank()
-            # flatten_tp_size = dp_size * pcp_size * tp_size
-            flatten_tp_size = asym_world_size(zero_interrupt_config)
-            # flatten_tp_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
-            flatten_tp_rank = get_global_rank_asym(tp_rank)
-
-            return flatten_tp_size, flatten_tp_rank
-        
         tp_rank = 0 if tp_size == 1 else get_tensor_model_parallel_rank()
-        # There are actually dp_size * pcp_size * tp_size devices.
-        # Update tp_size and tp_rank so we shard across all devices.
-        flatten_tp_size = dp_size * pcp_size * tp_size
-        flatten_tp_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+        # Check for heterogeneous TP (different tp sizes per DP rank)
+        # NOTE: do NOT rely on the ``dp_size``/``dp_rank`` arguments here.
+        # Under heterogeneous TP the DP group of an "orphaned" TP rank is a
+        # singleton, so ``get_dp_group().world_size``/``rank_in_group`` are
+        # wrong. Also the TP group may be temporarily patched to size-1 for
+        # the draft model, so get_tensor_model_parallel_rank() may be wrong.
+        # Always read the true values from the current VllmConfig / world rank.
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+        if cfg is not None and cfg.parallel_config.is_heterogeneous_tp:
+            from vllm.distributed.parallel_state import get_world_group
+
+            pc = cfg.parallel_config
+            true_dp_size = pc.data_parallel_size
+            true_dp_rank = pc.data_parallel_rank
+            tp_sizes = [pc.get_tp_size_for_dp(i) for i in range(true_dp_size)]
+            # Recover the true rank within this DP rank's TP group from the
+            # global rank, since get_tensor_model_parallel_rank() reads the
+            # (possibly patched) global TP group.
+            global_rank = get_world_group().rank
+            true_tp_rank = global_rank - pc.get_rank_offset_for_dp(true_dp_rank)
+            cum_offset = sum(
+                tp_sizes[i] * pcp_size for i in range(true_dp_rank)
+            )
+            flatten_tp_size = sum(tp_sizes) * pcp_size
+            flatten_tp_rank = (
+                cum_offset + pcp_rank * tp_sizes[true_dp_rank] + true_tp_rank
+            )
+        else:
+            # There are actually dp_size * pcp_size * tp_size devices.
+            # Update tp_size and tp_rank so we shard across all devices.
+            flatten_tp_size = dp_size * pcp_size * tp_size
+            flatten_tp_rank = (
+                dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+            )
         return flatten_tp_size, flatten_tp_rank
 
     @staticmethod
@@ -1098,33 +1194,27 @@ class FusedMoEParallelConfig:
             - Comment: There are 2 engine instances and the experts are split
                 between the 4 devices.
         """
-        # 异构 TP（DP4TP4 -> DP4TP(3,4,4,4)）下 orphaned TP rank 的
-        # DP group 是 singleton（get_dp_group().world_size == 1），并且
-        # draft model 可能临时把 TP group patch 成 size-1。因此必须从
-        # parallel_config 读取真实的 dp/tp 值，否则 use_ep 会误判。
-        from vllm.config import get_current_vllm_config_or_none
-
-        _cfg = get_current_vllm_config_or_none()
-        is_hetero = bool(
-            _cfg is not None
-            and getattr(_cfg.parallel_config, "is_heterogeneous_tp", False)
+        use_ep = (
+            dp_size_ * pcp_size_ * tp_size_ > 1
+            and vllm_parallel_config.enable_expert_parallel
         )
-        if is_hetero:
-            pc = _cfg.parallel_config
-            dp_size = pc.data_parallel_size
-            dp_rank = pc.data_parallel_rank
+
+        if vllm_parallel_config.is_heterogeneous_tp:
+            # Under heterogeneous TP the DP group of an orphaned TP rank is a
+            # singleton (get_dp_group().world_size == 1), and the TP group may
+            # be temporarily patched to size-1 for the draft model
+            # (patch_tensor_parallel_group). Both would make `use_ep` evaluate
+            # to False. Use the true sizes from the parallel config instead.
+            dp_size = vllm_parallel_config.data_parallel_size
+            dp_rank = vllm_parallel_config.data_parallel_rank
             use_ep = (
-                pc.data_parallel_size
-                * pcp_size_
-                * tp_size_
+                vllm_parallel_config.data_parallel_size
+                * vllm_parallel_config.prefill_context_parallel_size
+                * vllm_parallel_config.tensor_parallel_size
                 > 1
                 and vllm_parallel_config.enable_expert_parallel
             )
         else:
-            use_ep = (
-                dp_size_ * pcp_size_ * tp_size_ > 1
-                and vllm_parallel_config.enable_expert_parallel
-            ) # TODO: [lqf] 需要整改
             dp_size = dp_size_
             dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
         pcp_size = pcp_size_
@@ -1154,7 +1244,6 @@ class FusedMoEParallelConfig:
         # parallel update tp_size, tp_rank, ep_size and ep_rank to reflect that.
         ep_size = tp_size
         ep_rank = tp_rank
-        logger.debug(f"FusedMoEParallelConfig.make: use_ep={use_ep}, ep_size={ep_size}, ep_rank={ep_rank}")
         return FusedMoEParallelConfig(
             tp_size=1,
             tp_rank=0,
@@ -1184,7 +1273,7 @@ class FusedMoEParallelConfig:
             ep_rank=0,
             sp_size=1,
             use_ep=False,
-            all2all_backend="naive",
+            all2all_backend="allgather_reducescatter",
             enable_eplb=False,
         )
 
@@ -1209,17 +1298,23 @@ class FusedMoEConfig:
     # Defaults to in_dtype if not specified.
     router_logits_dtype: torch.dtype | None = None
 
-    moe_backend: str = "auto"
-    max_num_tokens: int = envs.VLLM_MOE_DP_CHUNK_SIZE
+    # Defaults to hidden_dim if not specified.
+    hidden_dim_unpadded: int | None = None
+    # Defaults to intermediate_size_per_partition if not specified.
+    intermediate_size_per_partition_unpadded: int | None = None
+
+    moe_backend: MoEBackend = "auto"
+    max_num_tokens: int = SchedulerConfig.DEFAULT_MAX_NUM_BATCHED_TOKENS_FOR_BATCHED_DP
     has_bias: bool = False
     is_act_and_mul: bool = True
     is_lora_enabled: bool = False
 
-    # This flag is used to disable the inplace optimization
-    # in MoE kernels. If this flag is True then the kernel
-    # should not be using inplace. If the flag is false, the
-    # kernel is free to use inplace or not.
-    disable_inplace: bool = True
+    # SwiGLU clamp limit. When set, backends that do not implement the clamp
+    # are filtered out by `FusedMoEExperts.is_supported_config` so the oracle
+    # cannot silently select one and drop the clamp.
+    swiglu_limit: float | None = None
+
+    max_capture_size: int = 0
 
     def __post_init__(self):
         if self.dp_size > 1:
@@ -1231,6 +1326,13 @@ class FusedMoEConfig:
 
         if self.router_logits_dtype is None:
             self.router_logits_dtype = self.in_dtype
+
+        if self.hidden_dim_unpadded is None:
+            self.hidden_dim_unpadded = self.hidden_dim
+        if self.intermediate_size_per_partition_unpadded is None:
+            self.intermediate_size_per_partition_unpadded = (
+                self.intermediate_size_per_partition
+            )
 
     @property
     def tp_size(self):
@@ -1297,9 +1399,13 @@ class FusedMoEConfig:
         return self.moe_parallel_config.use_fi_nvl_one_sided_kernels
 
     @property
-    def use_naive_all2all_kernels(self):
-        return self.moe_parallel_config.use_naive_all2all_kernels
+    def use_ag_rs_all2all_kernels(self):
+        return self.moe_parallel_config.use_ag_rs_all2all_kernels
 
     @property
     def use_nixl_ep_kernels(self):
         return self.moe_parallel_config.use_nixl_ep_kernels
+
+    @property
+    def needs_round_robin_routing_tables(self):
+        return self.moe_parallel_config.needs_round_robin_routing_tables

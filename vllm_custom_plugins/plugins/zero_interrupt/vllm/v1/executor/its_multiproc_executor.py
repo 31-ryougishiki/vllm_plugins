@@ -1115,11 +1115,11 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
             self._get_engine_parallel_config(self.current_strategy)
         # WorkerProc.rank/local_rank 仍是节点内（DP 内）的本地 rank，全局
-        # torch.distributed rank 偏移由 worker 的
-        # init_distributed_environment_asym 通过
-        # get_global_rank_asym(local_rank) 计算（DP4TP(3,4,4,4) 时
-        # 0/3/7/11）。不要把全局偏移传给 WorkerProc，否则
-        # _is_driver_worker(rank % local_tp_size == 0) 会在 DP1..3 失效。
+        # torch.distributed rank 偏移由 v0.23 hetero
+        # init_distributed_environment 按 get_rank_offset_for_dp 计算
+        # （DP4TP(3,4,4,4) 时 0/3/7/11）。不要把全局偏移传给
+        # WorkerProc，否则 _is_driver_worker(rank % local_tp_size == 0)
+        # 会在 DP1..3 失效。
         global_start_rank = (
             self.parallel_config.local_world_size
             * self.parallel_config.node_rank_within_dp
@@ -1749,11 +1749,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 )
                 self.parallel_config.data_parallel_rank_local = self.backup_parallel_config["data_parallel_rank_local"]
                 self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
-                self.parallel_config.world_size_across_dp = (
-                    sum(cfg.tp_size for cfg in self.parallel_config.heterogeneous_dp_config)
-                    if self.parallel_config.heterogeneous_dp_config
-                    else self.parallel_config.world_size * self.parallel_config.data_parallel_size
-                )
             elif strategy.deploy_type in (DeployType.DEGRADE, DeployType.PD_REBUILD):
                 if strategy.deploy_type == DeployType.DEGRADE:
                     # 备份缩容前的对称策略(连续多次缩容只备份第一次)
@@ -1800,21 +1795,13 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                         * self.parallel_config.pipeline_parallel_size
                         * self.parallel_config.prefill_context_parallel_size
                     )
-                    self.parallel_config.world_size_across_dp = sum(
-                        cfg.tp_size
-                        for cfg in self.parallel_config.heterogeneous_dp_config
-                    ) if self.parallel_config.heterogeneous_dp_config else (
-                        self.parallel_config.world_size * new_dp
-                    )
                 else:
                     self.parallel_config.world_size = 0
-                    self.parallel_config.world_size_across_dp = 0
             elif strategy.deploy_type == DeployType.STOP:
                 self._try_backup_origin_parallel_config_when_degrade()
                 self.parallel_config.tensor_parallel_size = 0
                 self.parallel_config.data_parallel_size = 0
                 self.parallel_config.world_size = 0
-                self.parallel_config.world_size_across_dp = 0
             else:
                 raise ValueError(f"receive unknown strategy: {strategy}")
 

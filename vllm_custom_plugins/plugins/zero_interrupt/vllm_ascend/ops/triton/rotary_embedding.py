@@ -34,12 +34,6 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import has_rope, is_vl_model
 
-import os
-
-vllm_patches = os.environ.get("VLLM_CUSTOM_PATCHES", "")
-
-HAS_ITS_ROTARY = "its_rotary" in vllm_patches
-
 if HAS_TRITON:
     from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 
@@ -88,12 +82,8 @@ def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, devi
             rope_dim = int(rope_dim * model_config.hf_text_config.partial_rotary_factor)
         elif hasattr(model_config.hf_text_config, "rotary_dim"):
             rope_dim = int(model_config.hf_text_config.rotary_dim)
-        if HAS_ITS_ROTARY:
-            _cos = torch.ones(1, max_num_batched_tokens, 1, rope_dim//2, dtype=dtype, device=device)
-            _sin = torch.zeros(1, max_num_batched_tokens, 1, rope_dim//2, dtype=dtype, device=device)
-        else:
-            _cos = torch.ones(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
-            _sin = torch.zeros(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
+        _cos = torch.ones(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
+        _sin = torch.zeros(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
 
 
 def get_cos_and_sin_mla(positions, use_cache=False):
@@ -136,35 +126,22 @@ def _record_cos_and_sin_cache_interleaved(cos_sin_cache):
     _sin_cache = sin_cache.squeeze(1)
 
 
-def update_cos_sin(positions, cos_sin_cache=None):
+def update_cos_sin(positions):
     global _cos
     global _sin
     global _cos_slice
     global _sin_slice
-    global _cos_sin_cache
-    # 惰性初始化：如果全局 _cos_sin_cache 为 None，但传入了 cos_sin_cache，则初始化它
-    if _cos_sin_cache is None and cos_sin_cache is not None:
-        _cos_sin_cache = cos_sin_cache
-        # 不 return，继续执行后续的更新逻辑
+
     if _cos_sin_cache is None or _cos is None or _sin is None:
         return
 
     num_tokens = positions.size(0)
-    if HAS_ITS_ROTARY:
-        _cos[:, :num_tokens] = (
-            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).chunk(2, dim=-2)[0]
-        )
-        _sin[:, :num_tokens] = (
-            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).chunk(2, dim=-2)[1]
-        )
-    else:
-        _cos[:, :num_tokens] = (
-            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
-        )
-        _sin[:, :num_tokens] = (
-            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[1]
-        )
-
+    _cos[:, :num_tokens] = (
+        _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
+    )
+    _sin[:, :num_tokens] = (
+        _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[1]
+    )
     _cos_slice = _cos[:, :num_tokens]
     _sin_slice = _sin[:, :num_tokens]
 
@@ -303,6 +280,8 @@ class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, scaling_factor, dtype, **extra_kwargs
         )
+        vllm_config = get_current_vllm_config()
+        self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
         _record_cos_sin_cache(self.cos_sin_cache)
 
     def forward_oot(
@@ -609,4 +588,3 @@ class AscendApplyRotaryEmb(ApplyRotaryEmb):
         output = self._post_process(output, origin_shape, origin_dtype)
 
         return output
-
