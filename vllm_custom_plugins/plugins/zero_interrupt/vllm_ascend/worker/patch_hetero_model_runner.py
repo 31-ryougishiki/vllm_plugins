@@ -116,8 +116,10 @@ def _patched_profile_run(self):
 
     # Call the original profile_run without recursion.  The original is a
     # function object saved in the class attribute by apply_*.
-    _ORIGINAL_PROFILE_RUN(self)
-    self.max_num_tokens = origin_max_num_tokens
+    try:
+        _ORIGINAL_PROFILE_RUN(self)
+    finally:
+        self.max_num_tokens = origin_max_num_tokens
 
 
 _ORIGINAL_PROFILE_RUN = None

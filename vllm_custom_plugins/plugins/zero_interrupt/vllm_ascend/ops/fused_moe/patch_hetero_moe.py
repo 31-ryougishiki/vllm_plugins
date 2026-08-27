@@ -33,10 +33,28 @@ def _patch_code(target, new_func):
     target.__code__ = new_func.__code__
 
 
+def _bind_method(cls, method_name, new_func):
+    """Bind *new_func* as a class attribute on *cls*.
+
+    Used instead of ``__code__`` replacement for ``__init__`` methods whose
+    compiled code closes over ``__class__`` (zero-arg ``super()`` in the
+    installed v0.23 source).  A code object with a different free-var list
+    cannot be assigned to such a function object, so the whole function is
+    rebound and its required globals are injected into this module first.
+    """
+    setattr(cls, method_name, new_func)
+
+
 def _ensure_global(module, name, value):
     """Add *name* to *module* globals when it is missing."""
     if name not in module.__dict__:
         module.__dict__[name] = value
+
+
+def _ensure_plugin_global(name, value):
+    """Expose *value* to whole-method patches bound from this module."""
+    if name not in globals():
+        globals()[name] = value
 
 
 # ---------------------------------------------------------------------------
@@ -740,8 +758,32 @@ def apply_hetero_moe_patch():
     # through fused_moe.py.  Patch the private class directly.
     from vllm_ascend.ops.fused_moe import fused_moe_0_23_0 as fused_moe_023
 
-    _patch_code(
-        fused_moe_023.AscendFusedMoE.__init__,
+    # ``AscendFusedMoE.__init__`` is compiled with a ``__class__`` free var
+    # (zero-arg super()), so its code object cannot be replaced by a function
+    # compiled without that closure.  Bind the whole function instead and
+    # expose the module globals the copied body references.
+    for _name in (
+        "AscendFusedMoE",
+        "AscendUnquantizedFusedMoEMethod",
+        "get_tp_group",
+        "get_dp_group",
+        "get_ep_group",
+        "get_mc2_group",
+        "get_ascend_config",
+        "enable_sp",
+        "get_current_vllm_config",
+        "init_eplb_config",
+        "get_compressed_expert_map",
+        "setup_moe_comm_method",
+        "AscendMoERunner",
+        "VllmEplbAdaptor",
+        "logger",
+        "wraps",
+    ):
+        _ensure_plugin_global(_name, getattr(fused_moe_023, _name))
+    _bind_method(
+        fused_moe_023.AscendFusedMoE,
+        "__init__",
         _patched_ascend_fused_moe_init,
     )
 
@@ -775,8 +817,15 @@ def apply_hetero_moe_patch():
         token_dispatcher.TokenDispatcherWithAllGather.token_dispatch,
         _patched_token_dispatch_allgather,
     )
-    _patch_code(
-        token_dispatcher.TokenDispatcherWithAll2AllV.__init__,
+    # Same ``__class__`` free-var issue as AscendFusedMoE.__init__: the
+    # installed TokenDispatcherWithAll2AllV.__init__ uses zero-arg super().
+    _ensure_plugin_global(
+        "TokenDispatcherWithAll2AllV",
+        token_dispatcher.TokenDispatcherWithAll2AllV,
+    )
+    _bind_method(
+        token_dispatcher.TokenDispatcherWithAll2AllV,
+        "__init__",
         _patched_init_all2allv,
     )
     _patch_code(

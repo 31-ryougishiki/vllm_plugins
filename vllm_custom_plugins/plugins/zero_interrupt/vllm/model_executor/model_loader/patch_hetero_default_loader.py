@@ -9,7 +9,7 @@ _PATCHED = False
 
 def _patched_init_ep_weight_filter(self, model_config):
     from vllm.config import get_current_vllm_config
-    from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+    from vllm.model_executor.model_loader.ep_weight_filter import (
         compute_local_expert_ids,
     )
 

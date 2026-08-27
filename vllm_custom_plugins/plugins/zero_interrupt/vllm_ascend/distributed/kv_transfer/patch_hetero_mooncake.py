@@ -400,7 +400,10 @@ def _patched_get_remote_host_info_by_port(
 
     # Legacy mappings are keyed by the producer's kv_port offset or by
     # the DP-local rank.
-    kv_port = self.vllm_config.kv_transfer_config.kv_port
+    kv_transfer_config = getattr(
+        getattr(self, "vllm_config", None), "kv_transfer_config", None
+    )
+    kv_port = getattr(kv_transfer_config, "kv_port", base_port)
     rank = str(remote_handshake_port - kv_port)
     info = remote_multi_nodes_meta_mapping.get(rank)
     if info is None:

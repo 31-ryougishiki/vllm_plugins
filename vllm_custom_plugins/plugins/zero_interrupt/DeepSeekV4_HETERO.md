@@ -45,24 +45,35 @@
 ## 3 重启流程（与旧实现的关键差异）
 
 1. **所有 DP 都重启**：`ITSMultiprocExecutor._strategy_requires_full_restart`
-   检测到 `new_tp != tp` 或 `tp_asymmetric_shardings` 时，PD_REBUILD
-   下不再区分“故障实例/健康实例”，所有 executor 都走
+   检测到 `new_tp != tp` 或 `tp_asymmetric_shardings` 时，DEGRADE 和
+   PD_REBUILD 都不再区分“故障实例/健康实例”，所有 executor 都走
    `_cleanup_and_restart_workers()`。原因是 MoE EP 通信组和全局
    world_size 从 16 变为 15，健康 DP 只做 KV connector RPC 更新会继续
    使用旧通信域。
-2. **完整异构拓扑注入**：`_update_vllm_config_for_restart` 把
+2. **跨 DP 重启 barrier**：`_cleanup_and_restart_workers()` 在杀 worker
+   之前通过 EngineCore 的 CPU DP group 做 all-reduce rendezvous（默认
+   120s 超时）。若决策中心只给故障 DP 下发策略，barrier 会超时并 fail
+   closed，而不是让新 15-rank `init_process_group` 无限等待。
+3. **P 端 engine_id 轮换**：producer 全量重启时
+   `_execute_deployment_strategy` 强制轮换 `kv_transfer_config.engine_id`
+   （`<旧id>-<uuid>`）。decode 侧 `KVCacheRecvingThread` 以
+   `(engine_id, handshake_port)` 为 key 缓存远端 KV 元数据，轮换后 D 会
+   对新 key 重新拉取新 TransferEngine/KV 基地址，避免 P 重启后 D 使用旧
+   地址导致 PD 链路失败。
+4. **完整异构拓扑注入**：`_update_vllm_config_for_restart` 把
    `heterogeneous_dp_config`、`global_world_size`、`global_start_rank`
    和当前 executor 的 `tp_asymmetric_shardings` 写入
    `additional_config["zero_interrupt_config"]`。
-3. **ParallelConfig 扩展**：`vllm/config/parallel.py` 新增
+5. **ParallelConfig 扩展**：`vllm/config/parallel.py` 新增
    `HeterogeneousDPConfig` / `heterogeneous_dp_config` /
    `is_heterogeneous_tp` / `get_tp_size_for_dp` /
    `get_sharding_ratios_for_dp` / `get_rank_offset_for_dp`。
-4. **全局 rank 偏移**：`WorkerProc.rank/local_rank` 保持 DP 内本地 rank；
-   全局 torch.distributed rank（0/3/7/11）由 worker 的
-   `init_distributed_environment_asym -> get_global_rank_asym` 按
-   `data_parallel_rank` 累加前序 DP 的 `new_tp` 得到。
-5. **设备隔离不变**：故障卡从 DP0 的 `ASCEND_RT_VISIBLE_DEVICES` 中
+6. **全局 rank 偏移**：`WorkerProc.rank/local_rank` 保持 DP 内本地 rank；
+   全局 torch.distributed rank（0/3/7/11）由 worker 调用
+   `init_distributed_environment` 时在 `is_heterogeneous_tp` 分支按
+   `get_rank_offset_for_dp(data_parallel_rank)` 累加前序 DP 的
+   `tp_size` 得到。
+7. **设备隔离不变**：故障卡从 DP0 的 `ASCEND_RT_VISIBLE_DEVICES` 中
    剔除，DP0 仅剩 3 张健康卡；其他 executor 保持 4 张卡。
 
 ## 4 DeepSeek-V4 patch 清单
@@ -94,7 +105,8 @@ vllm/vllm-ascend 源码对应：
   1. 启动 16 卡 DP4TP4 DeepSeek-V4-Flash-w8a8-mtp + decode dp16/tp1；
   2. 注入一张卡故障，决策中心下发第 2 节策略；
   3. 检查 4 个 executor 日志均出现 “restarting workers of EVERY DP
-     instance”；
-  4. 检查 worker 全局 rank：DP0=0/1/2，DP1=3/4/5/6，DP2=7/8/9/10，
+     instance” 与 “Full-restart barrier passed”；
+  4. 检查 P 端日志出现 “heterogeneous producer restart rotates engine_id”；
+  5. 检查 worker 全局 rank：DP0=0/1/2，DP1=3/4/5/6，DP2=7/8/9/10，
      DP3=11/12/13/14；
-  5. 请求续推结果与故障前同 seed 基准逐 token 对齐。
+  6. 请求续推结果与故障前同 seed 基准逐 token 对齐。

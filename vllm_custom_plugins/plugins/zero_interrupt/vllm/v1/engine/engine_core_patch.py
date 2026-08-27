@@ -585,12 +585,58 @@ def patch_engine_core() -> None:
             # 仅在 PD 分离场景（kv_transfer_config 不为 None）下执行 engine_id 更新逻辑
             if is_pd_separated(vllm_config):
                 from uuid import uuid4
+
                 ori_engine_id = vllm_config.kv_transfer_config.engine_id
-                ori_engine_id_components = ori_engine_id.replace('_', '-').split('-')
-                if len(ori_engine_id_components) == 3:
-                    prefix, ori_uuid, suffix = ori_engine_id_components
-                    vllm_config.kv_transfer_config.engine_id = f"{prefix}-{uuid4().hex}-{suffix}"
-                    logger.info(f"[PD] reset executor's vllm_config.kv_transfer_config.engine_id={vllm_config.kv_transfer_config.engine_id}")
+                # 异构 TP 全量重启后 P 侧 15 个 worker 会重建
+                # TransferEngine/KV cache，te_rpc_port 和 KV 基地址全部变化。
+                # decode 侧 KVCacheRecvingThread 以 (engine_id, handshake_port)
+                # 为 key 缓存远端元数据且不会主动失效，若 P 保持原 engine_id，
+                # D 会继续使用旧地址传输，PD 链路必然失败。因此 producer
+                # 全量重启时强制轮换 engine_id，让 D 对新 key 重新拉取元数据。
+                try:
+                    full_restart = bool(
+                        executor._strategy_requires_full_restart(
+                            executor.current_strategy
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[PD] failed to check full-restart strategy, "
+                        "keeping current engine_id: %s",
+                        exc,
+                    )
+                    full_restart = False
+                kv_role = getattr(
+                    vllm_config.kv_transfer_config, "kv_role", None
+                )
+                update_info = getattr(
+                    executor.current_strategy, "update_engine_info", None
+                )
+                if update_info is None and full_restart and kv_role == "kv_producer":
+                    vllm_config.kv_transfer_config.engine_id = (
+                        f"{ori_engine_id}-{uuid4().hex}"
+                    )
+                    logger.info(
+                        "[PD] heterogeneous producer restart rotates "
+                        "engine_id %s -> %s",
+                        ori_engine_id,
+                        vllm_config.kv_transfer_config.engine_id,
+                    )
+                elif update_info is None:
+                    # 兼容既有 prefix-uuid-suffix 三段 engine_id 的更新逻辑。
+                    ori_engine_id_components = (
+                        ori_engine_id.replace("_", "-").split("-")
+                    )
+                    if len(ori_engine_id_components) == 3:
+                        prefix, ori_uuid, suffix = ori_engine_id_components
+                        vllm_config.kv_transfer_config.engine_id = (
+                            f"{prefix}-{uuid4().hex}-{suffix}"
+                        )
+                        logger.info(
+                            "[PD] reset executor's "
+                            "vllm_config.kv_transfer_config.engine_id=%s",
+                            vllm_config.kv_transfer_config.engine_id,
+                        )
 
                 # 2. 直接修改scheduler connector的engine-id
                 sched_kv_connector = engine_core.scheduler.get_kv_connector()
@@ -612,8 +658,19 @@ def patch_engine_core() -> None:
 
                 # 4. 更新worker的engine_id
                 if sched_kv_connector.connector_worker:
-                    worker_handshake_metadata = sched_kv_connector.connector_worker.xfer_handshake_metadata
-                    worker_handshake_metadata.engine_id = vllm_config.kv_transfer_config.engine_id
+                    connector_worker = sched_kv_connector.connector_worker
+                    connector_worker.engine_id = (
+                        vllm_config.kv_transfer_config.engine_id
+                    )
+                    worker_handshake_metadata = getattr(
+                        connector_worker,
+                        "xfer_handshake_metadata",
+                        None,
+                    )
+                    if worker_handshake_metadata is not None:
+                        worker_handshake_metadata.engine_id = (
+                            vllm_config.kv_transfer_config.engine_id
+                        )
 
             success = executor.handle_new_deployment()
 

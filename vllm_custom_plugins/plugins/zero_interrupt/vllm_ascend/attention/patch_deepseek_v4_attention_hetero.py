@@ -21,7 +21,17 @@ import math
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank
-from vllm.distributed.utils import get_tp_partition_offset, get_tp_partition_size
+
+try:
+    from vllm.distributed.utils import (
+        get_tp_partition_offset,
+        get_tp_partition_size,
+    )
+except ImportError:  # stock v0.23 tree without the hetero utils patch
+    from vllm_custom_plugins.plugins.zero_interrupt.vllm.distributed.patch_hetero_utils import (
+        get_tp_partition_offset,
+        get_tp_partition_size,
+    )
 
 _ATTENTION_HETERO_PATCH_APPLIED = False
 

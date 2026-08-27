@@ -17,11 +17,14 @@ import time
 import traceback
 from collections import deque
 from dataclasses import asdict
+from datetime import timedelta
 from typing import Any, Callable
 import pickle
 import cloudpickle
 from functools import partial
 from collections.abc import Sequence
+
+import torch
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -742,6 +745,71 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             logger.error(f"Error restarting workers: {e}")
             return False
 
+    def _barrier_for_full_restart(self, timeout_seconds: int = 120) -> None:
+        """Barrier across all DP executor processes before a full restart.
+
+        DP4TP4 -> DP4TP(3,4,4,4) changes the global worker world from 16 to
+        15 ranks and rebuilds every MoE/HCCL communication group.  If one
+        executor killed its workers while the others were still serving from
+        the old 16-rank world, the old collectives on the healthy executors
+        can fail in an uncontrolled way and the new 15-rank ``init_process_group``
+        can hang forever waiting for ranks that never join.
+
+        All four engine-core processes already share a CPU ``dp_group``
+        (created by ``DPEngineCoreProc``) that survives worker restarts.
+        Use it as a deterministic pre-restart rendezvous: every executor that
+        received the heterogeneous strategy must reach this point before any
+        of them terminates workers.
+        """
+        engine_core = getattr(self, "_engine_core_ref", None)
+        dp_group = getattr(engine_core, "dp_group", None) if engine_core else None
+        if dp_group is None:
+            logger.info(
+                "Full-restart barrier skipped: no cross-executor DP group."
+            )
+            return
+        try:
+            world_size = int(dp_group.size())
+            rank_in_dp = int(dp_group.rank())
+        except Exception as exc:  # defensive: non-torch/stateless group
+            logger.warning(
+                "Full-restart barrier skipped: cannot query dp_group "
+                "size/rank: %s",
+                exc,
+            )
+            return
+        if world_size < 2:
+            logger.info(
+                "Full-restart barrier skipped: cross-executor DP group "
+                "world_size=%d.",
+                world_size,
+            )
+            return
+        logger.info(
+            "Full-restart barrier: waiting for %d/%d DP executors to receive "
+            "the heterogeneous strategy before worker cleanup.",
+            rank_in_dp + 1,
+            world_size,
+        )
+        tensor = torch.tensor([1], dtype=torch.int32)
+        work = torch.distributed.all_reduce(
+            tensor, group=dp_group, async_op=True
+        )
+        if not work.wait(timeout=timedelta(seconds=timeout_seconds)):
+            raise RuntimeError(
+                "Heterogeneous full restart barrier timed out after "
+                f"{timeout_seconds}s waiting for all {world_size} DP "
+                "executors. The decision center must push the same "
+                "engine_parallel_config to EVERY DP executor (heterogeneous "
+                "TP changes MoE weights and global communication groups, so "
+                "restarting only the faulty DP is invalid)."
+            )
+        logger.info(
+            "Full-restart barrier passed: all %d DP executors will now "
+            "restart their workers together.",
+            world_size,
+        )
+
     def _cleanup_and_restart_workers(self) -> None:
         """Restart all workers with current VllmConfig.
 
@@ -751,6 +819,23 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         logger.info("Restarting all workers with current VllmConfig")
 
         try:
+            # Heterogeneous TP (e.g. DP4TP4 -> DP4TP(3,4,4,4)) rebuilds the
+            # global worker world and all MoE communication groups.  Before
+            # killing any worker, rendezvous with the other DP executors:
+            # restarting only the faulty DP would leave the healthy DPs in the
+            # old 16-rank world and the new 15-rank init_process_group would
+            # wait forever.
+            if (
+                self.current_strategy is not None
+                and not getattr(self, "shutting_down", False)
+                and self._strategy_requires_full_restart(self.current_strategy)
+            ):
+                self._barrier_for_full_restart()
+                logger.info(
+                    "Heterogeneous TP restart: restarting workers of EVERY "
+                    "DP instance."
+                )
+
             # Step 1: Clean up all requests in scheduler before worker restart
             self._cleanup_scheduler_requests()
 
@@ -1402,8 +1487,16 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             # 不能只重启故障卡所在的 DP。
             if self._strategy_requires_full_restart(strategy):
                 current_config = self._get_current_engine_config(strategy)
-                new_tp = current_config.new_tp if current_config.new_tp else current_config.tp
-                new_dp = current_config.new_dp if current_config.new_dp else current_config.dp
+                new_tp = (
+                    current_config.new_tp
+                    if current_config.new_tp is not None
+                    else current_config.tp
+                )
+                new_dp = (
+                    current_config.new_dp
+                    if current_config.new_dp is not None
+                    else current_config.dp
+                )
                 logger.info(
                     "Heterogeneous TP PD_REBUILD: restarting workers of EVERY "
                     "DP instance with new config: TP=%s, DP=%s, shardings=%s",
@@ -1415,8 +1508,16 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             elif self._is_fault_instance_for_pd(strategy):
                 # 兼容原有非异构故障恢复：只有故障实例重启。
                 current_config = self._get_current_engine_config(strategy)
-                new_tp = current_config.new_tp if current_config.new_tp else current_config.tp
-                new_dp = current_config.new_dp if current_config.new_dp else current_config.dp
+                new_tp = (
+                    current_config.new_tp
+                    if current_config.new_tp is not None
+                    else current_config.tp
+                )
+                new_dp = (
+                    current_config.new_dp
+                    if current_config.new_dp is not None
+                    else current_config.dp
+                )
                 logger.info(
                     f"This instance is fault (has unhealthy NPUs), "
                     f"restarting workers with new config: TP={new_tp}, DP={new_dp}"
@@ -1453,7 +1554,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         """
         executor_id = strategy.executor_id
         for config in strategy.engine_parallel_config:
-            if config.executor_id == executor_id:
+            if str(config.executor_id) == str(executor_id):
                 return config
 
         # 如果找不到匹配的 config，返回默认配置
@@ -1501,18 +1602,51 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         world_size、MoE EP 通信组和非对称权重切分。vllm_plugins 的
         ``tp_asymmetric_shardings`` / ``new_tp`` 一旦出现，所有 DP rank
         都必须重建通信组，健康 DP 仅做 KV connector RPC 更新是不够的。
+
+        同时适用于 DEGRADE 和 PD_REBUILD：决策中心对这两种策略都必须把
+        完整的 engine_parallel_config 下发给每一个 DP executor。
         """
-        if strategy.deploy_type == DeployType.PD_REBUILD:
-            for conf in strategy.engine_parallel_config:
-                new_tp = conf.new_tp
-                if new_tp is not None and new_tp != conf.tp:
-                    return True
-                if conf.tp_asymmetric_shardings:
-                    return True
-                if new_tp == 0 and conf.new_dp == 0:
-                    # 有 executor 被缩到零，通信拓扑也发生变化。
-                    return True
-        return False
+        if strategy.deploy_type not in (
+            DeployType.DEGRADE,
+            DeployType.PD_REBUILD,
+        ):
+            return False
+
+        requires_full_restart = False
+        for conf in strategy.engine_parallel_config:
+            new_tp = conf.new_tp
+            if new_tp is not None and new_tp != conf.tp:
+                requires_full_restart = True
+            if conf.tp_asymmetric_shardings:
+                requires_full_restart = True
+            if new_tp == 0 and conf.new_dp == 0:
+                # 有 executor 被缩到零，通信拓扑也发生变化。
+                requires_full_restart = True
+
+        if not requires_full_restart:
+            return False
+
+        # Fail closed instead of deadlocking: every active DP rank must be
+        # present in the strategy.  A missing rank would make the new global
+        # init_process_group wait for ranks that will never join.
+        expected_dp = max(
+            (conf.dp for conf in strategy.engine_parallel_config),
+            default=0,
+        )
+        present = {
+            getattr(conf, "data_parallel_rank", None)
+            for conf in strategy.engine_parallel_config
+        }
+        missing = set(range(expected_dp)) - present
+        if missing:
+            raise ValueError(
+                "Heterogeneous full-restart strategy does not cover DP ranks "
+                f"{sorted(missing)}. The decision center must send the same "
+                "engine_parallel_config to every DP executor because the "
+                "global worker world size and MoE communication groups are "
+                "being rebuilt."
+            )
+        return True
 
     def _get_healthy_npu_ids_from_strategy(self, strategy: DeployStrategy) -> list[str] | None:
         """从策略中获取当前节点健康的 NPU ID 列表。
@@ -1727,10 +1861,33 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
             matched = True
             if strategy.deploy_type == DeployType.RECOVER:
-                # 恢复策略的参数和备份的并行配置应一致
-                assert engine_parallel_config.tp == self.backup_parallel_config["tensor_parallel_size"], f'{engine_parallel_config.tp} == {self.backup_parallel_config["tensor_parallel_size"]}'
-                assert engine_parallel_config.dp == self.backup_parallel_config["data_parallel_size"], f'{engine_parallel_config.dp} == {self.backup_parallel_config["data_parallel_size"]}'
-                assert engine_parallel_config.data_parallel_rank == self.backup_parallel_config["data_parallel_rank"], f'{engine_parallel_config.data_parallel_rank} == {self.backup_parallel_config["data_parallel_rank"]}'
+                # 恢复策略的参数和备份的并行配置应一致。没有备份时（例如
+                # 实例启动后直接收到 RECOVER）退化为按当前配置恢复。
+                backup = getattr(self, "backup_parallel_config", {})
+                expected_tp = backup.get(
+                    "tensor_parallel_size",
+                    self.parallel_config.tensor_parallel_size,
+                )
+                expected_dp = backup.get(
+                    "data_parallel_size",
+                    self.parallel_config.data_parallel_size,
+                )
+                expected_rank = backup.get(
+                    "data_parallel_rank",
+                    self.parallel_config.data_parallel_rank,
+                )
+                assert engine_parallel_config.tp == expected_tp, (
+                    f'{engine_parallel_config.tp} == {expected_tp}'
+                )
+                assert engine_parallel_config.dp == expected_dp, (
+                    f'{engine_parallel_config.dp} == {expected_dp}'
+                )
+                assert (
+                    engine_parallel_config.data_parallel_rank == expected_rank
+                ), (
+                    f'{engine_parallel_config.data_parallel_rank}'
+                    f' == {expected_rank}'
+                )
 
                 self.parallel_config.tensor_parallel_size = engine_parallel_config.tp
                 self.parallel_config.data_parallel_size = engine_parallel_config.dp
@@ -1739,7 +1896,10 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     if own_dp_rank is not None
                     else engine_parallel_config.data_parallel_rank
                 )
-                self.parallel_config.data_parallel_rank_local = self.backup_parallel_config["data_parallel_rank_local"]
+                self.parallel_config.data_parallel_rank_local = backup.get(
+                    "data_parallel_rank_local",
+                    self.parallel_config.data_parallel_rank_local,
+                )
                 self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
                 self.parallel_config.__post_init__()
                 self.parallel_config.data_parallel_rank = (
@@ -1747,12 +1907,15 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     if own_dp_rank is not None
                     else engine_parallel_config.data_parallel_rank
                 )
-                self.parallel_config.data_parallel_rank_local = self.backup_parallel_config["data_parallel_rank_local"]
+                self.parallel_config.data_parallel_rank_local = backup.get(
+                    "data_parallel_rank_local",
+                    self.parallel_config.data_parallel_rank_local,
+                )
                 self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
             elif strategy.deploy_type in (DeployType.DEGRADE, DeployType.PD_REBUILD):
-                if strategy.deploy_type == DeployType.DEGRADE:
-                    # 备份缩容前的对称策略(连续多次缩容只备份第一次)
-                    self._try_backup_origin_parallel_config_when_degrade()
+                # 连续多次缩容/异构重建只备份第一次的原始对称配置，
+                # 供后续 RECOVER 恢复。
+                self._try_backup_origin_parallel_config_when_degrade()
 
                 # 汇总当前 executor 之前被置空（scale-to-zero）的 DP rank。
                 rm_data_parallel_rank = len([
@@ -1762,10 +1925,11 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
                 new_tp = engine_parallel_config.new_tp if engine_parallel_config.new_tp is not None else engine_parallel_config.tp
                 new_dp = engine_parallel_config.new_dp if engine_parallel_config.new_dp is not None else engine_parallel_config.dp
+                backup = getattr(self, "backup_parallel_config", {})
                 logger.info(
                     "Matched executor_id=%s, backup_parallel_config=%s, "
                     "New TP=%s, new DP=%s, rm_data_parallel_rank=%s",
-                    executor_id, self.backup_parallel_config, new_tp, new_dp,
+                    executor_id, backup, new_tp, new_dp,
                     rm_data_parallel_rank,
                 )
 
@@ -1784,9 +1948,8 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                         )
                     else:
                         self.parallel_config.data_parallel_rank = (
-                            self.backup_parallel_config.get(
-                                "data_parallel_rank", 0
-                            ) - rm_data_parallel_rank
+                            backup.get("data_parallel_rank", 0)
+                            - rm_data_parallel_rank
                         )
                 self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
                 if new_tp > 0 and new_dp > 0:
