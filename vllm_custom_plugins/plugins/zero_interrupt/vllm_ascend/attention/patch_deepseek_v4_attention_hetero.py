@@ -22,6 +22,8 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.utils import get_tp_partition_offset, get_tp_partition_size
 
+_ATTENTION_HETERO_PATCH_APPLIED = False
+
 
 def _get_dsa_local_heads(vllm_config: VllmConfig | None, total_num_heads: int, tp_size: int) -> int:
     """Return the number of local attention heads for DSA metadata.
@@ -925,9 +927,17 @@ _DS_CP_PATCHED_SYMBOLS = (
 def apply_deepseek_v4_attention_hetero_patch() -> dict[str, list[str]]:
     """Apply heterogeneous-TP DSA attention patches to installed vllm_ascend.
 
-    The function is idempotent: original ``dsa_cp`` method functions are saved
-    only once, and re-applying the same code objects is harmless.
+    Idempotent.  Some of the patched functions are ``__code__``-level
+    wrappers around a saved original function object; applying twice would
+    replace the code of the saved original as well and cause recursion.
     """
+    global _ATTENTION_HETERO_PATCH_APPLIED
+    if _ATTENTION_HETERO_PATCH_APPLIED:
+        return {
+            "vllm_ascend.attention.dsa_v1": list(_DS_V1_PATCHED_SYMBOLS),
+            "vllm_ascend.attention.context_parallel.dsa_cp": list(_DS_CP_PATCHED_SYMBOLS),
+        }
+
     from vllm_ascend.attention import dsa_v1 as dsa_v1_module
     from vllm_ascend.attention.context_parallel import dsa_cp as dsa_cp_module
 
@@ -969,6 +979,7 @@ def apply_deepseek_v4_attention_hetero_patch() -> dict[str, list[str]]:
         restore_tp_head_layout.__code__
     )
 
+    _ATTENTION_HETERO_PATCH_APPLIED = True
     return {
         "vllm_ascend.attention.dsa_v1": list(_DS_V1_PATCHED_SYMBOLS),
         "vllm_ascend.attention.context_parallel.dsa_cp": list(_DS_CP_PATCHED_SYMBOLS),
