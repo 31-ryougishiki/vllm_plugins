@@ -1098,13 +1098,35 @@ class FusedMoEParallelConfig:
             - Comment: There are 2 engine instances and the experts are split
                 between the 4 devices.
         """
-        use_ep = (
-            dp_size_ * pcp_size_ * tp_size_ > 1
-            and vllm_parallel_config.enable_expert_parallel
-        ) # TODO: [lqf] 需要整改
+        # 异构 TP（DP4TP4 -> DP4TP(3,4,4,4)）下 orphaned TP rank 的
+        # DP group 是 singleton（get_dp_group().world_size == 1），并且
+        # draft model 可能临时把 TP group patch 成 size-1。因此必须从
+        # parallel_config 读取真实的 dp/tp 值，否则 use_ep 会误判。
+        from vllm.config import get_current_vllm_config_or_none
 
-        dp_size = dp_size_
-        dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
+        _cfg = get_current_vllm_config_or_none()
+        is_hetero = bool(
+            _cfg is not None
+            and getattr(_cfg.parallel_config, "is_heterogeneous_tp", False)
+        )
+        if is_hetero:
+            pc = _cfg.parallel_config
+            dp_size = pc.data_parallel_size
+            dp_rank = pc.data_parallel_rank
+            use_ep = (
+                pc.data_parallel_size
+                * pcp_size_
+                * tp_size_
+                > 1
+                and vllm_parallel_config.enable_expert_parallel
+            )
+        else:
+            use_ep = (
+                dp_size_ * pcp_size_ * tp_size_ > 1
+                and vllm_parallel_config.enable_expert_parallel
+            ) # TODO: [lqf] 需要整改
+            dp_size = dp_size_
+            dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
         pcp_size = pcp_size_
         pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
         tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(

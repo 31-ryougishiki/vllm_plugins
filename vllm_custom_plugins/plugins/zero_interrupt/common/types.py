@@ -85,6 +85,9 @@ class EngineParallelConfig:
     enable_expert_parallel: bool = False
     new_dp: int | None = None
     new_tp: int | None = None
+    tp_asymmetric_shardings: list[int] | None = None
+    """Per-TP-rank sharding ratios for the new_tp ranks, e.g. [2, 1, 1].
+    None means uniform sharding. This is the vllm_plugins-native config."""
 
 
 @dataclass

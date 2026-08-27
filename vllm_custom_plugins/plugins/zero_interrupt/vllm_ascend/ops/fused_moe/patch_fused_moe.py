@@ -101,7 +101,39 @@ class PatchAscendFusedMoE(AscendFusedMoE):
         # but this class attribute may not be accessible yet when create_weights is called in some code paths
         # (e.g., when SharedFusedMoE or other subclasses trigger weight creation before the attribute propagates).
         # Manually compute and inject intermediate_size_per_partition to ensure it's available.
-        intermediate_size_per_partition = intermediate_size // self.tp_size
+        # DeepSeek-V4 异构重启：按 tp_asymmetric_shardings（例如 [2,1,1]）切分
+        # 而非 intermediate_size // tp_size，否则 2048 在 tp=3 上会切成
+        # 682/682/682 而不是 1024/512/512。
+        _asym_ratios = None
+        try:
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm_custom_plugins.plugins.zero_interrupt.vllm.v1.executor.utils import (
+                get_tp_asymmetric_shardings,
+            )
+
+            _cfg = get_current_vllm_config_or_none()
+            _additional = getattr(_cfg, "additional_config", None) or {}
+            _ratios = get_tp_asymmetric_shardings(
+                _additional.get("zero_interrupt_config", {})
+            )
+            if _ratios and len(_ratios) == self.tp_size:
+                _asym_ratios = [int(r) for r in _ratios]
+        except Exception:
+            _asym_ratios = None
+
+        if _asym_ratios is not None:
+            _world_split = sum(_asym_ratios)
+            _split = _asym_ratios[self.tp_rank]
+            intermediate_size_per_partition = (
+                intermediate_size // _world_split
+            ) * _split
+            _remainder = intermediate_size % _world_split
+            # remainder 给最后一个 rank，保持各 rank 分片之和等于
+            # intermediate_size。
+            if self.tp_rank == self.tp_size - 1:
+                intermediate_size_per_partition += _remainder
+        else:
+            intermediate_size_per_partition = intermediate_size // self.tp_size
         self.intermediate_size_per_partition = intermediate_size_per_partition
         self.moe_config.intermediate_size_per_partition = intermediate_size_per_partition
         logger.info_once(f"TP={self.tp_size}, local_num_experts={self.local_num_experts}, "

@@ -46,6 +46,12 @@ from vllm_custom_plugins.plugins.zero_interrupt.common.types import DeployState,
     InitExecutorStateRequest, ModelInfo
 
 from vllm_custom_plugins.plugins.zero_interrupt.common.communication.decision_center_client import DecisionCenterClient
+from vllm_custom_plugins.plugins.zero_interrupt.vllm.v1.executor.utils import (
+    get_global_start_rank,
+    get_heterogeneous_dp_config,
+    get_tp_asymmetric_shardings,
+    is_heterogeneous_restart,
+)
 from .health_monitor import ITSHealthMonitor, ITSFailureCallback
 from .http_server import ITSHttpServer
 from .strategy_sync import StrategySyncThread
@@ -1108,11 +1114,16 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                         os.environ["ASCEND_RT_VISIBLE_DEVICES"] = healthy_npu_str
 
             self._get_engine_parallel_config(self.current_strategy)
-        # global_start_rank 和 node_rank_within_dp 使用节点级别的 rank，不是 active_count
-        # 这样可以确保每个 executor 的 rank 是基于其物理位置的全局 rank
-        # 注意：必须使用更新后的 parallel_config.local_world_size，不能用 self.local_world_size
-        # 因为 _get_engine_parallel_config 可能已更改了 world_size 等参数
-        global_start_rank = self.parallel_config.local_world_size * self.parallel_config.node_rank_within_dp
+        # WorkerProc.rank/local_rank 仍是节点内（DP 内）的本地 rank，全局
+        # torch.distributed rank 偏移由 worker 的
+        # init_distributed_environment_asym 通过
+        # get_global_rank_asym(local_rank) 计算（DP4TP(3,4,4,4) 时
+        # 0/3/7/11）。不要把全局偏移传给 WorkerProc，否则
+        # _is_driver_worker(rank % local_tp_size == 0) 会在 DP1..3 失效。
+        global_start_rank = (
+            self.parallel_config.local_world_size
+            * self.parallel_config.node_rank_within_dp
+        )
         # 从 parallel_config 获取并行配置（已在 _get_engine_parallel_config 中更新）
         new_tp = self.parallel_config.tensor_parallel_size
         new_dp = self.parallel_config.data_parallel_size
@@ -1250,6 +1261,43 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         strategy_dict = asdict(self.current_strategy)
         # Convert enum values to strings
         strategy_dict = self._convert_enums_to_values(strategy_dict)
+
+        # 注入异构重启所需的完整拓扑信息。所有 DP executor 都使用同一份
+        # heterogeneous_dp_config，worker 启动时据此建立 15-rank 的
+        # torch.distributed 世界和各 DP 的 TP/DP/EP 通信组。
+        engine_parallel_config_list = strategy_dict.get(
+            "engine_parallel_config", []
+        )
+        if engine_parallel_config_list and is_heterogeneous_restart(
+            strategy_dict
+        ):
+            heterogeneous_dp_config = get_heterogeneous_dp_config(strategy_dict)
+            strategy_dict["heterogeneous_dp_config"] = heterogeneous_dp_config
+            strategy_dict["global_world_size"] = sum(
+                cfg["tp_size"] for cfg in heterogeneous_dp_config
+            )
+            strategy_dict["global_start_rank"] = get_global_start_rank(
+                strategy_dict
+            )
+            # 保留 vllm_plugins 原生配置名，worker/model patch 直接读取。
+            current_config = next(
+                (
+                    cfg
+                    for cfg in engine_parallel_config_list
+                    if str(cfg.get("executor_id", None))
+                    == str(strategy_dict.get("executor_id", "0"))
+                ),
+                None,
+            )
+            if current_config is not None:
+                shardings = current_config.get("tp_asymmetric_shardings")
+                if shardings is None and (
+                    current_config.get("new_tp") is not None
+                    and current_config.get("new_tp") != current_config.get("tp")
+                ):
+                    shardings = get_tp_asymmetric_shardings(strategy_dict)
+                strategy_dict["tp_asymmetric_shardings"] = shardings
+
         self.vllm_config.additional_config["zero_interrupt_config"] = strategy_dict
         logger.info(f"Updated VllmConfig.additional_config with strategy: {self.current_strategy.deploy_type.value}")
 
@@ -1348,11 +1396,24 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         logger.info("Executing PD_REBUILD strategy")
 
         try:
-            # 判断是否是故障实例
-            is_fault_instance = self._is_fault_instance_for_pd(strategy)
-
-            if is_fault_instance:
-                # 获取当前实例的新 TP/DP 配置
+            # DeepSeek-V4 DP4TP4 -> DP4TP(3,4,4,4) 属于异构 TP 切换：
+            # MoE 权重、EP 通信组和全局 rank 布局全部发生变化，因此
+            # **所有 DP**（包括没有故障卡的 DP）都必须重启 worker，
+            # 不能只重启故障卡所在的 DP。
+            if self._strategy_requires_full_restart(strategy):
+                current_config = self._get_current_engine_config(strategy)
+                new_tp = current_config.new_tp if current_config.new_tp else current_config.tp
+                new_dp = current_config.new_dp if current_config.new_dp else current_config.dp
+                logger.info(
+                    "Heterogeneous TP PD_REBUILD: restarting workers of EVERY "
+                    "DP instance with new config: TP=%s, DP=%s, shardings=%s",
+                    new_tp, new_dp,
+                    getattr(current_config, "tp_asymmetric_shardings", None),
+                )
+                # _init_workers 会从 strategy 中提取并应用完整异构配置。
+                self._cleanup_and_restart_workers()
+            elif self._is_fault_instance_for_pd(strategy):
+                # 兼容原有非异构故障恢复：只有故障实例重启。
                 current_config = self._get_current_engine_config(strategy)
                 new_tp = current_config.new_tp if current_config.new_tp else current_config.tp
                 new_dp = current_config.new_dp if current_config.new_dp else current_config.dp
@@ -1360,8 +1421,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     f"This instance is fault (has unhealthy NPUs), "
                     f"restarting workers with new config: TP={new_tp}, DP={new_dp}"
                 )
-                # 故障实例：使用 new_tp/new_dp 重启 Workers
-                # 注意：new_tp/new_dp 会通过 _init_workers 从 strategy 中提取并应用
                 self._cleanup_and_restart_workers()
             else:
                 logger.info("This instance is healthy, updating KVConnector via RPC")
@@ -1434,6 +1493,26 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                                 logger.info(f"Found unhealthy device on {current_host_ip}: {device}")
                                 return True  # 有不健康设备，是故障实例
         return False  # 全部健康，是健康实例
+
+    def _strategy_requires_full_restart(self, strategy: DeployStrategy) -> bool:
+        """判断策略是否需要所有 DP executor 重启 worker。
+
+        DeepSeek-V4 异构场景（DP4TP4 -> DP4TP(3,4,4,4)）改变了全局
+        world_size、MoE EP 通信组和非对称权重切分。vllm_plugins 的
+        ``tp_asymmetric_shardings`` / ``new_tp`` 一旦出现，所有 DP rank
+        都必须重建通信组，健康 DP 仅做 KV connector RPC 更新是不够的。
+        """
+        if strategy.deploy_type == DeployType.PD_REBUILD:
+            for conf in strategy.engine_parallel_config:
+                new_tp = conf.new_tp
+                if new_tp is not None and new_tp != conf.tp:
+                    return True
+                if conf.tp_asymmetric_shardings:
+                    return True
+                if new_tp == 0 and conf.new_dp == 0:
+                    # 有 executor 被缩到零，通信拓扑也发生变化。
+                    return True
+        return False
 
     def _get_healthy_npu_ids_from_strategy(self, strategy: DeployStrategy) -> list[str] | None:
         """从策略中获取当前节点健康的 NPU ID 列表。
@@ -1550,100 +1629,236 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
     def _get_engine_parallel_config(self, strategy: DeployStrategy):
         """从策略获取新的 TP/DP 配置。
 
-        直接更新 parallel_config 中的 tensor_parallel_size 和 data_parallel_size，
-        world_size、local_world_size 由 vLLM 自动计算。
-
-        注意：global_start_rank 在调用处使用 node_rank_within_dp 计算，
-        不再在此方法中基于 active_count 计算。
-
-        Args:
-            node_rank_within_dp: Original node rank within DP
-            strategy: DEGRADE deployment strategy
+        除了更新当前 executor 的 TP/DP 外，还把完整的
+        ``heterogeneous_dp_config``（每个 DP rank 的 tp_size 与
+        tp_asymmetric_shardings）写入 parallel_config。这样：
+        - worker 可以据此建立 15-rank 的全局通信域；
+        - DeepSeek-V4 权重加载可以读取 [2,1,1] 这类非对称切分；
+        - DP4TP4 -> DP4TP(3,4,4,4) 时所有 DP 都会用同一份拓扑重启。
         """
-        logger.info(f"Getting new TP/DP config from strategy")
-        engine_parallel_config_list = strategy.engine_parallel_config
-        # 按 data_parallel_rank 从小到大排序，确保遍历顺序正确
+        logger.info("Getting new TP/DP config from strategy")
         engine_parallel_config_list = sorted(
-            engine_parallel_config_list,
+            strategy.engine_parallel_config,
             key=lambda x: getattr(x, 'data_parallel_rank', 0) or 0
         )
 
         executor_id = strategy.executor_id
         logger.info(
-            f"#############executor_id={executor_id}, engine_parallel_config_list:{engine_parallel_config_list} ")
+            "executor_id=%s, engine_parallel_config_list=%s",
+            executor_id, engine_parallel_config_list,
+        )
         matched = False
         rm_data_parallel_rank = 0
 
+        # 构建完整异构拓扑（跳过 new_tp/new_dp 均为 0 的空转 executor）。
+        hetero_configs = []
+        for conf in engine_parallel_config_list:
+            new_tp = conf.new_tp if conf.new_tp is not None else conf.tp
+            new_dp = conf.new_dp if conf.new_dp is not None else conf.dp
+            if new_tp == 0 and new_dp == 0:
+                continue
+            ratios = conf.tp_asymmetric_shardings
+            if ratios is None and new_tp != conf.tp:
+                # 与 get_tp_asymmetric_shardings 的 legacy 逻辑保持一致。
+                tmp_strategy = {
+                    "executor_id": conf.executor_id,
+                    "engine_parallel_config": [asdict(conf)],
+                }
+                ratios = get_tp_asymmetric_shardings(tmp_strategy)
+            hetero_configs.append(
+                {
+                    "executor_id": str(conf.executor_id),
+                    "dp_rank": int(
+                        getattr(conf, "data_parallel_rank", 0) or 0
+                    ),
+                    "tp_size": int(new_tp),
+                    "tp_sharding_ratios": (
+                        [int(r) for r in ratios] if ratios else None
+                    ),
+                }
+            )
+        hetero_configs.sort(key=lambda c: c["dp_rank"])
+        # 跳过被缩到零的 executor 后重新连续编号，保证
+        # heterogeneous_dp_config 覆盖 0..N-1。
+        for new_rank, cfg in enumerate(hetero_configs):
+            cfg["dp_rank"] = new_rank
+
+        # 纯 DP 扩缩容（各 rank tp 不变且无显式非对称配比）继续走
+        # 原有对称流程，避免 legacy 多机/EPLB 场景被 hetero 校验拒绝。
+        hetero_restart = any(
+            (
+                c.new_tp is not None and c.new_tp != c.tp
+            ) or bool(c.tp_asymmetric_shardings)
+            for c in engine_parallel_config_list
+        )
+        hetero_configs_for_pc = hetero_configs if hetero_restart else None
+        own_dp_rank = (
+            next(
+                (
+                    cfg["dp_rank"]
+                    for cfg in hetero_configs
+                    if cfg["executor_id"] == str(executor_id)
+                ),
+                None,
+            )
+            if hetero_restart else None
+        )
+
         for idx, engine_parallel_config in enumerate(engine_parallel_config_list):
-            # 兼容 executor_id 类型不一致的情况（字符串 vs 整数）
             engine_executor_id = engine_parallel_config.executor_id
             logger.info(
-                f"Checking executor_id match: strategy.executor_id={executor_id} (type={type(executor_id).__name__}) "
-                f"vs engine_config.executor_id={engine_executor_id} (type={type(engine_executor_id).__name__ if engine_executor_id is not None else 'None'}), "
-                f"config: new_tp={engine_parallel_config.new_tp}, new_dp={engine_parallel_config.new_dp}, "
-                f"tp={engine_parallel_config.tp}, dp={engine_parallel_config.dp}")
-            logger.info(
-                f"###########*********##executor_id={executor_id}, engine_parallel_config:{engine_parallel_config} ")
-            if engine_executor_id is not None and executor_id is not None:
-                # 尝试将两者转为字符串进行比较，避免类型不一致导致的比较失败
-                if str(executor_id) == str(engine_executor_id):
-                    matched = True
-                    if strategy.deploy_type == DeployType.RECOVER:
-                        # 恢复策略的参数和备份的并行配置应一致
-                        assert engine_parallel_config.tp == self.backup_parallel_config["tensor_parallel_size"], f'{engine_parallel_config.tp} == {self.backup_parallel_config["tensor_parallel_size"]}'
-                        assert engine_parallel_config.dp == self.backup_parallel_config["data_parallel_size"], f'{engine_parallel_config.dp} == {self.backup_parallel_config["data_parallel_size"]}'
-                        assert engine_parallel_config.data_parallel_rank == self.backup_parallel_config["data_parallel_rank"], f'{engine_parallel_config.data_parallel_rank} == {self.backup_parallel_config["data_parallel_rank"]}'
+                "Checking executor_id match: strategy.executor_id=%s (%s) vs "
+                "config.executor_id=%s (%s), config: new_tp=%s, new_dp=%s, "
+                "tp=%s, dp=%s, tp_asymmetric_shardings=%s",
+                executor_id, type(executor_id).__name__,
+                engine_executor_id,
+                type(engine_executor_id).__name__
+                if engine_executor_id is not None else "None",
+                engine_parallel_config.new_tp,
+                engine_parallel_config.new_dp,
+                engine_parallel_config.tp,
+                engine_parallel_config.dp,
+                engine_parallel_config.tp_asymmetric_shardings,
+            )
+            if engine_executor_id is None or executor_id is None:
+                continue
+            if str(executor_id) != str(engine_executor_id):
+                continue
 
-                        self.parallel_config.tensor_parallel_size = engine_parallel_config.tp
-                        self.parallel_config.data_parallel_size = engine_parallel_config.dp
-                        self.parallel_config.__post_init__()
-                        self.parallel_config.data_parallel_rank = engine_parallel_config.data_parallel_rank
-                        self.parallel_config.data_parallel_rank_local = self.backup_parallel_config["data_parallel_rank_local"]
-                    elif strategy.deploy_type == DeployType.DEGRADE:
-                        logger.debug(f"+++++++[mzm]+++++++++++++Degrade  executor_id={executor_id}+++++++[mzm]+++++++++++++")
-                        # 备份缩容前的对称策略(连续多次缩容不会多次写入，仅第一次缩容进行有效备份)
-                        self._try_backup_origin_parallel_config_when_degrade()
+            matched = True
+            if strategy.deploy_type == DeployType.RECOVER:
+                # 恢复策略的参数和备份的并行配置应一致
+                assert engine_parallel_config.tp == self.backup_parallel_config["tensor_parallel_size"], f'{engine_parallel_config.tp} == {self.backup_parallel_config["tensor_parallel_size"]}'
+                assert engine_parallel_config.dp == self.backup_parallel_config["data_parallel_size"], f'{engine_parallel_config.dp} == {self.backup_parallel_config["data_parallel_size"]}'
+                assert engine_parallel_config.data_parallel_rank == self.backup_parallel_config["data_parallel_rank"], f'{engine_parallel_config.data_parallel_rank} == {self.backup_parallel_config["data_parallel_rank"]}'
 
-                        # 按data_parallel_rank排序后，汇总dp-rank小于当前executor的故障信息。
-                        # 如果某executor的new_tp/new_dp均为0, 意味着该executor进入idle状态.
-                        # 此时, 后续executor的dp-rank需要相应往前排
-                        rm_data_parallel_rank = len([c for c in engine_parallel_config_list[:idx] if c.new_tp == 0 and c.new_dp == 0 and c.dp > 1])
+                self.parallel_config.tensor_parallel_size = engine_parallel_config.tp
+                self.parallel_config.data_parallel_size = engine_parallel_config.dp
+                self.parallel_config.data_parallel_rank = (
+                    own_dp_rank
+                    if own_dp_rank is not None
+                    else engine_parallel_config.data_parallel_rank
+                )
+                self.parallel_config.data_parallel_rank_local = self.backup_parallel_config["data_parallel_rank_local"]
+                self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
+                self.parallel_config.__post_init__()
+                self.parallel_config.data_parallel_rank = (
+                    own_dp_rank
+                    if own_dp_rank is not None
+                    else engine_parallel_config.data_parallel_rank
+                )
+                self.parallel_config.data_parallel_rank_local = self.backup_parallel_config["data_parallel_rank_local"]
+                self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
+                self.parallel_config.world_size_across_dp = (
+                    sum(cfg.tp_size for cfg in self.parallel_config.heterogeneous_dp_config)
+                    if self.parallel_config.heterogeneous_dp_config
+                    else self.parallel_config.world_size * self.parallel_config.data_parallel_size
+                )
+            elif strategy.deploy_type in (DeployType.DEGRADE, DeployType.PD_REBUILD):
+                if strategy.deploy_type == DeployType.DEGRADE:
+                    # 备份缩容前的对称策略(连续多次缩容只备份第一次)
+                    self._try_backup_origin_parallel_config_when_degrade()
 
-                        # Use new_tp/new_dp if available, otherwise fall back to tp/dp
-                        new_tp = engine_parallel_config.new_tp if engine_parallel_config.new_tp is not None else engine_parallel_config.tp
-                        new_dp = engine_parallel_config.new_dp if engine_parallel_config.new_dp is not None else engine_parallel_config.dp
-                        logger.info(f"Matched executor_id={executor_id}, self.backup_parallel_config={self.backup_parallel_config}, New TP={new_tp}, new DP={new_dp}, rm_data_parallel_rank={rm_data_parallel_rank}")
+                # 汇总当前 executor 之前被置空（scale-to-zero）的 DP rank。
+                rm_data_parallel_rank = len([
+                    c for c in engine_parallel_config_list[:idx]
+                    if c.new_tp == 0 and c.new_dp == 0 and c.dp > 1
+                ])
 
-                        # 直接更新 parallel_config，让 vLLM 自动计算其他值
-                        self.parallel_config.tensor_parallel_size = new_tp
-                        self.parallel_config.data_parallel_size = new_dp
-                        self.parallel_config.data_parallel_rank = self.backup_parallel_config['data_parallel_rank'] - rm_data_parallel_rank
-                        # self.parallel_config.data_parallel_rank_local -= rm_data_parallel_rank
-                        # world_size = TP × PP × PCP，需要手动更新
-                        if new_tp > 0 and new_dp > 0:
-                            self.parallel_config.world_size = new_tp * self.parallel_config.pipeline_parallel_size * self.parallel_config.prefill_context_parallel_size
-                        else:
-                            self.parallel_config.world_size = 0
-                    elif strategy.deploy_type == DeployType.STOP:
-                        logger.debug(f"+++++++[mzm]+++++++++++++Stop executor_id={executor_id}+++++++[mzm]+++++++++++++")
-                        # 备份缩容前的对称策略(连续多次缩容不会多次写入，仅第一次缩容进行有效备份)
-                        self._try_backup_origin_parallel_config_when_degrade()
-                        self.parallel_config.tensor_parallel_size = 0
-                        self.parallel_config.data_parallel_size = 0
-                        self.parallel_config.world_size = 0
+                new_tp = engine_parallel_config.new_tp if engine_parallel_config.new_tp is not None else engine_parallel_config.tp
+                new_dp = engine_parallel_config.new_dp if engine_parallel_config.new_dp is not None else engine_parallel_config.dp
+                logger.info(
+                    "Matched executor_id=%s, backup_parallel_config=%s, "
+                    "New TP=%s, new DP=%s, rm_data_parallel_rank=%s",
+                    executor_id, self.backup_parallel_config, new_tp, new_dp,
+                    rm_data_parallel_rank,
+                )
+
+                self.parallel_config.tensor_parallel_size = new_tp
+                self.parallel_config.data_parallel_size = new_dp
+                if own_dp_rank is not None:
+                    # 异构拓扑里按 active executor 重新连续编号。
+                    self.parallel_config.data_parallel_rank = own_dp_rank
+                else:
+                    explicit_dp_rank = getattr(
+                        engine_parallel_config, "data_parallel_rank", None
+                    )
+                    if explicit_dp_rank is not None:
+                        self.parallel_config.data_parallel_rank = (
+                            explicit_dp_rank
+                        )
                     else:
-                        # 不应接收DEGRADE/RECOVER以外的策略
-                        raise ValueError(f"receive unknown strategy: {strategy}")
-                    logger.info(f"executor_id={executor_id}, TP={self.parallel_config.tensor_parallel_size}, DP={self.parallel_config.data_parallel_size}, world_size={self.parallel_config.world_size}, data_parallel_rank={self.parallel_config.data_parallel_rank}")
-                    
-                    # 提前break，仅处理当前executor有关信息
-                    break
+                        self.parallel_config.data_parallel_rank = (
+                            self.backup_parallel_config.get(
+                                "data_parallel_rank", 0
+                            ) - rm_data_parallel_rank
+                        )
+                self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
+                if new_tp > 0 and new_dp > 0:
+                    self.parallel_config.world_size = (
+                        new_tp
+                        * self.parallel_config.pipeline_parallel_size
+                        * self.parallel_config.prefill_context_parallel_size
+                    )
+                    self.parallel_config.world_size_across_dp = sum(
+                        cfg.tp_size
+                        for cfg in self.parallel_config.heterogeneous_dp_config
+                    ) if self.parallel_config.heterogeneous_dp_config else (
+                        self.parallel_config.world_size * new_dp
+                    )
+                else:
+                    self.parallel_config.world_size = 0
+                    self.parallel_config.world_size_across_dp = 0
+            elif strategy.deploy_type == DeployType.STOP:
+                self._try_backup_origin_parallel_config_when_degrade()
+                self.parallel_config.tensor_parallel_size = 0
+                self.parallel_config.data_parallel_size = 0
+                self.parallel_config.world_size = 0
+                self.parallel_config.world_size_across_dp = 0
+            else:
+                raise ValueError(f"receive unknown strategy: {strategy}")
+
+            logger.info(
+                "executor_id=%s, TP=%s, DP=%s, world_size=%s, "
+                "world_size_across_dp=%s, data_parallel_rank=%s, "
+                "heterogeneous_dp_config=%s",
+                executor_id,
+                self.parallel_config.tensor_parallel_size,
+                self.parallel_config.data_parallel_size,
+                self.parallel_config.world_size,
+                self.parallel_config.world_size_across_dp,
+                self.parallel_config.data_parallel_rank,
+                self.parallel_config.heterogeneous_dp_config,
+            )
+            break
 
         if not matched:
-            # 检查是否因为 executor_id 类型不匹配导致
             logger.warning(
                 f"No matching executor config found for executor_id={executor_id} (type={type(executor_id).__name__}), "
-                f"available configs: {[(ec.executor_id, type(ec.executor_id).__name__, ec.new_tp, ec.new_dp) for ec in engine_parallel_config_list]}")
+                f"available configs: {[(ec.executor_id, type(ec.executor_id).__name__, ec.new_tp, ec.new_dp) for ec in engine_parallel_config_list]}"
+            )
+
+    @staticmethod
+    def _to_heterogeneous_dp_config(configs: list[dict]):
+        """Convert strategy dicts to ParallelConfig.HeterogeneousDPConfig."""
+        if not configs:
+            return None
+        try:
+            from vllm.config.parallel import HeterogeneousDPConfig
+        except ImportError:
+            from vllm_custom_plugins.plugins.zero_interrupt.vllm.config.parallel import (
+                HeterogeneousDPConfig,
+            )
+        return [
+            HeterogeneousDPConfig(
+                **{
+                    k: v
+                    for k, v in cfg.items()
+                    if k in ("dp_rank", "tp_size", "tp_sharding_ratios")
+                }
+            )
+            for cfg in configs
+        ]
 
     @staticmethod
     def get_davinci_devices():

@@ -612,6 +612,25 @@ class NPUWorker(WorkerBase):
             asym_parallel_config.data_parallel_size = cur_engine_parallel_conf['new_dp']
             asym_parallel_config.world_size = asym_parallel_config.tensor_parallel_size # TODO: [lqf] world_size_inner_dp
             asym_parallel_config.world_size_across_dp = asym_world_size(zero_interrupt_config)
+
+            # DeepSeek-V4 异构重启：写入完整的 per-DP 拓扑，供
+            # get_tp_size_for_dp / get_sharding_ratios_for_dp /
+            # get_rank_offset_for_dp 使用。
+            heterogeneous_dp_config = zero_interrupt_config.get(
+                "heterogeneous_dp_config", None
+            )
+            if heterogeneous_dp_config:
+                try:
+                    from vllm.config.parallel import HeterogeneousDPConfig
+                except ImportError:
+                    from vllm_custom_plugins.plugins.zero_interrupt.vllm.config.parallel import (
+                        HeterogeneousDPConfig,
+                    )
+                asym_parallel_config.heterogeneous_dp_config = [
+                    HeterogeneousDPConfig(**cfg)
+                    for cfg in heterogeneous_dp_config
+                ]
+
             self.vllm_config.parallel_config = asym_parallel_config # NOTE: [lqf] rewrite parallel_config to avoid patching too much util function
             init_distributed_environment_asym(
                 asym_parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"

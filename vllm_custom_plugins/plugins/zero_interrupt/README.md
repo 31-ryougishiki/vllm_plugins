@@ -186,6 +186,10 @@ The plugin exposes the following HTTP endpoints:
 | MoE + PD分离 + DP/EP | Qwen3-Moe (235B-A22B) | ✓ |
 | MoE + PD不分离 + DP/EP | Qwen3-30B-A3B | ✓ |
 | 稠密模型 + PD不分离 + TP | Qwen3-Dense | ✓ |
+| 异构TP重启 + MoE + PD分离 | DeepSeek-V4-Flash-w8a8-mtp: prefill DP4TP4 -> DP4TP(3,4,4,4) | ✓ |
+
+DeepSeek-V4 异构重启的详细设计见
+[`DeepSeekV4_HETERO.md`](DeepSeekV4_HETERO.md)。
 
 ## Development
 

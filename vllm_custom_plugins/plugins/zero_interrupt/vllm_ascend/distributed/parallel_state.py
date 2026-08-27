@@ -101,6 +101,10 @@ def init_ascend_model_parallel_asym(
     global _MC2
     _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2") # NOTE:[lqf] EP专用通信组
 
+    # 异构 TP 下 FlashComm2 ODP 退化为主 TP 组；细粒度 TP 组保持 None。
+    global _FLASHCOMM2_ODP
+    _FLASHCOMM2_ODP = get_tp_group()
+
     # if get_ascend_config().eplb_config.dynamic_eplb:
     #     global _DYNAMIC_EPLB
     #     _DYNAMIC_EPLB = init_model_parallel_group(
