@@ -71,11 +71,34 @@ def _patched_ascend_vocab_init(
     if padding_size is None:
         padding_size = DEFAULT_PADDING_SIZE
     if _is_hetero_tp():
-        from vllm.distributed import get_tensor_model_parallel_world_size
+        # AscendVocabParallelEmbedding shards by its own comm_group (lm-head
+        # TP / embedding TP / regular TP), not necessarily by the global TP
+        # group.  Pad by the group that the original __init__ will actually
+        # use so num_embeddings_per_partition stays uniform.
+        prefix = kwargs.get("prefix", "")
+        try:
+            from vllm_ascend.distributed.parallel_state import (
+                get_embed_tp_group,
+                get_lmhead_tp_group,
+                get_tp_group,
+            )
+            from vllm_ascend.utils import (
+                embedding_tp_enable,
+                lmhead_tp_enable,
+            )
 
-        padding_size = lcm(
-            padding_size, get_tensor_model_parallel_world_size()
-        )
+            if lmhead_tp_enable() and "head" in prefix:
+                comm_group = get_lmhead_tp_group()
+            elif embedding_tp_enable() and "embed_tokens" in prefix:
+                comm_group = get_embed_tp_group()
+            else:
+                comm_group = get_tp_group()
+            group_size = comm_group.world_size
+        except Exception:
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            group_size = get_tensor_model_parallel_world_size()
+        padding_size = lcm(padding_size, group_size)
     return _ORIG_ASCEND_VOCAB_INIT(
         self,
         num_embeddings,

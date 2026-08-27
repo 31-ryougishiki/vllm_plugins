@@ -1027,10 +1027,14 @@ class NPUWorker(WorkerBase):
                     cur_engine_parallel_conf = conf
                     break
             asym_parallel_config.tensor_parallel_size = (
-                cur_engine_parallel_conf["new_tp"]
+                cur_engine_parallel_conf.get(
+                    "new_tp", cur_engine_parallel_conf.get("tp", 1)
+                )
             )
             asym_parallel_config.data_parallel_size = (
-                cur_engine_parallel_conf["new_dp"]
+                cur_engine_parallel_conf.get(
+                    "new_dp", cur_engine_parallel_conf.get("dp", 1)
+                )
             )
             asym_parallel_config.world_size = (
                 asym_parallel_config.tensor_parallel_size

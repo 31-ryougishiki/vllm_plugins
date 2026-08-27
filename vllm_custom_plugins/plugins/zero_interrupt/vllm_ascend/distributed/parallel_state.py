@@ -469,4 +469,10 @@ def get_global_rank(parallel_config: ParallelConfig | None = None) -> int:
         * parallel_config.prefill_context_parallel_size
     )
     rank_in_replica = get_world_group().rank_in_group % replica_size
+    if getattr(parallel_config, "is_heterogeneous_tp", False):
+        # Per-DP TP sizes differ (e.g. DP4TP(3,4,4,4)), so the uniform
+        # ``dp_rank * replica_size`` stride is wrong for DP1..3.
+        return parallel_config.get_rank_offset_for_dp(
+            parallel_config.data_parallel_index
+        ) + rank_in_replica
     return parallel_config.data_parallel_index * replica_size + rank_in_replica

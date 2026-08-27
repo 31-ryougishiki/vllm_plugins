@@ -117,6 +117,13 @@ class TestHeteroUtils(unittest.TestCase):
         cfg["executor_id"] = "3"
         self.assertEqual(get_global_start_rank(cfg), 11)
 
+    def test_global_start_rank_ignores_strategy_list_order(self):
+        cfg = self._strategy()
+        cfg["engine_parallel_config"].reverse()
+        cfg["executor_id"] = "2"
+        # Sorted by data_parallel_rank: dp0 (3 ranks) + dp1 (4 ranks) = 7.
+        self.assertEqual(get_global_start_rank(cfg), 7)
+
     def test_is_heterogeneous_restart(self):
         cfg = self._strategy()
         self.assertTrue(is_heterogeneous_restart(cfg))

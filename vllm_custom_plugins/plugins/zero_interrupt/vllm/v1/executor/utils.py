@@ -133,10 +133,16 @@ def get_global_world_size(zero_interrupt_config):
 
 def get_global_start_rank(zero_interrupt_config):
     """Global starting rank of the current executor's workers."""
-    configs = get_heterogeneous_dp_config(zero_interrupt_config)
+    # ``engine_parallel_config`` may arrive in any order.  Global offsets are
+    # cumulative in DP-rank order, so sort by data_parallel_rank first
+    # (scale-to-zero executors contribute zero ranks).
     executor_id = zero_interrupt_config.get("executor_id", "0")
+    ordered = sorted(
+        zero_interrupt_config.get("engine_parallel_config", []),
+        key=lambda conf: int(conf.get("data_parallel_rank", 0) or 0),
+    )
     offset = 0
-    for conf in zero_interrupt_config.get("engine_parallel_config", []):
+    for conf in ordered:
         if str(conf.get("executor_id", None)) == str(executor_id):
             return offset
         new_tp = conf.get("new_tp", None)

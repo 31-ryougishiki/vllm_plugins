@@ -73,31 +73,29 @@ def _patched_check_kv_extra_config(vllm_config):
 
 
 def _patched_enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False):
-    result = _ORIG_ENABLE_SP(
+    if enable_shared_expert_dp:
+        # The original helper force-enables the module-level FlashComm1 flag
+        # as a side effect.  Under heterogeneous TP the MoE EP path already
+        # implements shared-expert data parallelism; satisfy the caller
+        # (AscendConfig's assertion) WITHOUT mutating the global SP state.
+        cfg = vllm_config
+        if cfg is None:
+            try:
+                from vllm.config import get_current_vllm_config_or_none
+
+                cfg = get_current_vllm_config_or_none()
+            except AssertionError:
+                cfg = None
+        if (
+            cfg is not None
+            and getattr(cfg.parallel_config, "is_heterogeneous_tp", False)
+        ):
+            return True
+
+    return _ORIG_ENABLE_SP(
         vllm_config=vllm_config,
         enable_shared_expert_dp=enable_shared_expert_dp,
     )
-    if not enable_shared_expert_dp:
-        return result
-    if result:
-        return True
-
-    cfg = vllm_config
-    if cfg is None:
-        try:
-            from vllm.config import get_current_vllm_config
-
-            cfg = get_current_vllm_config()
-        except AssertionError:
-            cfg = None
-    if (
-        cfg is not None
-        and getattr(cfg.parallel_config, "is_heterogeneous_tp", False)
-    ):
-        # AscendConfig only uses this return value for the assertion.  The
-        # real per-forward SP decision keeps using the unforced _ENABLE_SP.
-        return True
-    return result
 
 
 def apply_hetero_ascend_config_patch():
@@ -109,4 +107,15 @@ def apply_hetero_ascend_config_patch():
     _ORIG_ENABLE_SP = mod.enable_sp
     mod.enable_sp = _patched_enable_sp
     mod.check_kv_extra_config = _patched_check_kv_extra_config
+
+    # ``vllm_ascend.platform`` imports ``check_kv_extra_config`` by name at
+    # module load and calls its own reference.  Patch that reference as well,
+    # otherwise the strict homogeneous TP check still runs and rejects the
+    # DP0 tp=3 prefill after a heterogeneous restart.
+    try:
+        import vllm_ascend.platform as platform_mod
+
+        platform_mod.check_kv_extra_config = _patched_check_kv_extra_config
+    except Exception:
+        pass
     _PATCHED = True

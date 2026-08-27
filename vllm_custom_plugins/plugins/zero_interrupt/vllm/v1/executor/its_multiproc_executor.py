@@ -1797,6 +1797,12 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     )
                 else:
                     self.parallel_config.world_size = 0
+                # data_parallel_index 是异构全局 rank 计算的输入
+                # （get_global_rank），必须和重新编号后的 data_parallel_rank
+                # 保持一致。
+                self.parallel_config.data_parallel_index = (
+                    self.parallel_config.data_parallel_rank
+                )
             elif strategy.deploy_type == DeployType.STOP:
                 self._try_backup_origin_parallel_config_when_degrade()
                 self.parallel_config.tensor_parallel_size = 0

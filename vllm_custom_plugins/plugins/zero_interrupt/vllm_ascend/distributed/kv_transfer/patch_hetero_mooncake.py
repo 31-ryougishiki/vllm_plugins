@@ -745,6 +745,190 @@ def _patched_transfer_kv_cache_all_groups(self, req_meta):
     )
 
 
+def _patched_register_kv_caches(self, kv_caches):
+    """Register the KV Cache data.
+
+    Copy of the installed v0.23 ``MooncakeConnectorWorker.register_kv_caches``
+    with the two hetero_cp changes:
+
+    * the handshake metadata carries ``block_strides`` and the absolute
+      ``handshake_port`` so decode workers can resolve remote producers under
+      heterogeneous TP; and
+    * the producer send thread is told the LOCAL per-DP tp_size (3 on DP0)
+      instead of the remote pool descriptor ``_prefill_tp_size`` (4).
+    """
+    self.use_mla = self.vllm_config.model_config.is_deepseek_mla
+    self.use_sparse = hasattr(
+        self.vllm_config.model_config.hf_text_config, "index_topk"
+    )
+
+    self.num_blocks = self.kv_cache_config.num_blocks
+    logger.info("num_blocks: %s", self.num_blocks)
+    self.kv_caches = kv_caches
+    self.kv_caches_base_addr = []
+    self.block_len_per_addr = []
+    self.block_stride_per_addr = []
+    self.addr_group_idx = []
+    ptrs = []
+    lengths = []
+    if not self.use_hybrid:
+        for layer_name, kv_cache_tuple in kv_caches.items():
+            if not isinstance(kv_cache_tuple, (list, tuple)):
+                kv_cache_tuple = [kv_cache_tuple]
+            for single_kv_cache in kv_cache_tuple:
+                tensor_num_blocks = single_kv_cache.shape[0]
+                block_size_scale = tensor_num_blocks // self.num_blocks
+                block_shape = single_kv_cache.shape[1:]
+                self.block_len_per_addr.append(
+                    single_kv_cache.element_size()
+                    * math.prod(block_shape)
+                    * block_size_scale
+                )
+                self.kv_caches_base_addr.append(single_kv_cache.data_ptr())
+                ptrs.append(single_kv_cache.data_ptr())
+                lengths.append(
+                    single_kv_cache.element_size()
+                    * math.prod(single_kv_cache.shape)
+                )
+    elif self.use_mamba:
+        for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
+            share_tensor_addr = []
+            for layer_name in kv_cache_tensor.shared_by:
+                kv_cache_tuple = kv_caches[layer_name]
+                if not isinstance(kv_cache_tuple, (list, tuple)):
+                    kv_cache_tuple = [kv_cache_tuple]
+                for single_kv_cache in kv_cache_tuple:
+                    if single_kv_cache.data_ptr() in self.kv_caches_base_addr:
+                        continue
+                    tensor_num_blocks = single_kv_cache.shape[0]
+                    block_size_scale = tensor_num_blocks // self.num_blocks
+                    block_shape = single_kv_cache.shape[1:]
+                    self.block_len_per_addr.append(
+                        single_kv_cache.element_size()
+                        * math.prod(block_shape)
+                        * block_size_scale
+                    )
+                    self.kv_caches_base_addr.append(
+                        single_kv_cache.data_ptr()
+                    )
+                    share_tensor_addr.append(single_kv_cache.data_ptr())
+            if share_tensor_addr:
+                ptrs.append(min(share_tensor_addr))
+                lengths.append(kv_cache_tensor.size)
+        self.block_stride_per_addr.extend(self.block_len_per_addr)
+    elif self.use_compress:
+        layer_group_idx = {}
+        for i, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            for layer_name in group.layer_names:
+                layer_group_idx[layer_name] = i
+        for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
+            if not kv_cache_tensor.shared_by:
+                continue
+            share_tensor_addr = []
+            share_tensor_stride = []
+            cur_tensor_group_idx = []
+            for layer_name in kv_cache_tensor.shared_by:
+                cur_tensor_group_idx.append(layer_group_idx[layer_name])
+                kv_cache_tuple = kv_caches[layer_name]
+                if not isinstance(kv_cache_tuple, (tuple, list)):
+                    kv_cache_tuple = kv_cache_tuple
+                for single_tensor in kv_cache_tuple:
+                    tensor_addr = single_tensor.data_ptr()
+                    if (
+                        tensor_addr in share_tensor_addr
+                        or tensor_addr in self.kv_caches_base_addr
+                    ):
+                        continue
+                    share_tensor_addr.append(tensor_addr)
+                    share_tensor_stride.append(
+                        single_tensor.stride(0) * single_tensor.element_size()
+                    )
+            cur_tensor_group_idx = sorted(list(set(cur_tensor_group_idx)))
+            self.kv_caches_base_addr.append(min(share_tensor_addr))
+            self.addr_group_idx.append(cur_tensor_group_idx)
+            self.block_stride_per_addr.append(share_tensor_stride[0])
+            self.block_len_per_addr.append(share_tensor_stride[0])
+            ptrs.append(min(share_tensor_addr))
+            lengths.append(kv_cache_tensor.size)
+    else:
+        raise TypeError(
+            "Mooncake connector does not support this type kv_cache now."
+        )
+
+    global_te.register_buffer(ptrs, lengths)
+    # After KV Caches registered, start the sending or receiving thread.
+    metadata = MooncakeAgentMetadata(
+        engine_id=self.engine_id,
+        te_rpc_port=self.te_rpc_port,
+        block_size=self.block_size,
+        kv_caches_base_addr=self.kv_caches_base_addr,
+        num_blocks=self.num_blocks,
+        block_lens=self.block_len_per_addr,
+        block_strides=self.block_stride_per_addr,
+        ssm_sizes=self._mamba_ssm_size,
+        local_ip=get_ip(),
+        handshake_port=self.handshake_port,
+    )
+    self.xfer_handshake_metadata = metadata
+
+    ready_event = threading.Event()
+    if self.kv_role == "kv_producer":
+        self.kv_send_thread = KVCacheSendingThread(
+            self.vllm_config,
+            self.tp_rank,
+            self.tp_size,
+            self.engine_id,
+            self.side_channel_host,
+            self.side_channel_port,
+            metadata,
+            ready_event,
+            self.kv_caches,
+        )
+        self.kv_send_thread.start()
+    else:
+        self.kv_recv_thread = KVCacheRecvingThread(
+            self.tp_rank,
+            self.tp_size,
+            self._prefill_pp_size,
+            self.engine,
+            self.engine_id,
+            self.handshake_port,
+            self.side_channel_port,
+            self.kv_caches_base_addr,
+            self.block_len_per_addr,
+            self.block_stride_per_addr,
+            self.addr_group_idx,
+            self._mamba_ssm_size,
+            self.use_hybrid,
+            self.use_mamba,
+            self.hma_group_size,
+            ready_event,
+            self.vllm_config,
+            self.kv_cache_config,
+            self.kv_caches,
+            self._prefill_pp_layer_partition,
+        )
+        self.kv_recv_thread.start()
+
+    start_wait_time = time.time()
+    thread = (
+        self.kv_send_thread
+        if self.kv_role == "kv_producer"
+        else self.kv_recv_thread
+    )
+    assert thread is not None
+    while not ready_event.is_set():
+        if not thread.is_alive():
+            raise RuntimeError(
+                "KV Cache sending/receiving thread failed to start."
+            )
+        if time.time() - start_wait_time > 5 * 60:
+            raise RuntimeError(
+                "Timeout waiting for KV Cache thread to be ready."
+            )
+        time.sleep(3)
+
+
 def _patch_method_code(cls, method_name: str, new_func) -> tuple[str, list[str]]:
     """Patch ``cls.method_name`` with ``new_func.__code__`` and report status."""
     target = getattr(cls, method_name, None)
@@ -825,6 +1009,7 @@ def apply_hetero_mooncake_patch():
         (mod.MooncakeConnectorScheduler, "__init__", _patched_scheduler_init),
         (mod.MooncakeConnectorScheduler, "set_xfer_handshake_metadata", _patched_set_xfer_handshake_metadata),
         (mod.MooncakeConnectorWorker, "__init__", _patched_worker_init),
+        (mod.MooncakeConnectorWorker, "register_kv_caches", _patched_register_kv_caches),
         (mod.MooncakeConnectorWorker, "_get_tp_num_need_pulls", _patched_get_tp_num_need_pulls),
         (mod.MooncakeConnectorWorker, "_get_remote_host_info_by_port", _patched_get_remote_host_info_by_port),
         (mod.MooncakeConnectorWorker, "_prefill_get_remote_rank", _patched_prefill_get_remote_rank),

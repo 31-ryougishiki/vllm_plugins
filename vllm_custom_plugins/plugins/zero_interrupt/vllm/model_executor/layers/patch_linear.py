@@ -109,25 +109,49 @@ class ColumnParallelLinearAsymmetric(ColumnParallelLinear):
         if not tp_asymmetric_shardings:
             tp_asymmetric_shardings = [1] * self.tp_size
         self.tp_asymmetric_shardings = tp_asymmetric_shardings
-        world_split_size = sum(self.tp_asymmetric_shardings)  # 4
-        tp_rank = get_tensor_model_parallel_rank()  # 0 1 2
-        split_size = self.tp_asymmetric_shardings[self.tp_rank]  # 1 1 2
-        # end
-        self.output_size_per_partition = divide(output_size, world_split_size) * split_size
+        is_asymmetric_active = len(tp_asymmetric_shardings) > 1 and any(
+            s != tp_asymmetric_shardings[0]
+            for s in tp_asymmetric_shardings
+        )
+        if is_asymmetric_active:
+            from vllm.distributed.utils import get_tp_partition_size
+
+            self.output_size_per_partition = get_tp_partition_size(
+                output_size, self.tp_rank, self.tp_size,
+                tp_asymmetric_shardings,
+            )
+        else:
+            self.output_size_per_partition = divide(
+                output_size, self.tp_size
+            )
         self.output_partition_sizes = [self.output_size_per_partition]
         # If QKV or MergedColumn, use output size of each partition.
         if hasattr(self, "output_sizes"):
             if not is_qkv_type:
                 self.output_partition_sizes = []
                 for output_size in self.output_sizes:
-                    self.output_partition_sizes.append(
-                        divide(output_size, world_split_size) * split_size
-                    )
+                    if is_asymmetric_active:
+                        from vllm.distributed.utils import (
+                            get_tp_partition_size,
+                        )
+
+                        self.output_partition_sizes.append(
+                            get_tp_partition_size(
+                                output_size,
+                                self.tp_rank,
+                                self.tp_size,
+                                tp_asymmetric_shardings,
+                            )
+                        )
+                    else:
+                        self.output_partition_sizes.append(
+                            divide(output_size, self.tp_size)
+                        )
             else:
                 self.output_partition_sizes = [
                     num_heads * head_size,
                     num_kv_heads * head_size,
-                    num_kv_heads * head_size
+                    num_kv_heads * getattr(self, "v_head_size", head_size)
                 ]
 
         super(ColumnParallelLinear, self).__init__(
@@ -215,10 +239,16 @@ class ColumnParallelLinearAsymmetric(ColumnParallelLinear):
         if output_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[output_dim]
             if is_asymmetric_active:
-                # Asymmetric TP: use cumulative offsets
-                # split_size = 本rank的分片大小 (e.g., [1,1,2] 中 rank2 的 split_size=2)
-                split_size = self.tp_asymmetric_shardings[self.tp_rank]
-                start_idx = sum(self.tp_asymmetric_shardings[:self.tp_rank]) * (shard_size // split_size)
+                # Asymmetric TP: use the same cumulative/remainder-aware
+                # partition helper as vllm.distributed.utils.
+                from vllm.distributed.utils import get_tp_partition_offset
+
+                start_idx = get_tp_partition_offset(
+                    total_size=loaded_weight.shape[output_dim],
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    tp_sharding_ratios=self.tp_asymmetric_shardings,
+                )
             else:
                 # Original symmetric TP logic
                 start_idx = self.tp_rank * shard_size
@@ -263,6 +293,22 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
         tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         # 非对称修改
         # tp_asymmetric_shardings = [1,1,2] if tp_size == 3 else [1,1,1,1]
+        if tp_asymmetric_shardings is None:
+            try:
+                from vllm.config import get_current_vllm_config_or_none
+                from vllm_custom_plugins.plugins.zero_interrupt.vllm.v1.executor.utils import (
+                    get_tp_asymmetric_shardings,
+                )
+
+                _cfg = get_current_vllm_config_or_none()
+                _additional = getattr(_cfg, "additional_config", None) or {}
+                tp_asymmetric_shardings = get_tp_asymmetric_shardings(
+                    _additional.get("zero_interrupt_config", {})
+                )
+            except Exception:
+                tp_asymmetric_shardings = []
+        if not tp_asymmetric_shardings:
+            tp_asymmetric_shardings = [1] * tp_size
         self.tp_asymmetric_shardings = tp_asymmetric_shardings
         world_split_size = sum(self.tp_asymmetric_shardings)  # TODO: 判断总切分size可以整除head数
         split_size = self.tp_asymmetric_shardings[get_tensor_model_parallel_rank()]
@@ -285,12 +331,13 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
         input_size = self.hidden_size
 
         output_size = (
-                              self.total_num_heads + 2 * self.total_num_kv_heads
-                      ) * self.head_size
+            self.total_num_heads * self.head_size
+            + 2 * self.total_num_kv_heads * self.v_head_size
+        )
         self.output_sizes = [
             self.total_num_heads * self.head_size,  # q_proj
             self.total_num_kv_heads * self.head_size,  # k_proj
-            self.total_num_kv_heads * self.head_size,  # v_proj
+            self.total_num_kv_heads * self.v_head_size,  # v_proj
         ]
 
         # end
@@ -337,7 +384,7 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
         shard_size_mapping = {
             "q": self.num_heads * self.head_size,
             "k": self.num_kv_heads * self.head_size,
-            "v": self.num_kv_heads * self.head_size,
+            "v": self.num_kv_heads * self.v_head_size,
         }
         return shard_size_mapping.get(loaded_shard_id)
 
@@ -664,9 +711,19 @@ class RowParallelLinearAsymmetric(RowParallelLinear):
         if not tp_asymmetric_shardings:
             tp_asymmetric_shardings = [1] * self.tp_size
         self.tp_asymmetric_shardings = tp_asymmetric_shardings
-        world_split_size = sum(self.tp_asymmetric_shardings)
-        split_size = self.tp_asymmetric_shardings[self.tp_rank]
-        self.input_size_per_partition = divide(input_size, world_split_size) * split_size
+        is_asymmetric_active = len(tp_asymmetric_shardings) > 1 and any(
+            s != tp_asymmetric_shardings[0]
+            for s in tp_asymmetric_shardings
+        )
+        if is_asymmetric_active:
+            from vllm.distributed.utils import get_tp_partition_size
+
+            self.input_size_per_partition = get_tp_partition_size(
+                input_size, self.tp_rank, self.tp_size,
+                tp_asymmetric_shardings,
+            )
+        else:
+            self.input_size_per_partition = divide(input_size, self.tp_size)
         # end
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
@@ -751,10 +808,21 @@ class RowParallelLinearAsymmetric(RowParallelLinear):
 
         if input_dim is not None and not is_sharded_weight:
             shard_size = param_data.shape[input_dim]
-            split_size = self.tp_asymmetric_shardings[self.tp_rank]
-            start_id = sum([self.tp_asymmetric_shardings[i] for i in range(self.tp_rank)])
-            shard_size_per_unit = divide(shard_size, split_size)  # 每个最小分片的大小
-            start_idx = shard_size_per_unit * start_id
+            is_asymmetric_active = len(self.tp_asymmetric_shardings) > 1 and any(
+                s != self.tp_asymmetric_shardings[0]
+                for s in self.tp_asymmetric_shardings
+            )
+            if is_asymmetric_active:
+                from vllm.distributed.utils import get_tp_partition_offset
+
+                start_idx = get_tp_partition_offset(
+                    total_size=loaded_weight.shape[input_dim],
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    tp_sharding_ratios=self.tp_asymmetric_shardings,
+                )
+            else:
+                start_idx = self.tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
 
         # Special case for loading scales off disk, which often do not
@@ -1000,19 +1068,35 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
         assert loaded_shard_id < len(self.output_sizes)
         if output_dim is not None:
             # ========== 非对称分片配置 ==========
-            split_size = self.tp_asymmetric_shardings[self.tp_rank]
-            world_split_size = sum(self.tp_asymmetric_shardings)  # 4
+            is_asymmetric_active = len(self.tp_asymmetric_shardings) > 1 and any(
+                s != self.tp_asymmetric_shardings[0]
+                for s in self.tp_asymmetric_shardings
+            )
             # 子权重的原始总行数（gate 和 up 相同）
-            full_subweight_size = self.output_sizes[loaded_shard_id]  # 12288
-            base = full_subweight_size // world_split_size  # 3072,3072,6144 2,2,4
+            full_subweight_size = self.output_sizes[loaded_shard_id]
+            if is_asymmetric_active:
+                from vllm.distributed.utils import (
+                    get_tp_partition_offset,
+                    get_tp_partition_size,
+                )
 
-            # 1. 本 rank 在该子权重中分配的行数
-            shard_size = split_size * base  # 3072,3072,6144 2,2,4
+                shard_size = get_tp_partition_size(
+                    full_subweight_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.tp_asymmetric_shardings,
+                )
+                start_idx = get_tp_partition_offset(
+                    full_subweight_size,
+                    self.tp_rank,
+                    self.tp_size,
+                    self.tp_asymmetric_shardings,
+                )
+            else:
+                shard_size = divide(full_subweight_size, self.tp_size)
+                start_idx = self.tp_rank * shard_size
 
-            # 2. 本 rank 在子权重中的起始行（前面所有 rank 的累积）
-            start_idx = sum(self.tp_asymmetric_shardings[:self.tp_rank]) * base
-
-            # 3. 本地 param 中的偏移计算
+            # 本地 param 中的偏移计算
             # 使用累积偏移确保每个shard写入正确位置
             shard_offset = sum(self.output_partition_sizes[:loaded_shard_id])
 
@@ -1141,10 +1225,32 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
 
         assert loaded_shard_id < len(self.output_sizes)
 
-        shard_offset = sum(self.output_sizes[:loaded_shard_id])
-        shard_size = self.output_sizes[loaded_shard_id]
-        shard_offset //= self.tp_size
-        shard_size //= self.tp_size
+        is_asymmetric_active = len(self.tp_asymmetric_shardings) > 1 and any(
+            s != self.tp_asymmetric_shardings[0]
+            for s in self.tp_asymmetric_shardings
+        )
+        if is_asymmetric_active:
+            from vllm.distributed.utils import get_tp_partition_size
+
+            ratios = self.tp_asymmetric_shardings
+            total_ratio = sum(ratios)
+            local_offset = 0
+            for i in range(loaded_shard_id):
+                local_offset += (
+                    self.output_sizes[i] * ratios[self.tp_rank] // total_ratio
+                )
+            shard_offset = local_offset
+            shard_size = get_tp_partition_size(
+                self.output_sizes[loaded_shard_id],
+                self.tp_rank,
+                self.tp_size,
+                ratios,
+            )
+        else:
+            shard_offset = sum(self.output_sizes[:loaded_shard_id])
+            shard_size = self.output_sizes[loaded_shard_id]
+            shard_offset //= self.tp_size
+            shard_size //= self.tp_size
 
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = getattr(self, "weight_block_size", None)

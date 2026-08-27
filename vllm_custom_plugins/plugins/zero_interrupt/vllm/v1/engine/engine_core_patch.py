@@ -616,21 +616,48 @@ def patch_engine_core() -> None:
                     worker_handshake_metadata.engine_id = vllm_config.kv_transfer_config.engine_id
 
             success = executor.handle_new_deployment()
+
+            # PD 分离且 worker 重启后，scheduler connector 里保存的仍是旧
+            # worker 的 handshake 元数据。异构重启后端口/engine_id 都会变，
+            # 必须从新 worker 重新收集并刷新，否则 decode 端会按旧端口
+            # 拉 KV，PD 链路无法恢复。
+            if success and is_pd_separated(vllm_config):
+                if hasattr(executor, "update_kv_connector_metadata"):
+                    executor.update_kv_connector_metadata(engine_core)
             
             # 仅 PD 分离场景
             if is_pd_separated(vllm_config):
                 # 5. 更新 scheduler connector 的 side_channel_port
-                pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
-                # Handshake base port
+                # 异构 TP（DP4TP(3,4,4,4)）下 DP 端口偏移是累计的
+                # 0/3/7/11，不能再用 dp_rank * tp_size 的均匀公式。
+                parallel_config = vllm_config.parallel_config
+                if getattr(parallel_config, "is_heterogeneous_tp", False):
+                    port_offset = parallel_config.get_rank_offset_for_dp(
+                        parallel_config.data_parallel_rank
+                    )
+                else:
+                    pcp_size = parallel_config.prefill_context_parallel_size
+                    port_offset = (
+                        parallel_config.data_parallel_rank
+                        * parallel_config.tensor_parallel_size
+                        * parallel_config.pipeline_parallel_size
+                        * pcp_size
+                    )
                 side_channel_port = (
-                    vllm_config.kv_transfer_config.kv_port
-                    + vllm_config.parallel_config.data_parallel_rank
-                    * vllm_config.parallel_config.tensor_parallel_size
-                    * vllm_config.parallel_config.pipeline_parallel_size
-                    * pcp_size
+                    vllm_config.kv_transfer_config.kv_port + port_offset
                 )
 
                 sched_kv_connector.connector_scheduler.side_channel_port = side_channel_port
+                if getattr(parallel_config, "is_heterogeneous_tp", False):
+                    # request_finished_all_groups 用 scheduler 的 tp_size
+                    # 向 decode 端通告 prefill TP 布局。异构重启后 DP0 只有
+                    # 3 个 rank，仍用旧的 4 会选到不存在的 producer rank。
+                    sched_kv_connector.connector_scheduler.tp_size = (
+                        parallel_config.tensor_parallel_size
+                    )
+                    sched_kv_connector.connector_scheduler.max_device_id = (
+                        parallel_config.world_size_across_dp
+                    )
                 logger.info(f"[PD] reset executor's sched_kv_connector.connector_scheduler.side_channel_port={side_channel_port}")
 
 

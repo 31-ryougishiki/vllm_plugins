@@ -237,6 +237,15 @@ def apply():
         logger.warning(f"Failed to patch distributed utils for heterogeneous TP: {e}")
 
     try:
+        from .vllm.model_executor.layers.patch_hetero_parameter import (
+            apply_hetero_parameter_patch,
+        )
+        apply_hetero_parameter_patch()
+        logger.info("Applied heterogeneous-TP parameter weight-loader patch")
+    except Exception as e:
+        logger.warning(f"Failed to patch parameter weight loaders for heterogeneous TP: {e}")
+
+    try:
         from .vllm.model_executor.layers.patch_hetero_vocab import (
             apply_hetero_vocab_patch,
         )
@@ -244,6 +253,15 @@ def apply():
         logger.info("Applied heterogeneous-TP vocab embedding padding patch")
     except Exception as e:
         logger.warning(f"Failed to patch vocab embedding for heterogeneous TP: {e}")
+
+    try:
+        from .vllm.model_executor.layers.fused_moe.runner.patch_hetero_moe_runner import (
+            apply_hetero_moe_runner_patch,
+        )
+        apply_hetero_moe_runner_patch()
+        logger.info("Applied heterogeneous-TP MoERunner shared-output padding patch")
+    except Exception as e:
+        logger.warning(f"Failed to patch MoERunner for heterogeneous TP: {e}")
 
     try:
         from .vllm.model_executor.model_loader.patch_hetero_default_loader import (

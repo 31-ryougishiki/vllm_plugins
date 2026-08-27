@@ -503,6 +503,214 @@ def _patched_select_experts_with_fusion_ops(
 
 
 # ---------------------------------------------------------------------------
+# fused_moe_0_23_0: AscendFusedMoE.__init__
+# ---------------------------------------------------------------------------
+
+
+def _patched_ascend_fused_moe_init(self, *args, **kwargs):
+    # Copy of hetero_cp v0.23 AscendFusedMoE.__init__ with the remainder-based
+    # local expert distribution (256 experts over 15 ranks -> rank 0 owns 18).
+    _ = kwargs.pop("hash") if "hash" in kwargs else None
+    tid2eid = kwargs.pop("tid2eid") if "tid2eid" in kwargs else None
+
+    self._original_routed_scaling_factor = kwargs.get(
+        "routed_scaling_factor", 1.0
+    )
+    super(AscendFusedMoE, self).__init__(*args, **kwargs)
+    self.use_overlapped = True
+    self._routed_input_transform = kwargs.get("routed_input_transform")
+    self._shared_experts = kwargs.get("shared_experts")
+    self.shared_expert_stream = None
+    has_shared_experts = self._shared_experts is not None
+    num_experts = kwargs["num_experts"]
+    intermediate_size = kwargs["intermediate_size"]
+    num_shared_experts = kwargs.get("n_shared_experts", 0)
+
+    AscendFusedMoE.moe_counter += 1
+    self.moe_instance_id = AscendFusedMoE.moe_counter
+
+    self._expert_map = None
+    self.log2phy = None
+
+    self.tid2eid = tid2eid
+
+    if self.quant_config is None:
+        self.quant_method = AscendUnquantizedFusedMoEMethod(
+            self.moe_config, tid2eid=self.tid2eid
+        )
+    else:
+        self.quant_method = self.quant_config.get_quant_method(
+            self, self.layer_name, tid2eid=self.tid2eid
+        )
+
+    assert self.quant_method is not None
+    self.base_quant_method = self.quant_method
+
+    self.moe_config.tp_group = get_tp_group()
+    self.moe_config.dp_group = get_dp_group()
+    if self.moe_config.ep_size > 1:
+        self.moe_config.ep_group = get_ep_group()
+        self.moe_config.mc2_group = get_mc2_group()
+    self.moe_config.supports_eplb = self.quant_method.supports_eplb
+    ascend_config = get_ascend_config()
+    self.multistream_overlap_shared_expert = (
+        ascend_config.multistream_overlap_shared_expert
+        and has_shared_experts
+    )
+    self.shared_multistream_overlap_gate = (
+        ascend_config.multistream_overlap_gate and has_shared_experts
+    )
+    if self.multistream_overlap_shared_expert:
+        logger.info_once(
+            "[fused_moe/layer] Multistream overlap shared expert is enabled."
+        )
+    if enable_sp() and has_shared_experts:
+        logger.info_once(
+            "[fused_moe/layer] Sequence parallelism is enabled, shared "
+            "experts are replicated for best performance."
+        )
+
+    self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
+    if self.multistream_overlap_gate and AscendFusedMoE.gate_stream is None:
+        AscendFusedMoE.gate_stream = torch.npu.Stream()
+    if self.multistream_overlap_gate:
+        logger.info_once("[fused_moe/layer] Multistream overlap gate is enabled.")
+    vllm_config = get_current_vllm_config()
+    if (
+        self.custom_routing_function is None
+        and self.e_score_correction_bias is not None
+        and not vllm_config.model_config.is_deepseek_mla
+    ):
+        self.e_score_correction_bias.data = (
+            self.e_score_correction_bias.data.to(
+                dtype=vllm_config.model_config.dtype
+            )
+        )
+    self._gate = kwargs.get("gate")
+
+    # init moe
+    eplb_config = ascend_config.eplb_config
+    self.mix_placement = getattr(ascend_config, "mix_placement", False)
+    self.n_shared_experts = num_shared_experts
+    num_experts += num_shared_experts if self.mix_placement else 0
+    self.moe_config.num_experts = num_experts
+    (
+        self.global_expert_map,
+        self._expert_map,
+        self.log2phy,
+        self.global_redundant_expert_num,
+    ) = init_eplb_config(
+        eplb_config,
+        self.moe_instance_id,
+        self.moe_config,
+        self.mix_placement,
+        num_shared_experts,
+        tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+    )
+    self.global_num_experts = num_experts + self.global_redundant_expert_num
+    self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
+    # Match determine_expert_map's remainder-based distribution so
+    # local_num_experts agrees with expert_map when
+    # global_num_experts % ep_size != 0 (e.g. 256 experts / 15 ranks).
+    self.local_num_experts = self.global_num_experts // self.ep_size
+    if (
+        self.global_num_experts % self.ep_size != 0
+        and self.ep_rank < self.global_num_experts % self.ep_size
+    ):
+        self.local_num_experts += 1
+    self.expert_map_manager._local_num_experts = self.local_num_experts
+    self.expert_map_manager._expert_map = self._expert_map
+    if self._expert_map is not None:
+        logger.info_once(
+            "[fused_moe/layer] Expert parallelism is enabled."
+            " ep_rank=%s/%s, local_num_experts=%s, global_num_experts=%s,"
+            " expert_map=%s",
+            self.ep_rank,
+            self.ep_size,
+            self.local_num_experts,
+            self.global_num_experts,
+            get_compressed_expert_map(self._expert_map),
+        )
+    if self.dynamic_eplb:
+        self.multi_stage = False
+        self.moe_load = torch.zeros(
+            self.local_num_experts, dtype=torch.int64
+        ).npu()
+        if eplb_config.eplb_policy_type == 3:
+            self.multi_stage = True
+            self.load_counter = torch.tensor(
+                0, dtype=torch.int32, device="npu"
+            )
+            self.num_iter = eplb_config.expert_heat_collection_interval
+            self.moe_load = torch.zeros(
+                (self.num_iter, self.local_num_experts),
+                dtype=torch.int32,
+                device="npu",
+            )
+
+    self.moe_config.num_experts = self.global_num_experts
+    self.moe_config.num_local_experts = self.local_num_experts
+    self.moe_config.global_redundant_expert_num = (
+        self.global_redundant_expert_num
+    )
+    self.swiglu_limit = getattr(
+        self.vllm_config.model_config.hf_config, "swiglu_limit", 0
+    )
+
+    moe_quant_params = {
+        "num_experts": self.local_num_experts,
+        "hidden_size": self.hidden_size,
+        "intermediate_size_per_partition": (
+            self.intermediate_size_per_partition
+        ),
+        "params_dtype": self.params_dtype,
+        "weight_loader": self.weight_loader,
+    }
+    if self.quant_method.__class__.__name__ in (
+        "GPTQMarlinMoEMethod",
+        "CompressedTensorsWNA16MoEMethod",
+    ):
+        moe_quant_params["intermediate_size_full"] = intermediate_size
+    self.quant_method.create_weights(layer=self, **moe_quant_params)
+
+    self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
+    self.enable_npugraph_ex_static_kernel = (
+        ascend_config.ascend_compilation_config.enable_static_kernel
+    )
+
+    setup_moe_comm_method(self.moe_config)
+    self.quant_type = self._get_quant_type()
+
+    self.runner = AscendMoERunner(
+        self.layer_name,
+        self.moe_config,
+        self.router,
+        self._routed_input_transform,
+        kwargs.pop("gate", None),
+        kwargs.pop("shared_experts", None),
+        self.quant_method,
+        self.vllm_config.parallel_config.enable_dbo,
+    )
+
+    if self.multistream_overlap_shared_expert:
+        original_process_weights = (
+            self.quant_method.process_weights_after_loading
+        )
+
+        @wraps(original_process_weights)
+        def wrapped_process_weights(*wargs, **wkwargs):
+            result = original_process_weights(*wargs, **wkwargs)
+            self._validate_shared_expert_consistency()
+            return result
+
+        self.quant_method.process_weights_after_loading = (
+            wrapped_process_weights
+        )
+
+    VllmEplbAdaptor.register_layer(self)
+
+
+# ---------------------------------------------------------------------------
 # Patch application
 # ---------------------------------------------------------------------------
 
@@ -526,6 +734,15 @@ def apply_hetero_moe_patch():
         experts_selector,
         prepare_finalize,
         token_dispatcher,
+    )
+
+    # v0.23 AscendFusedMoE lives in fused_moe_0_23_0 and is re-exported
+    # through fused_moe.py.  Patch the private class directly.
+    from vllm_ascend.ops.fused_moe import fused_moe_0_23_0 as fused_moe_023
+
+    _patch_code(
+        fused_moe_023.AscendFusedMoE.__init__,
+        _patched_ascend_fused_moe_init,
     )
 
     # Global helper names referenced by the copied code but not imported by

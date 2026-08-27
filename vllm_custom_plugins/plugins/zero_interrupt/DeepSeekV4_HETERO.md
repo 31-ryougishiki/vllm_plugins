@@ -75,12 +75,14 @@ vllm/vllm-ascend 源码对应：
 | `vllm_ascend/models/patch_deepseek_v4.py` | 绑定非对称 linear 类；MoE shared expert 复制；MoE 余数专家分布；attention head/group 非对称；load_weights sink 分片 |
 | `vllm_ascend/models/patch_deepseek_v4_mtp.py` | MTP load_weights sink 分片 |
 | `vllm_ascend/attention/patch_deepseek_v4_attention_hetero.py` | DSA v1/DSA-CP 本地 head、LCM padding、o_proj 非对称 all_to_all |
-| `vllm_ascend/ops/fused_moe/patch_hetero_moe.py` | Prepare/Finalize、token dispatcher 的非对称 token 布局与余数专家分布 |
+| `vllm_ascend/ops/fused_moe/patch_hetero_moe.py` | Prepare/Finalize、token dispatcher、selector，以及 v0.23 `AscendFusedMoE.__init__` 的 256/15 余数专家分布 |
+| `vllm/model_executor/layers/fused_moe/runner/patch_hetero_moe_runner.py` | MoERunner shared/routed 输出长度补齐 |
 | `vllm_ascend/ops/patch_hetero_custom_ops.py` | 已注册 MoE 自定义算子的异构 gather/reduce/unpad 实现 |
 | `vllm_ascend/patch/patch_hetero_tp.py` | forward context 的 per-DP padded lengths、LCM MC2 capacity、A3 回退 ALLGATHER |
 | `vllm_ascend/worker/patch_hetero_model_runner.py` | DP metadata 经 EP group 同步；profile_run LCM 对齐 |
 | `vllm_ascend/spec_decode/patch_hetero_spec_decode.py` | 异构下 MTP 复用目标 per-DP TP group |
 | `vllm/model_executor/layers/patch_hetero_vocab.py` | vocab/logits 维度 LCM padding |
+| `vllm/model_executor/layers/patch_hetero_parameter.py` | v2 参数加载器（column/merged/row）按非对称 offset 切 checkpoint |
 | `vllm/model_executor/model_loader/patch_hetero_default_loader.py` | EP weight filter 的异构 ep_size/ep_rank |
 | `vllm/config/patch_speculative_hetero.py` | draft ParallelConfig 继承异构拓扑 |
 | `vllm_ascend/distributed/kv_transfer/patch_hetero_mooncake.py` | MooncakeHybridConnector 异构 TP 端口偏移、绝对 port 映射、producer rank 选择 |

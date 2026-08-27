@@ -9,9 +9,10 @@ heterogeneous TP (e.g. DP4TP(3,4,4,4) with DP0 tp=3 using
 tp_sharding_ratios [2,1,1]).
 
 Call ``apply_deepseek_v4_attention_hetero_patch()`` once after vLLM Ascend has
-been imported.  The patch is idempotent and replaces only method code objects
-via ``target_method.__code__ = new_function.__code__``; it never replaces a
-whole class attribute.
+been imported.  The patch is idempotent.  Standalone copied method bodies are
+installed via ``target_method.__code__ = new_function.__code__``; wrappers
+that must call the original are installed as replacement function objects so
+the saved original cannot be mutated into recursion.
 """
 
 from __future__ import annotations
@@ -23,6 +24,13 @@ from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.distributed.utils import get_tp_partition_offset, get_tp_partition_size
 
 _ATTENTION_HETERO_PATCH_APPLIED = False
+
+# Originals saved in THIS module.  The wrapper functions below resolve these
+# names through their own ``__globals__``.  Saving them on the target module
+# instead and then replacing the target method's ``__code__`` mutates the very
+# function object that was just saved, which makes the wrapper call itself.
+_ORIG_BUILD_LOCAL_TOKEN_METADATA = None
+_ORIG_DSA_CP_INIT = None
 
 
 def _get_dsa_local_heads(vllm_config: VllmConfig | None, total_num_heads: int, tp_size: int) -> int:
@@ -784,7 +792,7 @@ def _patched_build_local_token_metadata(
             ]
         )
         num_input_tokens = math.ceil(num_input_tokens / align) * align
-    return _original_build_local_token_metadata(
+    return _ORIG_BUILD_LOCAL_TOKEN_METADATA(
         self,
         num_reqs,
         num_input_tokens,
@@ -804,7 +812,7 @@ def _patched_dsa_cp_init(self, *args, **kwargs):
     ratios and disables the A5 o_proj full-gather path for ratio-sharded
     groups.
     """
-    _original_dsa_cp_init(self, *args, **kwargs)
+    _ORIG_DSA_CP_INIT(self, *args, **kwargs)
     self._hetero_head_ratios = None
     vllm_config = get_current_vllm_config()
     if vllm_config.parallel_config.is_heterogeneous_tp:
@@ -814,6 +822,19 @@ def _patched_dsa_cp_init(self, *args, **kwargs):
         if ratios is not None:
             self._hetero_head_ratios = list(ratios)
             self.enable_dsa_cp_with_o_proj_tp = False
+            # The original __init__ was called with the UNIFORM head count
+            # (e.g. 16 at tp=4) because DeepseekV4Attention is patched from
+            # the outside after its DSA impl was already constructed.  The
+            # impl object holds its own copies of n_local_heads /
+            # n_local_groups, so overwrite them here too -- otherwise
+            # _restore_tp_head_layout and the o_proj path use the wrong
+            # shard width on DP0 (must be 32/16/16 heads for [2,1,1]).
+            self.n_local_heads = get_tp_partition_size(
+                self.num_heads, self.tp_rank, self.tp_size, ratios
+            )
+            self.n_local_groups = get_tp_partition_size(
+                self.n_group, self.tp_rank, self.tp_size, ratios
+            )
 
 
 
@@ -927,11 +948,13 @@ _DS_CP_PATCHED_SYMBOLS = (
 def apply_deepseek_v4_attention_hetero_patch() -> dict[str, list[str]]:
     """Apply heterogeneous-TP DSA attention patches to installed vllm_ascend.
 
-    Idempotent.  Some of the patched functions are ``__code__``-level
-    wrappers around a saved original function object; applying twice would
-    replace the code of the saved original as well and cause recursion.
+    Idempotent.  The two dsa_cp wrappers must be installed as replacement
+    function attributes (not by swapping ``__code__``): swapping code mutates
+    the saved original function object in-place, so the wrapper's ``original``
+    reference ends up pointing at itself and recurses.
     """
     global _ATTENTION_HETERO_PATCH_APPLIED
+    global _ORIG_BUILD_LOCAL_TOKEN_METADATA, _ORIG_DSA_CP_INIT
     if _ATTENTION_HETERO_PATCH_APPLIED:
         return {
             "vllm_ascend.attention.dsa_v1": list(_DS_V1_PATCHED_SYMBOLS),
@@ -946,14 +969,13 @@ def apply_deepseek_v4_attention_hetero_patch() -> dict[str, list[str]]:
     dsa_cp_module.__dict__.setdefault("get_tp_partition_size", get_tp_partition_size)
     dsa_cp_module.__dict__.setdefault("get_tp_partition_offset", get_tp_partition_offset)
 
-    # Save the original dsa_cp method function objects that the wrappers call
-    # directly.  Saving only once keeps the patch idempotent.
-    if "_original_build_local_token_metadata" not in dsa_cp_module.__dict__:
-        dsa_cp_module.__dict__["_original_build_local_token_metadata"] = (
-            dsa_cp_module.AscendDSACPMetadataBuilder._build_local_token_metadata
-        )
-    if "_original_dsa_cp_init" not in dsa_cp_module.__dict__:
-        dsa_cp_module.__dict__["_original_dsa_cp_init"] = dsa_cp_module.AscendDSACPImpl.__init__
+    # Save original dsa_cp method function objects in this module, then bind
+    # the wrappers as new class attributes.  The originals keep their own
+    # ``__code__`` and ``__globals__``, so calling them cannot recurse.
+    _ORIG_BUILD_LOCAL_TOKEN_METADATA = (
+        dsa_cp_module.AscendDSACPMetadataBuilder._build_local_token_metadata
+    )
+    _ORIG_DSA_CP_INIT = dsa_cp_module.AscendDSACPImpl.__init__
 
     # dsa_v1 metadata builders and forward.
     dsa_v1_module.AscendDSAMetadataBuilder.build_prefill_metadata.__code__ = (
@@ -970,11 +992,16 @@ def apply_deepseek_v4_attention_hetero_patch() -> dict[str, list[str]]:
     )
     dsa_v1_module.AscendDSAImpl.forward.__code__ = dsa_impl_forward.__code__
 
-    # dsa_cp builder/impl helpers.
-    dsa_cp_module.AscendDSACPMetadataBuilder._build_local_token_metadata.__code__ = (
-        _patched_build_local_token_metadata.__code__
+    # dsa_cp builder/impl helpers.  ``__init__`` and
+    # ``_build_local_token_metadata`` are wrapper function objects that call
+    # the saved originals through this module's globals, so bind them directly.
+    dsa_cp_module.AscendDSACPMetadataBuilder._build_local_token_metadata = (
+        _patched_build_local_token_metadata
     )
-    dsa_cp_module.AscendDSACPImpl.__init__.__code__ = _patched_dsa_cp_init.__code__
+    dsa_cp_module.AscendDSACPImpl.__init__ = _patched_dsa_cp_init
+    # ``_restore_tp_head_layout`` is a standalone copied body whose globals
+    # must stay the target module namespace (torch, dist, helpers above), so
+    # code-object replacement is the right installation method for it.
     dsa_cp_module.AscendDSACPImpl._restore_tp_head_layout.__code__ = (
         restore_tp_head_layout.__code__
     )

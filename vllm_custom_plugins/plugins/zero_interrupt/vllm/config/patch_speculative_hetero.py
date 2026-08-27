@@ -16,6 +16,10 @@ def _patched_create_draft_parallel_config(
     kwargs = dict(
         pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
         tensor_parallel_size=speculative_draft_tensor_parallel_size,
+        heterogeneous_dp_config=target_parallel_config.heterogeneous_dp_config,
+        data_parallel_size=target_parallel_config.data_parallel_size,
+        data_parallel_rank=target_parallel_config.data_parallel_rank,
+        enable_expert_parallel=target_parallel_config.enable_expert_parallel,
         distributed_executor_backend=(
             target_parallel_config.distributed_executor_backend
         ),
@@ -28,17 +32,6 @@ def _patched_create_draft_parallel_config(
         ray_workers_use_nsight=target_parallel_config.ray_workers_use_nsight,
         placement_group=target_parallel_config.placement_group,
     )
-    if getattr(target_parallel_config, "is_heterogeneous_tp", False):
-        kwargs["heterogeneous_dp_config"] = (
-            target_parallel_config.heterogeneous_dp_config
-        )
-        kwargs["data_parallel_size"] = (
-            target_parallel_config.data_parallel_size
-        )
-        kwargs["data_parallel_rank"] = target_parallel_config.data_parallel_rank
-        kwargs["enable_expert_parallel"] = (
-            target_parallel_config.enable_expert_parallel
-        )
     return ParallelConfig(**kwargs)
 
 

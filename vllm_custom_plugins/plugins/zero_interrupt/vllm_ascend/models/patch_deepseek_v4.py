@@ -283,6 +283,13 @@ def _patched_dsv4_attention_init(
         if inner is not None:
             inner.n_local_heads = self.n_local_heads
             inner.n_local_groups = self.n_local_groups
+            # DSAAttention passed the ORIGINAL uniform n_local_heads to its
+            # impl object; that object keeps independent copies used by the
+            # DSA-CP restore/o_proj path. Refresh them as well.
+            impl = getattr(inner, "impl", None)
+            if impl is not None:
+                impl.n_local_heads = self.n_local_heads
+                impl.n_local_groups = self.n_local_groups
 
     # With DSA-CP the attn_sink is intentionally replicated with all heads;
     # only the non-CP path shards it across TP ranks.
