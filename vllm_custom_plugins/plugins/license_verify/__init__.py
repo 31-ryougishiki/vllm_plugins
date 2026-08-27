@@ -26,6 +26,18 @@ class LicenseVerifyError(Exception):
     pass
 
 
+def should_skip_license_verify() -> bool:
+    """Whether license verification is explicitly disabled.
+
+    Test/dev environments without a vendor license can set
+    ``VLLM_CUSTOM_PLUGINS_SKIP_LICENSE=1``. Production deployments must
+    leave it unset (or set to 0) and provide LICENSE_PATH/CERT_PATH/
+    PRODUCT_KEY_PATH.
+    """
+    value = os.getenv("VLLM_CUSTOM_PLUGINS_SKIP_LICENSE", "0")
+    return value.strip().lower() in ("1", "true", "yes")
+
+
 
 def setup_fallback_logging():
     """设置 fallback 日志配置，确保在 vLLM 启动后仍能工作"""
@@ -135,6 +147,13 @@ def register(manager):
     """
 
     logger.info("Running license verification...")
+
+    if should_skip_license_verify():
+        logger.warning(
+            "VLLM_CUSTOM_PLUGINS_SKIP_LICENSE=1: license verification skipped. "
+            "This is intended for test/dev only."
+        )
+        return
 
     try:
         verify_license()

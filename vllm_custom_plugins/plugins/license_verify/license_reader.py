@@ -11,6 +11,13 @@ class LicenseReader:
         self._copyright: dict = {}
 
     def read(self) -> bool:
+        if not self.license_path:
+            logger.error(
+                "LICENSE_PATH environment variable is not set. "
+                "Set LICENSE_PATH/CERT_PATH/PRODUCT_KEY_PATH, or set "
+                "VLLM_CUSTOM_PLUGINS_SKIP_LICENSE=1 for test/dev only."
+            )
+            return False
         if not os.path.exists(self.license_path):
             logger.error(f"The path specified by the environment variable LICENSE_PATH is incorrect. Please check.")
             return False
