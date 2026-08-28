@@ -13,6 +13,8 @@ import sys
 import types
 import unittest
 
+import torch
+
 _PATCH_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "patch_hetero_ascend_linear.py")
 )
@@ -56,8 +58,27 @@ def _install_standins():
             (),
             {"process_weights_after_loading": lambda self, layer: None},
         ),
+        adjust_block_scale_shard=lambda *a: (_ for _ in ()).throw(
+            NotImplementedError
+        ),
+        adjust_marlin_shard=lambda *a: (_ for _ in ()).throw(
+            NotImplementedError
+        ),
+        adjust_bitsandbytes_4bit_shard=lambda *a: (_ for _ in ()).throw(
+            NotImplementedError
+        ),
+        adjust_scalar_to_fused_array=lambda *a: (_ for _ in ()).throw(
+            NotImplementedError
+        ),
     )
     _module("vllm.model_executor.utils", set_weight_attrs=lambda *a, **kw: None)
+    _module(
+        "vllm.model_executor.parameter",
+        BlockQuantScaleParameter=type("BlockQuantScaleParameter", (), {}),
+        PerTensorScaleParameter=type("PerTensorScaleParameter", (), {}),
+        RowvLLMParameter=type("RowvLLMParameter", (), {}),
+        BasevLLMParameter=type("BasevLLMParameter", (), {}),
+    )
     _package("vllm.distributed")
     _module(
         "vllm.distributed.utils",
@@ -102,7 +123,11 @@ def _get_tp_partition_size(total_size, tp_rank, tp_size, ratios=None):
     return sizes[tp_rank]
 
 
-def _get_tp_partition_offset(total_size, tp_rank, tp_size, ratios=None):
+def _get_tp_partition_offset(
+    total_size, tp_rank, tp_size, ratios=None, tp_sharding_ratios=None
+):
+    if ratios is None:
+        ratios = tp_sharding_ratios
     if ratios is None:
         return tp_rank * _divide(total_size, tp_size)
     return sum(
@@ -240,9 +265,12 @@ def _load_patch(linear_module):
     row_cls.__init__ = _orig_row_init
     row_cls.weight_loader = lambda self, param, loaded: None
     linear_module.AscendColumnParallelLinear = col_cls
-    linear_module.AscendMergedColumnParallelLinear = type(
-        "AscendMergedColumnParallelLinear", (), {}
+    merged_cls = type("AscendMergedColumnParallelLinear", (), {})
+    merged_cls.weight_loader = lambda self, param, loaded, shard_id=None: None
+    merged_cls.weight_loader_v2 = (
+        lambda self, param, loaded, shard_id=None: None
     )
+    linear_module.AscendMergedColumnParallelLinear = merged_cls
     linear_module.AscendRowParallelLinear = row_cls
 
     spec = importlib.util.spec_from_file_location(
@@ -266,6 +294,7 @@ class TestHeteroAscendLinearScaffolding(unittest.TestCase):
                 "vllm.model_executor.layers",
                 "vllm.model_executor.layers.linear",
                 "vllm.model_executor.utils",
+                "vllm.model_executor.parameter",
                 "vllm.distributed",
                 "vllm.distributed.utils",
                 "vllm_ascend",
@@ -340,6 +369,100 @@ class TestHeteroAscendLinearScaffolding(unittest.TestCase):
             layer.quant_method.create_calls,
             [(2731, (4096,)), (4096, (4096,))],
         )
+
+    def test_hetero_row_weight_loader_uses_cumulative_offsets(self):
+        hidden = 8
+        full_rows = 8192
+        loaded = torch.arange(
+            full_rows * hidden, dtype=torch.float32
+        ).reshape(full_rows, hidden)
+        shard_sizes = {0: 4096, 1: 2048, 2: 2048}
+        offsets = {0: 0, 1: 4096, 2: 6144}
+        for rank in range(3):
+            param = _SimpleParam(
+                torch.empty(shard_sizes[rank], hidden), input_dim=0
+            )
+            layer = _SimpleRowLayer(rank)
+            self._patch._patched_row_weight_loader(layer, param, loaded)
+            expected = loaded[
+                offsets[rank] : offsets[rank] + shard_sizes[rank]
+            ]
+            self.assertTrue(
+                torch.equal(param.data, expected),
+                f"row rank {rank}: cumulative offset not used",
+            )
+
+    def test_hetero_merged_weight_loader_uses_ratio_local_offsets(self):
+        hidden = 8
+        output_sizes = [2048, 1024]
+        full = torch.arange(
+            sum(output_sizes) * hidden, dtype=torch.float32
+        ).reshape(sum(output_sizes), hidden)
+
+        # ratios [2,1,1] -> rank local partitions 1024/512, 512/256, 512/256
+        expected_partitions = {
+            0: [1024, 512],
+            1: [512, 256],
+            2: [512, 256],
+        }
+        expected_starts = {
+            0: [0, 0],
+            1: [1024, 512],
+            2: [1536, 768],
+        }
+        for rank in range(3):
+            partitions = expected_partitions[rank]
+            param = _SimpleParam(
+                torch.empty(sum(partitions), hidden), output_dim=0
+            )
+            layer = _SimpleMergedLayer(rank, output_sizes)
+            for shard_id in range(2):
+                self._patch._patched_merged_weight_loader(
+                    layer, param, full, loaded_shard_id=shard_id
+                )
+                local_offset = sum(partitions[:shard_id])
+                start = expected_starts[rank][shard_id]
+                expected = full[start : start + partitions[shard_id]]
+                self.assertTrue(
+                    torch.equal(
+                        param.data[
+                            local_offset : local_offset + partitions[shard_id]
+                        ],
+                        expected,
+                    ),
+                    f"merged rank {rank} shard {shard_id}: "
+                    "ratio local/global offsets not used",
+                )
+
+
+class _SimpleParam:
+    def __init__(self, data, input_dim=None, output_dim=None):
+        self.data = data
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+
+class _SimpleRowLayer:
+    def __init__(self, rank):
+        self.tp_rank = rank
+        self.tp_size = 3
+        self._tp_sharding_ratios = [2, 1, 1]
+        self.prefix = "model.layers.0.self_attn.wo_b"
+
+
+class _SimpleMergedLayer:
+    def __init__(self, rank, output_sizes):
+        self.tp_rank = rank
+        self.tp_size = 3
+        self._tp_sharding_ratios = [2, 1, 1]
+        self.output_sizes = output_sizes
+        self.output_size = sum(output_sizes)
+
+    def validate_shard_id(self, loaded_shard_id):
+        if loaded_shard_id is not None and not 0 <= loaded_shard_id < len(
+            self.output_sizes
+        ):
+            raise ValueError(loaded_shard_id)
 
 
 if __name__ == "__main__":

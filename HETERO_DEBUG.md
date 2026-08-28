@@ -20,7 +20,7 @@
 | 异构重启后 profile_run / KV cache 重建 | ✅ 已验证（10:21 复测） | `available_memory` 为真实数值，KV 重建成功（§4.9） |
 | 异构重启后 MTP draft RoPE 崩溃 | 🔧 修复后不再崩溃 | 该问题只阻塞流程；按 speculative 原理它**不是乱码根因**（§4.10/§4.11） |
 | 重复 trigger 静默丢弃 | ✅ 已修复 | `strategy_sync` 重复策略会转发而非 return（§4.6） |
-| 异构重启后发请求 | ❌ 单请求可完成，但输出乱码 | 以 hetero_cp 为 golden 逐模块 diff，排查方向见 §4.11 |
+| 异构重启后发请求 | 🔧 已定位根因并修复（待 A3 复测） | DP0 v1 linear weight_loader 未按 `[2,1,1]` 取累计 offset；修复见 §4.12 |
 | PD / Mooncake engine_id 轮换链路 | ✅ P 端已验证；⏳ D 端待验证 | dp0/dp1 均已 `KV connector metadata updated` + recovered 通知 |
 
 ### 本地提交（均已合入 `hetero` 分支）
@@ -446,6 +446,44 @@ git -C vllm_plugins diff HEAD
 - 铁律：**不要用“裁剪 / 丢弃多出来的行 / 只取 rank0”来压掉形状差异**。
   乱码说明某处已经悄悄错位，裁剪只会把错误固化（§4.4 教训）。
 
+### 4.12 乱码根因：DP0 线性层权重未按 `[2,1,1]` 加载（代码已修复，待 A3 复测）
+
+- 现象：异构重启后单请求无任何 shape/collective 报错，但输出乱码；
+  对称推理和 hetero_cp 直接拉起的异构推理均正确。
+- 根因：参数形状已经按 ratios 重建，但 **weight_loader 仍按均匀 TP 取 offset**。
+  - hetero_cp 在 `vllm/model_executor/layers/linear.py` 中给
+    `ColumnParallelLinear.weight_loader` /
+    `MergedColumnParallelLinear.weight_loader` /
+    `RowParallelLinear.weight_loader` 三个 **v1 loader** 增加了
+    `_tp_sharding_ratios` 分支（用 `get_tp_partition_offset/Size`）。
+  - vllm_plugins 的 `setup.py` **没有替换 vllm 的 linear.py**；
+    原 `patch_hetero_ascend_linear.py` 只 patch 了 init 的形状 scaffolding
+    和 `wo_a` 的 Column loader，Row / Merged 仍继承 stock 均匀 loader。
+  - `patch_hetero_parameter.py` 只覆盖 v2 `BasevLLMParameter` loader；
+    而 `AscendUnquantizedLinearMethod` / `AscendLinearMethod` 不在
+    `WEIGHT_LOADER_V2_SUPPORTED` 中（worker.py 还会显式移除
+    UnquantizedLinearMethod），当前模型实际走 v1 `self.weight_loader`，
+    所以 v2 补丁没有生效。
+  - DP0 8192 输入维按 `[2,1,1]` 分片为 `[4096,2048,2048]`，stock 公式
+    `start_idx = tp_rank * shard_size` 得到 rank1=2048（应为 4096）、
+    rank2=4096（应为 6144）。rank1 加载了 rank0 的后半段，rank2 加载了
+    rank1 应有的行；`wo_b` / `down_proj` / `gate_up_proj` 均如此。
+    因此所有 collective 形状合法，但 DP0 数值错位 → 纯乱码。
+- 修复（`patch_hetero_ascend_linear.py`）：
+  - `_patched_row_weight_loader`：ratios 生效时用累计
+    `get_tp_partition_offset` 取 `wo_b/down_proj` 输入维切片。
+  - `_patched_merged_weight_loader` /
+    `_patched_merged_weight_loader_v2`：ratios 生效时本地
+    `shard_offset/shard_size` 与 checkpoint `start_idx` 均按 ratios 计算。
+  - `_patched_col_weight_loader_ratio`：非 `wo_a` Column 权重同样按 ratios。
+  - `ratios is None` 时全部回退原实现，对称路径行为不变。
+- 回归：`vllm_ascend/ops/tests/test_patch_hetero_ascend_linear.py`
+  新增 Row/Merged 两个 loader 用例，覆盖 `[2,1,1]` 三个 rank 的
+  累计 offset 与 merged 本地偏移。
+- A3 复测顺序：装包 → 对称单请求（必须仍正常）→ trigger →
+  单请求与 hetero_cp golden 逐 token 对比。若仍乱码，再按 §4.11 表
+  继续查 custom-op / MoE 整段拷贝的 globals 注入。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
@@ -553,6 +591,7 @@ grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应�
 | 同上错误在 §4.7 修复后复现 | stock col init 读预置的 `self.output_sizes` 而非入参，scaffolding 尺寸被绕过 | 已修复（§4.8） |
 | 异构重启后 profile_run `shape '[4, 8184, 4096]' is invalid`，KV 重建 `NoneType <= int` | `model_runner_v1` 等模块在 patch 前已 import，`set_ascend_forward_context` 别名仍指向 stock 函数，`_EXTRA_CTX` 无 per-DP 布局 | 已修复（§4.9，刷新已导入模块别名） |
 | 真实请求 MTP draft 前向 `inplace_partial_rotary_mul` `dim0 must be equal` | MoE drafter 实际 FlashComm1=True、隐状态按 LCM 分片；draft builder 被错误地跳过 LCM，只用本地 TP 对齐 | 已修复（§4.10） |
+| 异构重启后单请求返回但输出乱码 | DP0 ratios `[2,1,1]` 下 Ascend Row/Merged 线性层继承 stock v1 loader，`start_idx=tp_rank*shard_size` 取错权重行（rank1/2 错位）；vllm linear.py 未替换，v2 parameter patch 对 Ascend 类不生效 | 代码已修复待 A3 复测（§4.12） |
 
 ---
 

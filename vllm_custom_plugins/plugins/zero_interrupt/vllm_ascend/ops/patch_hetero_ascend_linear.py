@@ -19,18 +19,26 @@ classes.
 
 from __future__ import annotations
 
+import itertools
+import logging
+
 import torch
-from torch.nn.parameter import Parameter
+from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.linear import WEIGHT_LOADER_V2_SUPPORTED
 from vllm.model_executor.utils import set_weight_attrs
+
+logger = logging.getLogger(__name__)
 
 _PATCHED = False
 _ORIG_COL_INIT = None
 _ORIG_MERGED_INIT = None
 _ORIG_ROW_INIT = None
 _ORIG_COL_WEIGHT_LOADER = None
+_ORIG_ROW_WEIGHT_LOADER = None
+_ORIG_MERGED_WEIGHT_LOADER = None
+_ORIG_MERGED_WEIGHT_LOADER_V2 = None
 _ORIG_ASCEND_UNQUANT_PROCESS = None
 _ORIG_VLLM_UNQUANT_PROCESS = None
 
@@ -396,14 +404,70 @@ def _patched_row_init(
         self.custom_op.update_attrs()
 
 
+def _patched_col_weight_loader_ratio(
+    self, param: Parameter, loaded_weight: torch.Tensor
+):
+    """Ratio-aware port of ``ColumnParallelLinear.weight_loader``.
+
+    Used for Ascend column-parallel weights other than ``wo_a`` under
+    heterogeneous TP.  ``wo_a`` keeps its 2-D/3-D reshape handling in
+    ``_patched_col_weight_loader``.
+    """
+    output_dim = getattr(param, "output_dim", None)
+
+    is_sharded_weight = getattr(param, "is_sharded_weight", False)
+    use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+    is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+
+    is_gguf_weight = getattr(param, "is_gguf_weight", False)
+    is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+    if is_gguf_weight_type:
+        param.weight_type = loaded_weight.item()
+
+    if is_gguf_weight and isinstance(param, UninitializedParameter):
+        from vllm.distributed.utils import get_tp_partition_size
+
+        final_shape = list(loaded_weight.shape)
+        if output_dim is not None:
+            final_shape[output_dim] = get_tp_partition_size(
+                final_shape[output_dim],
+                self.tp_rank,
+                self.tp_size,
+                self._tp_sharding_ratios,
+            )
+        param.materialize(final_shape, dtype=loaded_weight.dtype)
+
+    param_data = param.data
+    if output_dim is not None and not is_sharded_weight:
+        from vllm.distributed.utils import get_tp_partition_offset
+
+        shard_size = param_data.shape[output_dim]
+        start_idx = get_tp_partition_offset(
+            total_size=loaded_weight.shape[output_dim],
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            tp_sharding_ratios=self._tp_sharding_ratios,
+        )
+        loaded_weight = loaded_weight.narrow(
+            output_dim, start_idx, shard_size
+        )
+
+    if len(loaded_weight.shape) == 0:
+        loaded_weight = loaded_weight.reshape(1)
+
+    assert param_data.shape == loaded_weight.shape
+    param_data.copy_(loaded_weight)
+
+
 def _patched_col_weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
     """AscendColumnParallelLinear.weight_loader with asymmetric wo_a slicing."""
     ratios = getattr(self, "_tp_sharding_ratios", None)
-    if not (
-        ratios is not None
-        and "wo_a" in getattr(self, "prefix", "")
-    ):
+    if ratios is None:
         return _ORIG_COL_WEIGHT_LOADER(self, param, loaded_weight)
+
+    prefix = getattr(self, "prefix", "")
+    if "wo_a" not in prefix:
+        return _patched_col_weight_loader_ratio(self, param, loaded_weight)
 
     from vllm.distributed.utils import (
         get_tp_partition_offset,
@@ -452,11 +516,386 @@ def _patched_col_weight_loader(self, param: Parameter, loaded_weight: torch.Tens
     self.weight.data.copy_(loaded_weight)
 
 
+def _patched_row_weight_loader(
+    self, param: Parameter, loaded_weight: torch.Tensor
+):
+    """Ratio-aware port of ``RowParallelLinear.weight_loader``.
+
+    hetero_cp patched this method in ``vllm/model_executor/layers/linear.py``.
+    vllm_plugins keeps the stock vLLM file and patches the Ascend subclass
+    here, so DP0's ``[2,1,1]`` partitions must use cumulative offsets rather
+    than ``tp_rank * shard_size``.
+    """
+    ratios = getattr(self, "_tp_sharding_ratios", None)
+    if ratios is None:
+        return _ORIG_ROW_WEIGHT_LOADER(self, param, loaded_weight)
+
+    input_dim = getattr(param, "input_dim", None)
+    use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
+    is_sharded_weight = getattr(param, "is_sharded_weight", False)
+    is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+
+    is_gguf_weight = getattr(param, "is_gguf_weight", False)
+    is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+    if is_gguf_weight_type:
+        param.weight_type = loaded_weight.item()
+
+    if is_gguf_weight and isinstance(param, UninitializedParameter):
+        from vllm.distributed.utils import get_tp_partition_size
+
+        weight_shape = list(loaded_weight.shape)
+        if input_dim:
+            weight_shape[input_dim] = get_tp_partition_size(
+                weight_shape[input_dim],
+                self.tp_rank,
+                self.tp_size,
+                ratios,
+            )
+        param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
+
+    param_data = param.data
+    if input_dim is not None and not is_sharded_weight:
+        from vllm.distributed.utils import get_tp_partition_offset
+
+        shard_size = param_data.shape[input_dim]
+        start_idx = get_tp_partition_offset(
+            total_size=loaded_weight.shape[input_dim],
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            tp_sharding_ratios=ratios,
+        )
+        loaded_weight = loaded_weight.narrow(
+            input_dim, start_idx, shard_size
+        )
+
+    if len(loaded_weight.shape) == 0:
+        loaded_weight = loaded_weight.reshape(1)
+
+    assert param_data.shape == loaded_weight.shape
+    param_data.copy_(loaded_weight)
+
+
+def _patched_merged_weight_loader(
+    self,
+    param: Parameter,
+    loaded_weight: torch.Tensor,
+    loaded_shard_id=None,
+):
+    """Ratio-aware port of ``MergedColumnParallelLinear.weight_loader``.
+
+    Both the rank-local shard offset inside the merged parameter and the
+    checkpoint start index must follow ``tp_sharding_ratios``.
+    """
+    ratios = getattr(self, "_tp_sharding_ratios", None)
+    if ratios is None:
+        return _ORIG_MERGED_WEIGHT_LOADER(
+            self, param, loaded_weight, loaded_shard_id
+        )
+
+    from vllm.distributed.utils import (
+        get_tp_partition_offset,
+        get_tp_partition_size,
+    )
+
+    self.validate_shard_id(loaded_shard_id)
+
+    is_gguf_weight = getattr(param, "is_gguf_weight", False)
+    is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+    if isinstance(loaded_shard_id, tuple) and (
+        is_gguf_weight or is_gguf_weight_type
+    ):
+        raise NotImplementedError(
+            "Shard id with multiple indices is not supported for GGUF."
+        )
+    if is_gguf_weight_type:
+        if loaded_shard_id is not None:
+            param.data[loaded_shard_id].copy_(loaded_weight)
+            param.shard_weight_type[loaded_shard_id] = loaded_weight.item()
+        else:
+            param.shard_weight_type = {
+                i: loaded_weight.item()
+                for i, _ in enumerate(self.output_sizes)
+            }
+        return
+
+    if is_gguf_weight:
+        output_dim = getattr(param, "output_dim", None)
+        shard_size = loaded_weight.size(output_dim) // self.tp_size
+        start_idx = self.tp_rank * shard_size
+        if loaded_shard_id is not None:
+            loaded_weight = loaded_weight.narrow(
+                output_dim, start_idx, shard_size
+            )
+            param.shard_id.append(loaded_shard_id)
+            param.shard_id_map[loaded_shard_id] = len(param.data_container)
+            param.data_container.append(loaded_weight)
+            return
+
+    param_data = param.data
+    output_dim = getattr(param, "output_dim", None)
+    needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
+
+    if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
+        if output_dim is None:
+            if needs_scalar_to_array:
+                from vllm.model_executor.layers.linear import (
+                    adjust_scalar_to_fused_array,
+                )
+
+                param_data, loaded_weight = adjust_scalar_to_fused_array(
+                    param_data, loaded_weight, 0
+                )
+
+            assert param_data.shape == loaded_weight.shape
+            param_data.copy_(loaded_weight)
+            return
+
+        output_sizes = (
+            self.output_sizes[loaded_shard_id[0] : loaded_shard_id[-1] + 1]
+            if loaded_shard_id is not None
+            else self.output_sizes
+        )
+        current_shard_offset = 0
+        use_bitsandbytes_4bit = getattr(
+            param, "use_bitsandbytes_4bit", False
+        )
+        if (
+            use_bitsandbytes_4bit
+            and isinstance(loaded_shard_id, tuple)
+            and self.tp_size > 1
+        ):
+            raise NotImplementedError(
+                "Shard id with multiple indices is not supported "
+                "for BNB quantization with TP yet."
+            )
+        shard_offsets: list[tuple[int, int, int]] = []
+        for i, output_size in enumerate(output_sizes):
+            shard_offsets.append((i, current_shard_offset, output_size))
+            current_shard_offset += output_size
+        packed_dim = getattr(param, "packed_dim", None)
+        for shard_id, shard_offset, shard_size in shard_offsets:
+            from vllm.model_executor.layers.linear import (
+                adjust_bitsandbytes_4bit_shard,
+                adjust_block_scale_shard,
+                adjust_marlin_shard,
+            )
+            from vllm.model_executor.parameter import (
+                BlockQuantScaleParameter,
+            )
+
+            if isinstance(param, BlockQuantScaleParameter):
+                weight_block_size = getattr(self, "weight_block_size", None)
+                shard_size, shard_offset = adjust_block_scale_shard(
+                    weight_block_size, shard_size, shard_offset
+                )
+
+            if packed_dim == output_dim:
+                shard_size = shard_size // param.packed_factor
+                shard_offset = shard_offset // param.packed_factor
+                shard_size, shard_offset = adjust_marlin_shard(
+                    param, shard_size, shard_offset
+                )
+
+            if use_bitsandbytes_4bit:
+                index = list(itertools.accumulate([0] + self.output_sizes))
+                orig_offsets = {
+                    str(i): (index[i], size)
+                    for i, size in enumerate(self.output_sizes)
+                }
+                orig_offsets["total"] = (self.output_size, 0)
+                shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
+                    param, orig_offsets, str(shard_id)
+                )
+
+            loaded_weight_shard = loaded_weight.narrow(
+                output_dim, shard_offset, shard_size
+            )
+            self.weight_loader(param, loaded_weight_shard, shard_id)
+        return
+
+    assert loaded_shard_id < len(self.output_sizes)
+    if output_dim is not None:
+        total_ratio = sum(ratios)
+        local_offset = 0
+        for i in range(loaded_shard_id):
+            s = self.output_sizes[i]
+            local_offset += s * ratios[self.tp_rank] // total_ratio
+        shard_offset = local_offset
+        shard_size = get_tp_partition_size(
+            self.output_sizes[loaded_shard_id],
+            self.tp_rank,
+            self.tp_size,
+            ratios,
+        )
+
+        from vllm.model_executor.layers.linear import (
+            adjust_bitsandbytes_4bit_shard,
+            adjust_block_scale_shard,
+            adjust_marlin_shard,
+        )
+        from vllm.model_executor.parameter import (
+            BlockQuantScaleParameter,
+        )
+
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            shard_size, shard_offset = adjust_block_scale_shard(
+                weight_block_size, shard_size, shard_offset
+            )
+
+        packed_dim = getattr(param, "packed_dim", None)
+        if packed_dim == output_dim:
+            shard_size = round(shard_size // param.packed_factor)
+            shard_offset = round(shard_offset // param.packed_factor)
+            shard_size, shard_offset = adjust_marlin_shard(
+                param, shard_size, shard_offset
+            )
+
+        use_bitsandbytes_4bit = getattr(
+            param, "use_bitsandbytes_4bit", False
+        )
+        is_sharded_weight = getattr(param, "is_sharded_weight", False)
+        is_sharded_weight = is_sharded_weight or use_bitsandbytes_4bit
+
+        if use_bitsandbytes_4bit:
+            index = list(itertools.accumulate([0] + self.output_sizes))
+            orig_offsets = {
+                str(i): (index[i], size)
+                for i, size in enumerate(self.output_sizes)
+            }
+            orig_offsets["total"] = (self.output_size, 0)
+            shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
+                param, orig_offsets, str(loaded_shard_id)
+            )
+        param_data = param_data.narrow(
+            output_dim, shard_offset, shard_size
+        )
+        _full_sz = self.output_sizes[loaded_shard_id]
+        start_idx = get_tp_partition_offset(
+            _full_sz, self.tp_rank, self.tp_size, ratios
+        )
+        if not is_sharded_weight:
+            loaded_weight = loaded_weight.narrow(
+                output_dim, start_idx, shard_size
+            )
+    elif needs_scalar_to_array:
+        from vllm.model_executor.layers.linear import (
+            adjust_scalar_to_fused_array,
+        )
+
+        param_data, loaded_weight = adjust_scalar_to_fused_array(
+            param_data, loaded_weight, loaded_shard_id
+        )
+    else:
+        ignore_warning = getattr(param, "ignore_warning", False)
+        if not ignore_warning:
+            logger.warning(
+                "Loading a weight without `output_dim` attribute in "
+                "MergedColumnParallelLinear, assume the weight is "
+                "the same for all partitions."
+            )
+
+    assert param_data.shape == loaded_weight.shape
+    param_data.copy_(loaded_weight)
+
+
+def _patched_merged_weight_loader_v2(
+    self,
+    param,
+    loaded_weight: torch.Tensor,
+    loaded_shard_id=None,
+):
+    """Ratio-aware port of ``MergedColumnParallelLinear.weight_loader_v2``.
+
+    ``patch_hetero_parameter`` already makes the v2 parameter loader ratio
+    aware, but the merged layer still has to pass the ratio-correct local
+    ``shard_offset`` / ``shard_size`` to that loader.
+    """
+    ratios = getattr(self, "_tp_sharding_ratios", None)
+    if ratios is None:
+        return _ORIG_MERGED_WEIGHT_LOADER_V2(
+            self, param, loaded_weight, loaded_shard_id
+        )
+
+    from vllm.distributed.utils import get_tp_partition_size
+    from vllm.model_executor.layers.linear import adjust_block_scale_shard
+    from vllm.model_executor.parameter import (
+        BasevLLMParameter,
+        BlockQuantScaleParameter,
+        PerTensorScaleParameter,
+        RowvLLMParameter,
+    )
+
+    self.validate_shard_id(loaded_shard_id)
+    if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
+        if isinstance(param, PerTensorScaleParameter):
+            if isinstance(loaded_shard_id, tuple):
+                for idx in loaded_shard_id:
+                    param.load_merged_column_weight(
+                        loaded_weight=loaded_weight, shard_id=idx
+                    )
+            else:
+                for idx in range(param.data.shape[0]):
+                    param.load_merged_column_weight(
+                        loaded_weight=loaded_weight, shard_id=idx
+                    )
+            return
+        elif type(param) in (RowvLLMParameter, BasevLLMParameter):
+            param.load_merged_column_weight(loaded_weight=loaded_weight)
+            return
+
+        output_sizes = (
+            [self.output_sizes[idx] for idx in loaded_shard_id]
+            if loaded_shard_id
+            else None
+        )
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            output_sizes = [
+                adjust_block_scale_shard(weight_block_size, size, 0)[0]
+                for size in (output_sizes or self.output_sizes)
+            ]
+        self._load_fused_module_from_checkpoint(
+            param, loaded_weight, output_sizes=output_sizes
+        )
+        return
+
+    assert loaded_shard_id < len(self.output_sizes)
+
+    total_ratio = sum(ratios)
+    local_offset = 0
+    for i in range(loaded_shard_id):
+        s = self.output_sizes[i]
+        local_offset += s * ratios[self.tp_rank] // total_ratio
+    shard_offset = local_offset
+    shard_size = get_tp_partition_size(
+        self.output_sizes[loaded_shard_id],
+        self.tp_rank,
+        self.tp_size,
+        ratios,
+    )
+
+    if isinstance(param, BlockQuantScaleParameter):
+        weight_block_size = getattr(self, "weight_block_size", None)
+        shard_size, shard_offset = adjust_block_scale_shard(
+            weight_block_size, shard_size, shard_offset
+        )
+
+    param.load_merged_column_weight(
+        loaded_weight=loaded_weight,
+        shard_id=loaded_shard_id,
+        shard_offset=shard_offset,
+        shard_size=shard_size,
+        tp_rank=self.tp_rank,
+    )
+
+
 def apply_hetero_ascend_linear_patch():
     """Patch Ascend custom-op linear classes for heterogeneous TP."""
     global _PATCHED
     global _ORIG_COL_INIT, _ORIG_MERGED_INIT, _ORIG_ROW_INIT
-    global _ORIG_COL_WEIGHT_LOADER
+    global _ORIG_COL_WEIGHT_LOADER, _ORIG_ROW_WEIGHT_LOADER
+    global _ORIG_MERGED_WEIGHT_LOADER, _ORIG_MERGED_WEIGHT_LOADER_V2
     global _ORIG_ASCEND_UNQUANT_PROCESS, _ORIG_VLLM_UNQUANT_PROCESS
 
     if _PATCHED:
@@ -468,11 +907,25 @@ def apply_hetero_ascend_linear_patch():
     _ORIG_MERGED_INIT = mod.AscendMergedColumnParallelLinear.__init__
     _ORIG_ROW_INIT = mod.AscendRowParallelLinear.__init__
     _ORIG_COL_WEIGHT_LOADER = mod.AscendColumnParallelLinear.weight_loader
+    _ORIG_ROW_WEIGHT_LOADER = mod.AscendRowParallelLinear.weight_loader
+    _ORIG_MERGED_WEIGHT_LOADER = (
+        mod.AscendMergedColumnParallelLinear.weight_loader
+    )
+    _ORIG_MERGED_WEIGHT_LOADER_V2 = (
+        mod.AscendMergedColumnParallelLinear.weight_loader_v2
+    )
 
     mod.AscendColumnParallelLinear.__init__ = _patched_col_init
     mod.AscendMergedColumnParallelLinear.__init__ = _patched_merged_init
     mod.AscendRowParallelLinear.__init__ = _patched_row_init
     mod.AscendColumnParallelLinear.weight_loader = _patched_col_weight_loader
+    mod.AscendRowParallelLinear.weight_loader = _patched_row_weight_loader
+    mod.AscendMergedColumnParallelLinear.weight_loader = (
+        _patched_merged_weight_loader
+    )
+    mod.AscendMergedColumnParallelLinear.weight_loader_v2 = (
+        _patched_merged_weight_loader_v2
+    )
 
     # W8A8 modelslim keeps DeepSeek-V4 wo_a unquantized; reshape it for the
     # DSA batchmatmul kernels after the original post-load processing.
