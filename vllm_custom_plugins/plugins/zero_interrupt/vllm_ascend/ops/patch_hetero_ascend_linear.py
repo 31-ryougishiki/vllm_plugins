@@ -119,6 +119,11 @@ def _ratios_for(disable_tp: bool):
     return get_current_tp_sharding_ratios() if not disable_tp else None
 
 
+def _ceil_divisible(value: int, divisor: int) -> int:
+    """Smallest multiple of ``divisor`` that is >= ``value``."""
+    return ((value + divisor - 1) // divisor) * divisor
+
+
 def _rebuild_col_weights(self, output_size: int, ratios: list[int]) -> None:
     from vllm.distributed.utils import get_tp_partition_size
 
@@ -189,29 +194,59 @@ def _patched_col_init(
 ):
     # Preserve the original __init__'s `hasattr(self, "output_sizes")`
     # behaviour and make the Merged subclass path deterministic.
-    self.output_sizes = list(output_sizes) if output_sizes is not None else [
-        output_size
-    ]
+    real_output_sizes = (
+        list(output_sizes) if output_sizes is not None else None
+    )
+    self.output_sizes = real_output_sizes or [output_size]
     ratios = _ratios_for(disable_tp)
     self._tp_sharding_ratios = ratios
 
-    _ORIG_COL_INIT(
-        self,
-        input_size=input_size,
-        output_size=output_size,
-        bias=bias,
-        gather_output=gather_output,
-        skip_bias_add=skip_bias_add,
-        params_dtype=params_dtype,
-        quant_config=quant_config,
-        output_sizes=output_sizes,
-        prefix=prefix,
-        return_bias=return_bias,
-        disable_tp=disable_tp,
-    )
-
+    # The stock AscendColumnParallelLinear.__init__ requires
+    # ``output_size % tp_size == 0``.  Under heterogeneous TP that is no
+    # longer true (e.g. wo_a output 8192 with tp=3).  Call the original with
+    # the smallest divisible size so it can build the layer scaffolding, then
+    # restore the real output sizes and rebuild the quant weights with the
+    # asymmetric partition below.
     if ratios is not None:
+        import vllm_ascend.ops.linear as mod
+
+        self.custom_op, self.tp_rank, self.tp_size = mod.get_parallel_op(
+            disable_tp, prefix, self, "column"
+        )
+        uniform_output_size = _ceil_divisible(output_size, self.tp_size)
+        _ORIG_COL_INIT(
+            self,
+            input_size=input_size,
+            output_size=uniform_output_size,
+            bias=bias,
+            gather_output=gather_output,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            output_sizes=None,
+            prefix=prefix,
+            return_bias=return_bias,
+            disable_tp=disable_tp,
+        )
+        # Restore the real geometry before rebuilding weights.
+        self.output_size = output_size
+        self.output_sizes = real_output_sizes or [output_size]
         _rebuild_col_weights(self, output_size, ratios)
+    else:
+        _ORIG_COL_INIT(
+            self,
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            gather_output=gather_output,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            output_sizes=output_sizes,
+            prefix=prefix,
+            return_bias=return_bias,
+            disable_tp=disable_tp,
+        )
 
 
 def _patched_merged_init(
@@ -278,21 +313,49 @@ def _patched_row_init(
     ratios = _ratios_for(disable_tp)
     self._tp_sharding_ratios = ratios
 
-    _ORIG_ROW_INIT(
-        self,
-        input_size=input_size,
-        output_size=output_size,
-        bias=bias,
-        input_is_parallel=input_is_parallel,
-        skip_bias_add=skip_bias_add,
-        params_dtype=params_dtype,
-        out_dtype=out_dtype,
-        reduce_results=reduce_results,
-        quant_config=quant_config,
-        prefix=prefix,
-        return_bias=return_bias,
-        disable_tp=disable_tp,
-    )
+    # Same divisibility issue as the column path: stock AscendRowParallelLinear
+    # requires ``input_size % tp_size == 0``, but heterogeneous ratios make
+    # wo_b/down_proj input 8192 with tp=3.  Build the scaffolding with a
+    # divisible input size, restore the real input size, then rebuild.
+    if ratios is not None:
+        import vllm_ascend.ops.linear as mod
+
+        self.custom_op, self.tp_rank, self.tp_size = mod.get_parallel_op(
+            disable_tp, prefix, self, "row"
+        )
+        uniform_input_size = _ceil_divisible(input_size, self.tp_size)
+        _ORIG_ROW_INIT(
+            self,
+            input_size=uniform_input_size,
+            output_size=output_size,
+            bias=bias,
+            input_is_parallel=input_is_parallel,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            out_dtype=out_dtype,
+            reduce_results=reduce_results,
+            quant_config=quant_config,
+            prefix=prefix,
+            return_bias=return_bias,
+            disable_tp=disable_tp,
+        )
+        self.input_size = input_size
+    else:
+        _ORIG_ROW_INIT(
+            self,
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            input_is_parallel=input_is_parallel,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            out_dtype=out_dtype,
+            reduce_results=reduce_results,
+            quant_config=quant_config,
+            prefix=prefix,
+            return_bias=return_bias,
+            disable_tp=disable_tp,
+        )
 
     if ratios is None:
         return

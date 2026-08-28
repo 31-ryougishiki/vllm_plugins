@@ -223,6 +223,27 @@ git -C vllm_plugins diff HEAD
     `curl http://127.0.0.1:8001/api/v1/executor/status`
     应返回 `port: 8001`，且与 dp0 日志的 `_http_port` 一致。
 
+### 4.7 异构重启后 DP0 worker `8192 is not divisible by 3`（已修复）
+
+- 现象：trigger 后 DP0（TP=3，ratios=[2,1,1]）worker 加载模型时，
+  `wo_a = ColumnParallelLinear` 报：
+  `AssertionError: 8192 is not divisible by 3`。
+  位置：`patch_hetero_ascend_linear._patched_col_init` →
+  stock `AscendColumnParallelLinear.__init__` 的 `divide(output_size, tp_size)`。
+- 根因：§4.4 修复后不再把模块 linear 类换成 vLLM `*Asymmetric` 子类，
+  异构模型改走被 patch 的 `AscendColumnParallelLinear` /
+  `AscendRowParallelLinear`。但 stock Ascend init **先做整除校验**，
+  而 `wo_a/wo_b` 的 8192 维度在 TP=3 + `[2,1,1]` 下本来就不整除。
+- 修复：
+  - `_patched_col_init` / `_patched_row_init` 在 ratios 生效时，
+    先用 `_ceil_divisible(value, tp_size)` 构造一个可整除的临时维度
+    调 stock init（只用于搭 scaffolding），随后恢复真实
+    `input_size/output_size/output_sizes`，再调用 `_rebuild_*` 按
+    `get_tp_partition_size(..., ratios)` 重建权重。
+  - 对称路径仍然原样调用 stock init，行为不变。
+- 注意：后续若出现其它 Ascend linear 子类（如 QKV）在异构 TP 下
+  `divide` 报错，同样需要做“临时可整除维度 + 重建真实分区”的处理。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
@@ -322,6 +343,7 @@ grep -R "heterogeneous producer restart rotates engine_id" logs/prefill/
 | 只给故障 DP 下发策略 | barrier 120s 超时 fail-closed，EngineCore 退出 | 设计如此；决策中心必须广播完整策略 |
 | `inplace_partial_rotary_mul` / `EZ9999: Inner Error` | `local_cos` 行数（tokens_per_rank）与 q 行数不一致，常见于 draft metadata 被 LCM 对齐 | 已修复（draft builder 不 LCM） |
 | 异构重启后 worker `aclInit 107001 / Invalid device ID, Expected [0,0)` | `ASCEND_RT_VISIBLE_DEVICES` 被 `sorted()` 按字符串排序，`8,9,10,11` 变成 `10,11,8,9`，NPU runtime 解析失败 | 已修复（`sorted(..., key=int)`） |
+| 异构重启后 DP0 worker `8192 is not divisible by 3`（`wo_a/wo_b` 初始化） | stock `AscendColumnParallelLinear`/`AscendRowParallelLinear` 先做整除校验；TP=3 时 8192 不整除 | 已修复（临时可整除维度搭 scaffolding，再按 ratios 重建权重） |
 
 ---
 
