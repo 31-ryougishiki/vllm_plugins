@@ -308,13 +308,14 @@ git -C vllm_plugins diff HEAD
 
 ### 4.9 异构重启后 profile_run 报 `shape '[4, 8184, 4096]' is invalid`（已修复，待 A3 复测）
 
-- 现象：§4.8 修复后，DP1 四个新 worker 模型（含 MTP）加载成功，但
+- 现象：§4.8 修复后，DP0 三个 + DP1 四个新 worker 模型（含 MTP）加载成功，但
   `determine_available_memory -> profile_run -> _dummy_run -> MLP/MoE` 时报：
   ```
   patch_hetero_custom_ops.py:164
       x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
   RuntimeError: shape '[4, 8184, 4096]' is invalid for input of size 125706240
   ```
+  DP0 同一位置的输入 size 为 167608320，同样无法 view。dp0/dp1 日志均已复现。
   随后 EngineCore `_reinitialize_kv_cache` 拿到 `[None, None, None, None]`，
   又报 `TypeError: '<=' not supported between 'NoneType' and 'int'`。
 - 根因（patch 绑定时序，不是算子公式）：
