@@ -31,6 +31,61 @@ _ORIG_COL_INIT = None
 _ORIG_MERGED_INIT = None
 _ORIG_ROW_INIT = None
 _ORIG_COL_WEIGHT_LOADER = None
+_ORIG_ASCEND_UNQUANT_PROCESS = None
+_ORIG_VLLM_UNQUANT_PROCESS = None
+
+
+def _reshape_wo_a_for_dsa(layer) -> None:
+    """Reshape an unquantized DeepSeek-V4 ``wo_a`` weight to 3-D.
+
+    ModelSlim W8A8 recipes intentionally leave ``wo_a`` unquantized, so the
+    FP8 ``ds_linear`` post-load reshape never runs.  Both DSA-CP and DSA v1
+    feed ``wo_a.weight`` directly into ``npu_transpose_batchmatmul`` with
+    ``perm_x2=(0, 1, 2)``; the op requires a 3-D weight
+    ``[n_local_groups, input_dim, o_lora_rank]`` and raises
+    ``IndexError: Dimension out of range (expected [-2, 1], got 2)`` for a
+    2-D parameter.
+    """
+    prefix = getattr(layer, "prefix", "")
+    if not prefix.endswith("wo_a"):
+        return
+    weight = getattr(layer, "weight", None)
+    if weight is None or weight.dim() != 2:
+        return
+
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
+    try:
+        cfg = get_current_vllm_config()
+        hf_config = cfg.model_config.hf_text_config
+    except Exception:  # noqa: BLE001
+        return
+    o_groups = getattr(hf_config, "o_groups", 0)
+    o_lora_rank = getattr(hf_config, "o_lora_rank", 0)
+    if o_groups <= 0 or o_lora_rank <= 0:
+        return
+    tp_size = getattr(layer, "tp_size", None) or (
+        get_tensor_model_parallel_world_size()
+    )
+    n_local_groups = o_groups // tp_size
+    if n_local_groups <= 0 or weight.shape[0] != n_local_groups * o_lora_rank:
+        return
+
+    weight.data = (
+        weight.data.view(n_local_groups, o_lora_rank, -1)
+        .transpose(1, 2)
+        .contiguous()
+    )
+
+
+def _patched_ascend_unquant_process_weights_after_loading(self, layer):
+    _ORIG_ASCEND_UNQUANT_PROCESS(self, layer)
+    _reshape_wo_a_for_dsa(layer)
+
+
+def _patched_vllm_unquant_process_weights_after_loading(self, layer):
+    _ORIG_VLLM_UNQUANT_PROCESS(self, layer)
+    _reshape_wo_a_for_dsa(layer)
 
 
 def _ratios_for(disable_tp: bool):
@@ -305,6 +360,7 @@ def apply_hetero_ascend_linear_patch():
     global _PATCHED
     global _ORIG_COL_INIT, _ORIG_MERGED_INIT, _ORIG_ROW_INIT
     global _ORIG_COL_WEIGHT_LOADER
+    global _ORIG_ASCEND_UNQUANT_PROCESS, _ORIG_VLLM_UNQUANT_PROCESS
 
     if _PATCHED:
         return
@@ -320,5 +376,32 @@ def apply_hetero_ascend_linear_patch():
     mod.AscendMergedColumnParallelLinear.__init__ = _patched_merged_init
     mod.AscendRowParallelLinear.__init__ = _patched_row_init
     mod.AscendColumnParallelLinear.weight_loader = _patched_col_weight_loader
+
+    # W8A8 modelslim keeps DeepSeek-V4 wo_a unquantized; reshape it for the
+    # DSA batchmatmul kernels after the original post-load processing.
+    if _ORIG_ASCEND_UNQUANT_PROCESS is None:
+        _ORIG_ASCEND_UNQUANT_PROCESS = (
+            mod.AscendUnquantizedLinearMethod.process_weights_after_loading
+        )
+        mod.AscendUnquantizedLinearMethod.process_weights_after_loading = (
+            _patched_ascend_unquant_process_weights_after_loading
+        )
+
+    # Same guard for environments where the layer falls back to the stock
+    # vLLM UnquantizedLinearMethod instead of the Ascend subclass.
+    try:
+        from vllm.model_executor.layers.linear import (
+            UnquantizedLinearMethod as VllmUnquantizedLinearMethod,
+        )
+
+        if _ORIG_VLLM_UNQUANT_PROCESS is None:
+            _ORIG_VLLM_UNQUANT_PROCESS = (
+                VllmUnquantizedLinearMethod.process_weights_after_loading
+            )
+            VllmUnquantizedLinearMethod.process_weights_after_loading = (
+                _patched_vllm_unquant_process_weights_after_loading
+            )
+    except ImportError:
+        pass
 
     _PATCHED = True

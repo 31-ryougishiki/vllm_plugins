@@ -41,6 +41,7 @@ _ATTENTION_HETERO_PATCH_APPLIED = False
 # function object that was just saved, which makes the wrapper call itself.
 _ORIG_BUILD_LOCAL_TOKEN_METADATA = None
 _ORIG_DSA_CP_INIT = None
+_ORIG_DSA_CP_PROCESS_WEIGHTS = None
 
 
 def _get_dsa_local_heads(vllm_config: VllmConfig | None, total_num_heads: int, tp_size: int) -> int:
@@ -847,6 +848,27 @@ def _patched_dsa_cp_init(self, *args, **kwargs):
             )
 
 
+def _patched_dsa_cp_process_weights_after_loading(self, act_dtype):
+    """Make ``wo_a`` 3-D for ``npu_transpose_batchmatmul``.
+
+    With ModelSlim W8A8 DeepSeek-V4 the ``wo_a`` linear layer is
+    intentionally unquantized, so the FP8 ``process_weights_after_loading``
+    reshape to ``[n_local_groups, input, o_lora_rank]`` never runs.  The
+    DSA-CP forward passes ``self.wo_a.weight`` directly to
+    ``npu_transpose_batchmatmul(perm_x2=(0, 1, 2))``, which requires a 3-D
+    weight and otherwise fails with ``IndexError: ... got 2`` on a 2-D
+    parameter.
+    """
+    _ORIG_DSA_CP_PROCESS_WEIGHTS(self, act_dtype)
+    weight = self.wo_a.weight
+    if weight.dim() == 2 and not self.enable_dsa_cp_with_o_proj_tp:
+        weight.data = (
+            weight.data.view(self.n_local_groups, self.o_lora_rank, -1)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+
 
 # =====================================================================
 # Copied from hetero_cp/vllm-ascend/vllm_ascend/attention/context_parallel/dsa_cp.py
@@ -965,6 +987,7 @@ def apply_deepseek_v4_attention_hetero_patch() -> dict[str, list[str]]:
     """
     global _ATTENTION_HETERO_PATCH_APPLIED
     global _ORIG_BUILD_LOCAL_TOKEN_METADATA, _ORIG_DSA_CP_INIT
+    global _ORIG_DSA_CP_PROCESS_WEIGHTS
     if _ATTENTION_HETERO_PATCH_APPLIED:
         return {
             "vllm_ascend.attention.dsa_v1": list(_DS_V1_PATCHED_SYMBOLS),
@@ -986,6 +1009,9 @@ def apply_deepseek_v4_attention_hetero_patch() -> dict[str, list[str]]:
         dsa_cp_module.AscendDSACPMetadataBuilder._build_local_token_metadata
     )
     _ORIG_DSA_CP_INIT = dsa_cp_module.AscendDSACPImpl.__init__
+    _ORIG_DSA_CP_PROCESS_WEIGHTS = (
+        dsa_cp_module.AscendDSACPImpl.process_weights_after_loading
+    )
 
     # dsa_v1 metadata builders and forward.
     dsa_v1_module.AscendDSAMetadataBuilder.build_prefill_metadata.__code__ = (
@@ -1009,6 +1035,11 @@ def apply_deepseek_v4_attention_hetero_patch() -> dict[str, list[str]]:
         _patched_build_local_token_metadata
     )
     dsa_cp_module.AscendDSACPImpl.__init__ = _patched_dsa_cp_init
+    # W8A8 modelslim keeps wo_a unquantized (2-D); reshape it to the 3-D
+    # layout npu_transpose_batchmatmul expects after the original processing.
+    dsa_cp_module.AscendDSACPImpl.process_weights_after_loading = (
+        _patched_dsa_cp_process_weights_after_loading
+    )
     # ``_restore_tp_head_layout`` is a standalone copied body whose globals
     # must stay the target module namespace (torch, dist, helpers above), so
     # code-object replacement is the right installation method for it.
