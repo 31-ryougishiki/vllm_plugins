@@ -17,6 +17,7 @@
 | DP2 重启 worker NPU 可见性 | ✅ 已修复 | `ASCEND_RT_VISIBLE_DEVICES` 改为数值排序（§4.5） |
 | DP0 TP=3 worker 模型加载 | 🔧 已修复，待 A3 复测 | `8192 is not divisible by 3`（§4.7/§4.8） |
 | 异构重启后 profile_run / KV cache 重建 | 🔧 已修复，待 A3 复测 | `_EXTRA_CTX` 缺少 per-DP 布局，custom op 落入同形 view（§4.9） |
+| 异构重启后真实请求 MTP draft 前向 | 🔧 已修复，待 A3 复测 | MoE drafter 实际开 FlashComm1，draft metadata 错误跳过 LCM（§4.10） |
 | 重复 trigger 静默丢弃 | ✅ 已修复 | `strategy_sync` 重复策略会转发而非 return（§4.6） |
 | 异构重启后发请求 / 续推 | ⏳ 未验证 | 下一步必须在 A3 执行 |
 | PD / Mooncake engine_id 轮换链路 | ⏳ 未验证 | 需结合 D 端验证 |
@@ -345,6 +346,33 @@ git -C vllm_plugins diff HEAD
   `vllm_ascend/patch/tests/test_patch_hetero_tp.py`，模拟“先 import、
   后 patch”的模块别名场景，断言旧别名被刷新且无关属性不被覆盖。
 
+### 4.10 异构重启后真实请求在 MTP draft 前向报 RoPE `dim0 must be equal`（已修复，待 A3 复测）
+
+- 现象：profile_run / KV cache 重建 / Mooncake 元数据恢复全部通过，
+  DP0 收到真实请求后，worker 在 `sample_tokens ->
+  propose_draft_token_ids -> _run_merged_draft` 的 MTP draft 第一层报：
+  ```
+  dsa_cp.py:1369 inplace_partial_rotary_mul
+  RuntimeError: EZ1008 ... dim0 must be equal
+  CheckInputShapes ... inplace_partial_rotary_mul_a3_tiling.cpp
+  ```
+- 根因：§9.3 之前假设“MTP draft 的 `flash_comm_v1_enabled=False`，
+  draft metadata 绝不能 LCM 对齐”。但该结论只对**稠密 drafter**成立。
+  DeepSeek-V4 MTP 是 **MoE drafter**，`set_ascend_forward_context` 会走
+  `is_drafter_moe_model()` 分支并把 FlashComm1 保持为 True；此时
+  `maybe_pad_and_reduce` 已把 draft 隐状态按 `lcm(tp_sizes)` padding 并
+  reduce_scatter 成 `padded_length / tp` 行，而 `_patched_build_local_token_metadata`
+  因 `_is_dsa_cp_draft_builder` 标记跳过了 LCM，只做本地 `tp_size` 对齐。
+  两者行数不同，RoPE kernel 报 `dim0 must be equal`。
+- 修复：
+  - `_patched_build_local_token_metadata` 对 draft builder 不再一律跳过 LCM；
+    只有稠密 drafter（`is_drafter_moe_model() == False`）跳过，MoE drafter
+    与主模型一样用 `lcm(tp_sizes)` 对齐。
+  - 判断逻辑统一为：`use_lcm = (非 draft builder) or is_drafter_moe_model`。
+- 回归：新增
+  `vllm_ascend/attention/tests/test_patch_deepseek_v4_attention_hetero.py`，
+  覆盖“主模型 LCM / MoE drafter LCM / 稠密 drafter 不 LCM”三种情况。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
@@ -451,6 +479,7 @@ grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应�
 | 异构重启后 DP0 worker `8192 is not divisible by 3`（`wo_a/wo_b` 初始化） | stock `AscendColumnParallelLinear`/`AscendRowParallelLinear` 先做整除校验；TP=3 时 8192 不整除 | 已修复（临时可整除维度搭 scaffolding，再按 ratios 重建权重） |
 | 同上错误在 §4.7 修复后复现 | stock col init 读预置的 `self.output_sizes` 而非入参，scaffolding 尺寸被绕过 | 已修复（§4.8） |
 | 异构重启后 profile_run `shape '[4, 8184, 4096]' is invalid`，KV 重建 `NoneType <= int` | `model_runner_v1` 等模块在 patch 前已 import，`set_ascend_forward_context` 别名仍指向 stock 函数，`_EXTRA_CTX` 无 per-DP 布局 | 已修复（§4.9，刷新已导入模块别名） |
+| 真实请求 MTP draft 前向 `inplace_partial_rotary_mul` `dim0 must be equal` | MoE drafter 实际 FlashComm1=True、隐状态按 LCM 分片；draft builder 被错误地跳过 LCM，只用本地 TP 对齐 | 已修复（§4.10） |
 
 ---
 

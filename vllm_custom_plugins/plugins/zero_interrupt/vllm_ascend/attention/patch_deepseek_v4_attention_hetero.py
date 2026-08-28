@@ -803,18 +803,34 @@ def _patched_build_local_token_metadata(
     ``AscendSpecDecodeBaseProposer`` marks its DSA-CP draft builders with
     ``_is_dsa_cp_draft_builder``.
     """
-    if self.vllm_config.parallel_config.is_heterogeneous_tp and not getattr(
-        self, "_is_dsa_cp_draft_builder", False
-    ):
-        align = math.lcm(
-            *[
-                self.vllm_config.parallel_config.get_tp_size_for_dp(i)
-                for i in range(
-                    self.vllm_config.parallel_config.data_parallel_size
-                )
-            ]
-        )
-        num_input_tokens = math.ceil(num_input_tokens / align) * align
+    if self.vllm_config.parallel_config.is_heterogeneous_tp:
+        draft_builder = getattr(self, "_is_dsa_cp_draft_builder", False)
+        # Dense drafters run with flash_comm_v1_enabled=False and must NOT be
+        # LCM-padded.  MoE drafters (e.g. DeepSeek-V4 MTP) are different:
+        # set_ascend_forward_context marks them as a context MoE model and
+        # keeps flash_comm_v1_enabled=True, so their hidden stream IS padded
+        # to lcm(tp_sizes) and reduce_scattered before the first draft layer.
+        # In that case the draft metadata must use the exact same LCM padding;
+        # the local-TP fallback below makes local_cos wider/narrower than q and
+        # the inplace_partial_rotary_mul kernel reports ``dim0 must be equal``.
+        use_lcm_alignment = not draft_builder
+        if draft_builder:
+            try:
+                from vllm_ascend.utils import is_drafter_moe_model
+
+                use_lcm_alignment = is_drafter_moe_model(self.vllm_config)
+            except Exception:  # noqa: BLE001
+                use_lcm_alignment = False
+        if use_lcm_alignment:
+            align = math.lcm(
+                *[
+                    self.vllm_config.parallel_config.get_tp_size_for_dp(i)
+                    for i in range(
+                        self.vllm_config.parallel_config.data_parallel_size
+                    )
+                ]
+            )
+            num_input_tokens = math.ceil(num_input_tokens / align) * align
     return _ORIG_BUILD_LOCAL_TOKEN_METADATA(
         self,
         num_reqs,
