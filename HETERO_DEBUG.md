@@ -16,6 +16,7 @@
 | 全量重启 barrier | ✅ 已通过 | dp0/dp2 日志均有 `Full-restart barrier passed` |
 | DP2 重启 worker NPU 可见性 | ✅ 已修复 | `ASCEND_RT_VISIBLE_DEVICES` 改为数值排序（§4.5） |
 | DP0 TP=3 worker 模型加载 | 🔧 已修复，待 A3 复测 | `8192 is not divisible by 3`（§4.7/§4.8） |
+| 异构重启后 profile_run / KV cache 重建 | 🔧 已修复，待 A3 复测 | `_EXTRA_CTX` 缺少 per-DP 布局，custom op 落入同形 view（§4.9） |
 | 重复 trigger 静默丢弃 | ✅ 已修复 | `strategy_sync` 重复策略会转发而非 return（§4.6） |
 | 异构重启后发请求 / 续推 | ⏳ 未验证 | 下一步必须在 A3 执行 |
 | PD / Mooncake engine_id 轮换链路 | ⏳ 未验证 | 需结合 D 端验证 |
@@ -304,6 +305,44 @@ git -C vllm_plugins diff HEAD
   用最小 stock-init 替身精确复现 `hasattr(self, "output_sizes")` 行为，
   覆盖 Column / Merged / Row 三条 scaffolding 路径。
 
+### 4.9 异构重启后 profile_run 报 `shape '[4, 8184, 4096]' is invalid`（已修复，待 A3 复测）
+
+- 现象：§4.8 修复后，DP1 四个新 worker 模型（含 MTP）加载成功，但
+  `determine_available_memory -> profile_run -> _dummy_run -> MLP/MoE` 时报：
+  ```
+  patch_hetero_custom_ops.py:164
+      x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
+  RuntimeError: shape '[4, 8184, 4096]' is invalid for input of size 125706240
+  ```
+  随后 EngineCore `_reinitialize_kv_cache` 拿到 `[None, None, None, None]`，
+  又报 `TypeError: '<=' not supported between 'NoneType' and 'int'`。
+- 根因（patch 绑定时序，不是算子公式）：
+  - `patch.py` 在应用 hetero 系列 patch **之前**就
+    `from vllm_ascend.worker.worker import NPUWorker`；这会连带 import
+    `vllm_ascend/worker/model_runner_v1.py`，而后者在模块顶部执行了
+    `from vllm_ascend.ascend_forward_context import set_ascend_forward_context`。
+  - 之后 `apply_hetero_forward_context_patch()` 只替换了
+    `afc.set_ascend_forward_context` 这个模块属性，**没有刷新
+    `model_runner_v1`（以及若干 spec_decode proposer）里已经绑定到旧函数
+    对象的别名**。于是实际跑 profile_run 的仍是 stock forward context，
+    `_EXTRA_CTX.per_dp_tp_sizes / per_dp_padded_lengths` 从未被写入。
+  - custom op 检测不到 per-DP 布局，走同形 EP all_gather 分支，用
+    `dp_size * padded_length` 去 view 异构 gather 结果，形状不匹配。
+  - KV cache 报 `NoneType <= int` 是次生错误：worker profile_run 失败后
+    `collective_rpc` 容错返回 `[None,...]`，被原样传进
+    `get_kv_cache_configs`。
+- 修复：
+  - `patch_hetero_tp.apply_hetero_forward_context_patch()` 在替换
+    `afc` 属性后，遍历 `sys.modules`，把所有捕获了原函数对象的
+    `set_ascend_forward_context` / `set_mc2_tokens_capacity` 模块别名
+    一并指向 patched 版本。
+  - `_reinitialize_kv_cache` 对 `available_memory` 含 `None` 的情况
+    fail-closed，直接给出“worker profile_run 失败”的明确错误，不再把
+    None 传入 `kv_cache_utils`。
+- 回归：新增
+  `vllm_ascend/patch/tests/test_patch_hetero_tp.py`，模拟“先 import、
+  后 patch”的模块别名场景，断言旧别名被刷新且无关属性不被覆盖。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
@@ -409,6 +448,7 @@ grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应�
 | 异构重启后 worker `aclInit 107001 / Invalid device ID, Expected [0,0)` | `ASCEND_RT_VISIBLE_DEVICES` 被 `sorted()` 按字符串排序，`8,9,10,11` 变成 `10,11,8,9`，NPU runtime 解析失败 | 已修复（`sorted(..., key=int)`） |
 | 异构重启后 DP0 worker `8192 is not divisible by 3`（`wo_a/wo_b` 初始化） | stock `AscendColumnParallelLinear`/`AscendRowParallelLinear` 先做整除校验；TP=3 时 8192 不整除 | 已修复（临时可整除维度搭 scaffolding，再按 ratios 重建权重） |
 | 同上错误在 §4.7 修复后复现 | stock col init 读预置的 `self.output_sizes` 而非入参，scaffolding 尺寸被绕过 | 已修复（§4.8） |
+| 异构重启后 profile_run `shape '[4, 8184, 4096]' is invalid`，KV 重建 `NoneType <= int` | `model_runner_v1` 等模块在 patch 前已 import，`set_ascend_forward_context` 别名仍指向 stock 函数，`_EXTRA_CTX` 无 per-DP 布局 | 已修复（§4.9，刷新已导入模块别名） |
 
 ---
 

@@ -947,6 +947,21 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             available_memory = self.determine_available_memory()
             logger.info(f"Determined available_memory: {available_memory}")
 
+            # collective_rpc is fault-tolerant and returns None for failed
+            # workers (typically profile_run raised on the worker side).
+            # Passing None into get_kv_cache_configs produces a misleading
+            # ``NoneType <= int`` TypeError deep inside kv_cache_utils, so
+            # fail here with the worker logs as the actionable error source.
+            if available_memory is None or (
+                isinstance(available_memory, (list, tuple))
+                and any(memory is None for memory in available_memory)
+            ):
+                raise RuntimeError(
+                    "determine_available_memory returned "
+                    f"{available_memory!r}; one or more workers failed "
+                    "profile_run. Check the worker tracebacks above."
+                )
+
             # Step 3: Get KV cache configs
             kv_cache_configs = get_kv_cache_configs(
                 self.vllm_config,

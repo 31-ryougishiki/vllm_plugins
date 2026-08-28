@@ -316,11 +316,45 @@ def apply_hetero_forward_context_patch():
     global _PATCHED
     if _PATCHED:
         return
+    import sys
+
     import vllm_ascend.ascend_forward_context as afc
+
+    # ``vllm_ascend.worker.model_runner_v1`` (and several spec-decode
+    # proposer modules) do ``from vllm_ascend.ascend_forward_context import
+    # set_ascend_forward_context`` at module import time.  The zero_interrupt
+    # plugin imports ``NPUWorker`` (and therefore ``model_runner_v1``) before
+    # this patch runs, so those modules keep a reference to the ORIGINAL
+    # function object.  Replacing only the attribute on ``afc`` would leave
+    # those aliases stale and the hetero per-DP token metadata
+    # (``per_dp_tp_sizes`` / ``per_dp_padded_lengths``) would never be
+    # published to ``_EXTRA_CTX`` during profile_run / forward.
+    _orig_set_forward_context = afc.set_ascend_forward_context
+    _orig_set_mc2_tokens_capacity = afc.set_mc2_tokens_capacity
 
     afc.set_ascend_forward_context = _patched_set_ascend_forward_context
     afc.set_mc2_tokens_capacity = _patched_set_mc2_tokens_capacity
     afc._select_a3_moe_comm_method = _patched_select_a3_moe_comm_method
+
+    # Refresh every already-imported module that captured the original
+    # function objects as module-level names.
+    _rebindings = (
+        ("set_ascend_forward_context",
+         _orig_set_forward_context,
+         _patched_set_ascend_forward_context),
+        ("set_mc2_tokens_capacity",
+         _orig_set_mc2_tokens_capacity,
+         _patched_set_mc2_tokens_capacity),
+    )
+    for module in list(sys.modules.values()):
+        if module is None or module is afc:
+            continue
+        for attr, original, replacement in _rebindings:
+            try:
+                if getattr(module, attr, None) is original:
+                    setattr(module, attr, replacement)
+            except Exception:  # noqa: BLE001 - best-effort alias refresh
+                continue
 
     # 允许 _EXTRA_CTX 代理读写异构 TP 的 per-DP token 布局字段。
     _extra_attrs = list(afc._ExtraForwardContextProxy.extra_attrs)
