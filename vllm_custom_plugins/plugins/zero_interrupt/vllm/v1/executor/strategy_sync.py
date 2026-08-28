@@ -59,9 +59,19 @@ class StrategySyncThread:
         logger.info(f"Strategy received via HTTP: {strategy.deploy_type.value}")
 
         if self._current_strategy == strategy:
-            return
-
-        self._current_strategy = strategy
+            # A previous attempt may have recorded this exact strategy but
+            # failed to execute (or only some DPs received it).  Returning
+            # silently here makes the HTTP endpoint reply 200 while the
+            # executor does nothing, which is indistinguishable from a lost
+            # request.  Forward it again: the caller is explicit about the
+            # deployment intent, and the executor strategy path is the
+            # idempotency boundary.
+            logger.warning(
+                "Duplicate deployment strategy received; forwarding it to "
+                "the executor again instead of dropping it silently."
+            )
+        else:
+            self._current_strategy = strategy
 
         # Directly invoke callback (no need for separate thread)
         if self.strategy_callback:

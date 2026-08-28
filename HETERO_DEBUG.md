@@ -195,6 +195,34 @@ git -C vllm_plugins diff HEAD
 - 验证：重启后 grep `Setting ASCEND_RT_VISIBLE_DEVICES`，DP2 应为
   `8,9,10,11`，且无 `Invalid device ID`。
 
+### 4.6 重复 trigger 时个别 DP 收到 200 但无反应（已修复）
+
+- 现象：发送侧全部 HTTP 200，但某个 DP（尤其 dp0）日志没有
+  `parsing deploy request / Strategy received via HTTP`，或只有
+  HTTP 收到日志、没有后续执行日志。
+- 根因候选：
+  1. `StrategySyncThread.on_strategy_received()` 原来对
+     `_current_strategy == strategy` 的重复请求**直接 return**，
+     HTTP 仍返回 200。上一轮失败/部分投递后重放同一份 trigger 时，
+     该 DP 会静默丢弃，而其它 DP 正常执行。
+  2. HTTP 200 来自**旧的残留进程**：8001 端口上还挂着上一轮 dp0，
+     新拉起 dp0 的 ITS server 没绑定成功；curl status 会显示旧进程信息。
+  3. dp0 EngineCore 尚未注册 `_trigger_busy_loop_callback`（busy loop
+     还没走到 `_handle_shutdown`），HTTP 只 set 了
+     `recv_new_deployment`，没有 WAKEUP；通常下一次循环会补处理，
+     但若已 `_paused_for_restart` 就卡住。
+- 修复：
+  - 重复策略不再静默 return：记录 warning 并**再次回调 executor**，
+    由 executor 的执行路径保证幂等/重试。
+  - 排障时按日志顺序定位：
+    `parsing deploy request` → `Strategy received via HTTP` →
+    `Strategy sync received` → `Received deployment strategy` →
+    `Paused busy_loop` → `restarting workers of EVERY DP instance`。
+    缺哪一段就查对应进程/端口/回调注册。
+  - 端口自查：
+    `curl http://127.0.0.1:8001/api/v1/executor/status`
+    应返回 `port: 8001`，且与 dp0 日志的 `_http_port` 一致。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
