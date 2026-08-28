@@ -203,17 +203,16 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     responses.append(result)
             return responses[0] if output_rank is not None else responses
 
-        if non_block:
-            future = FutureWrapper(self.futures_queue, aggregate=aggregate)
-            self.futures_queue.appendleft((future, get_response))
-            return future
-
-        # First drain any pending futures in the queue.
-        while self.futures_queue:
-            future, get_fut_response = self.futures_queue.pop()
-            future.wait_for_response(get_fut_response)
-
-        return aggregate(get_response())
+        # v0.23 FutureWrapper semantics: __init__ takes (futures_queue,
+        # get_response, aggregate), appends itself to the queue and drains
+        # earlier futures inside result().  The v0.18 (future, get_response)
+        # tuple queue no longer exists.
+        future = FutureWrapper(
+            self.futures_queue,
+            get_response=get_response,
+            aggregate=aggregate,
+        )
+        return future if non_block else future.result()
 
 
     def _init_executor(self) -> None:
@@ -235,10 +234,13 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         )
         self._strategy_sync_thread.start()
 
-        # Override health monitor with ITS-specific implementation
-        if self.monitor_workers:
-            self.start_worker_monitor()
-        
+        # NOTE: AscendMultiprocExecutor._init_executor() already called
+        # self.start_worker_monitor() through dynamic dispatch (the ITS
+        # override).  Do NOT start a second ITSHealthMonitor thread here:
+        # two monitors on the same worker list would both react to worker
+        # death during restarts, and _cleanup_message_queues_and_workers
+        # only stops the one stored in self._health_monitor.
+
         if is_mm_scene():
             # MM场景所有挂载卡visible
             _, mounted_npu_id_list = self.get_davinci_devices()
@@ -274,6 +276,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         self._http_server = ITSHttpServer(
             port=self._http_port,
             strategy_sync_thread=self._strategy_sync_thread,
+            expected_executor_id=str(self.parallel_config.data_parallel_rank),
         )
         self._http_server.start()
         logger.info(f"Waiting for deployment strategy via HTTP POST to port {self._http_port}")
@@ -791,11 +794,36 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             rank_in_dp + 1,
             world_size,
         )
-        tensor = torch.tensor([1], dtype=torch.int32)
+        # Use the exact same collective shape/op as
+        # ParallelConfig.sync_dp_state (two int32 SUM) on the SAME dp_group.
+        # That way, if a DP rank is still inside its
+        # `_has_global_unfinished_reqs` all-reduce when another rank reaches
+        # this barrier, the two calls still match at the gloo level instead
+        # of deadlocking against each other.
+        tensor = torch.tensor([0, 0], dtype=torch.int32)
         work = torch.distributed.all_reduce(
-            tensor, group=dp_group, async_op=True
+            tensor,
+            op=torch.distributed.ReduceOp.SUM,
+            group=dp_group,
+            async_op=True,
         )
-        if not work.wait(timeout=timedelta(seconds=timeout_seconds)):
+        completed = False
+        try:
+            completed = bool(
+                work.wait(timeout=timedelta(seconds=timeout_seconds))
+            )
+        except Exception as exc:  # defensive: older torch raises on timeout
+            logger.warning(
+                "Full-restart barrier wait raised: %s", exc
+            )
+        if not completed:
+            try:
+                work.abort()
+            except Exception as abort_exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to abort timed-out barrier all_reduce: %s",
+                    abort_exc,
+                )
             raise RuntimeError(
                 "Heterogeneous full restart barrier timed out after "
                 f"{timeout_seconds}s waiting for all {world_size} DP "
@@ -975,6 +1003,16 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             for worker_dict in xfer_handshake_metadata:
                 if worker_dict is not None:
                     content.update(worker_dict)
+
+            # 重启后旧 worker 的端口/engine_id 全部失效，先清掉 scheduler
+            # connector 里缓存的旧条目，避免脏 mapping 残留。
+            connector_scheduler = getattr(
+                kv_connector, "connector_scheduler", None
+            )
+            if connector_scheduler is not None and hasattr(
+                connector_scheduler, "multi_nodes_meta_mapping"
+            ):
+                connector_scheduler.multi_nodes_meta_mapping.clear()
 
             # Set metadata to KV connector
             kv_connector.set_xfer_handshake_metadata(content)
@@ -1231,7 +1269,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             self.world_size = 0
             self.local_world_size = 0
             self.response_mqs = []
-            self.futures_queue = deque[tuple[FutureWrapper, Callable]]()
+            self.futures_queue = deque[FutureWrapper]()
             # 停止健康监控，避免检测到 worker 死亡后重复触发
             # stop() 设置 _running=False 和 _failure_handled=True
             # update_workers([]) 清空 workers 列表
@@ -1242,11 +1280,11 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 self._health_monitor._failure_handled = True  # 再次设置确保阻止 callback
             logger.info("Executor idle mode: no workers running, waiting for recovery strategy")
             return
-        # Check if this is the leader node
-        # 注意：node_rank_within_dp 在单机多实例场景下对所有实例都是 0
-        # 因为 nnodes_within_dp = 1（nnodes=1 时硬编码为 1）
-        # 所以需要使用 node_rank 来区分实例，node_rank=0 为 leader
-        is_leader = self.parallel_config.node_rank == 0
+        # Check if this is the leader node of the DP group.
+        # 与 vllm 0.23 / vllm-ascend 一致使用 node_rank_within_dp：
+        # 多节点 DP 时每个 DP 组都需要一个 leader 创建 rpc_broadcast_mq，
+        # 只有全局 node_rank==0 建队列会让其它节点 worker 收不到调度。
+        is_leader = self.parallel_config.node_rank_within_dp == 0
         logger.info(f"Starting workers: world_size={world_size}, local_world_size={local_world_size}, "
                     f"global_start_rank={global_start_rank}, tp={new_tp}, dp={new_dp}，is_leader：{is_leader}")
         # Create MessageQueue for leader node
@@ -1323,7 +1361,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             response_mq.wait_until_ready()
 
         # Reset futures queue
-        self.futures_queue = deque[tuple[FutureWrapper, Callable]]()
+        self.futures_queue = deque[FutureWrapper]()
         logger.info("Message queues setup complete")
 
     def _update_vllm_config_for_restart(self) -> None:
@@ -1603,39 +1641,58 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         ``tp_asymmetric_shardings`` / ``new_tp`` 一旦出现，所有 DP rank
         都必须重建通信组，健康 DP 仅做 KV connector RPC 更新是不够的。
 
-        同时适用于 DEGRADE 和 PD_REBUILD：决策中心对这两种策略都必须把
+        DEGRADE / PD_REBUILD / RECOVER 三种会改变拓扑的策略都必须把
         完整的 engine_parallel_config 下发给每一个 DP executor。
         """
-        if strategy.deploy_type not in (
-            DeployType.DEGRADE,
-            DeployType.PD_REBUILD,
-        ):
-            return False
-
-        requires_full_restart = False
-        for conf in strategy.engine_parallel_config:
-            new_tp = conf.new_tp
-            if new_tp is not None and new_tp != conf.tp:
-                requires_full_restart = True
-            if conf.tp_asymmetric_shardings:
-                requires_full_restart = True
-            if new_tp == 0 and conf.new_dp == 0:
-                # 有 executor 被缩到零，通信拓扑也发生变化。
-                requires_full_restart = True
-
-        if not requires_full_restart:
+        if strategy.deploy_type == DeployType.RECOVER:
+            # 从异构/缩容拓扑恢复同样会重建 world_size 和通信组。只要当前
+            # 拓扑是异构的，或备份的对称 tp 与当前 tp 不一致，就必须让全部
+            # DP 同时重启；否则会复现与 DEGRADE 相同的旧通信域问题。
+            backup = getattr(self, "backup_parallel_config", {}) or {}
+            backup_tp = backup.get("tensor_parallel_size")
+            current_tp = self.parallel_config.tensor_parallel_size
+            current_is_hetero = bool(
+                getattr(self.parallel_config, "is_heterogeneous_tp", False)
+            )
+            requires_full_restart = current_is_hetero or (
+                backup_tp is not None and backup_tp != current_tp
+            )
+            if not requires_full_restart:
+                return False
+            # fall through to the coverage validation below.
+        elif strategy.deploy_type in (DeployType.DEGRADE, DeployType.PD_REBUILD):
+            requires_full_restart = False
+            for conf in strategy.engine_parallel_config:
+                new_tp = conf.new_tp
+                if new_tp is not None and new_tp != conf.tp:
+                    requires_full_restart = True
+                if conf.tp_asymmetric_shardings:
+                    requires_full_restart = True
+                if new_tp == 0 and conf.new_dp == 0:
+                    # 有 executor 被缩到零，通信拓扑也发生变化。
+                    requires_full_restart = True
+            if not requires_full_restart:
+                return False
+        else:
             return False
 
         # Fail closed instead of deadlocking: every active DP rank must be
         # present in the strategy.  A missing rank would make the new global
         # init_process_group wait for ranks that will never join.
         expected_dp = max(
-            (conf.dp for conf in strategy.engine_parallel_config),
+            (
+                conf.new_dp
+                if conf.new_dp is not None
+                else conf.dp
+                for conf in strategy.engine_parallel_config
+            ),
             default=0,
         )
         present = {
-            getattr(conf, "data_parallel_rank", None)
+            int(getattr(conf, "data_parallel_rank", -1))
             for conf in strategy.engine_parallel_config
+            if getattr(conf, "data_parallel_rank", None) is not None
+            and int(getattr(conf, "data_parallel_rank", -1)) >= 0
         }
         missing = set(range(expected_dp)) - present
         if missing:
@@ -1723,7 +1780,13 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
         # Report stopped state
         self.executor_state = ExecutorState.STOPPED
-        self._cleanup_and_restart_workers()
+
+        # Only tear down workers/message queues here.  Calling
+        # _cleanup_and_restart_workers() would run _init_workers() and
+        # spawn a fresh set of workers during shutdown; the parent
+        # MultiprocExecutor.shutdown() skips worker termination once
+        # shutting_down=True, so those workers would leak.
+        self._cleanup_message_queues_and_workers()
 
         # Use current_strategy if available, otherwise create a dummy strategy for shutdown reporting
         if self.current_strategy:
@@ -1966,6 +2029,17 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 self.parallel_config.data_parallel_index = (
                     self.parallel_config.data_parallel_rank
                 )
+                # 单节点 DP 下 local == global；scale-to-zero 后如果
+                # active executor 被重新编号，local rank 也必须跟着变，
+                # 否则 Mooncake worker 侧按 data_parallel_rank_local 计算
+                # 端口偏移会指向旧 DP。
+                if self.parallel_config.nnodes == 1:
+                    self.parallel_config.data_parallel_rank_local = (
+                        self.parallel_config.data_parallel_rank
+                    )
+                    self.parallel_config.data_parallel_size_local = (
+                        self.parallel_config.data_parallel_size
+                    )
             elif strategy.deploy_type == DeployType.STOP:
                 self._try_backup_origin_parallel_config_when_degrade()
                 self.parallel_config.tensor_parallel_size = 0
@@ -2070,7 +2144,11 @@ class ITSNPUWorker(AscendWorkerProc):
     - DEGRADE/RECOVER: Apply new tp/dp from zero_interrupt_config
     - PD_REBUILD: Online KV-Cache transfer chain rebuild via RPC
 
-    NOTE: 此代码目前不生效
+    NOTE: worker_busy_loop dispatches string RPC methods on the wrapped
+    worker implementation (self.worker -> WorkerWrapperBase -> NPUWorker),
+    NOT on this WorkerProc subclass.  Therefore the PD_REBUILD RPC method
+    must be installed on the NPUWorker class (see patch.py) and the
+    StrategyHandler is attached to the wrapped worker below.
     """
 
     def __init__(self, vllm_config: Any, *args: Any, **kwargs: Any) -> None:
@@ -2092,6 +2170,16 @@ class ITSNPUWorker(AscendWorkerProc):
             worker=self.worker,
             pd_rebuild_enabled=VLLM_ITS_ENABLE_PD_REBUILD,
         )
+
+        # worker_busy_loop dispatches `update_kv_connector_for_pd` on the
+        # wrapped worker implementation.  Attach the handler there as well so
+        # the NPUWorker method installed by patch.py can find it.
+        try:
+            wrapped_worker = self.worker.worker
+        except Exception:  # noqa: BLE001
+            wrapped_worker = None
+        if wrapped_worker is not None:
+            wrapped_worker._its_strategy_handler = self._strategy_handler
 
         # Apply zero interrupt config (update tp/dp or execute PD rebuild)
         self._apply_zero_interrupt_config()

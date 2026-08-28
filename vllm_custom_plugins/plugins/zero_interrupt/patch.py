@@ -37,12 +37,15 @@ def apply():
         logger.warning(f"Failed to register deepseek_v4 tool parser: {e}")
 
     # 应用 EngineCore patch (使用相对导入)
+    # 这是零中断控制面的核心 patch：失败必须 fail-fast，不能出现
+    # “Executor 已被替换但 EngineCore 没有消费策略信号”的半开状态。
     try:
         from .vllm.v1.engine import \
             engine_core_patch
         engine_core_patch.patch_engine_core()
-    except ImportError as e:
-        logger.warning(f"Failed to import engine_core_patch: {e}")
+    except Exception as e:
+        logger.exception("Fatal: failed to apply engine_core_patch")
+        raise RuntimeError(f"Failed to apply engine_core_patch: {e}") from e
 
     # 应用 DPLBAsyncMPClient patch (客户端过滤)
     try:
@@ -60,8 +63,9 @@ def apply():
         mp_module.MultiprocExecutor = ITSMultiprocExecutor
         mp_module.WorkerProc = ITSNPUWorker
         logger.info("Replaced MultiprocExecutor with ITSMultiprocExecutor，Replaced WorkerProc with ITSNPUWorker")
-    except ImportError as e:
-        logger.warning(f"Failed to patch MultiprocExecutor: {e}")
+    except Exception as e:
+        logger.exception("Fatal: failed to patch MultiprocExecutor")
+        raise RuntimeError(f"Failed to patch MultiprocExecutor: {e}") from e
 
     # 同时 patch AscendMultiprocExecutor（如果存在）
     try:
@@ -70,10 +74,47 @@ def apply():
 
         ascend_module.MultiprocExecutor = ITSMultiprocExecutor
         ascend_module.WorkerProc = ITSNPUWorker
+        # 若 vllm_ascend 平台模块在其模块尾重新赋过
+        # vllm.v1.executor.multiproc_executor.MultiprocExecutor，这里必须
+        # 再同步一次，避免把 ITS 覆盖成 AscendMultiprocExecutor。
+        import vllm.v1.executor.multiproc_executor as mp_module
+        mp_module.MultiprocExecutor = ITSMultiprocExecutor
+        mp_module.WorkerProc = ITSNPUWorker
         logger.info("Replaced AscendMultiprocExecutor with ITSMultiprocExecutor，Replaced WorkerProc with ITSNPUWorker")
     except ImportError as e:
         # AscendMultiprocExecutor 不可用，跳过
         logger.warning(f"Failed to patch ascend MultiprocExecutor: {e}")
+
+    # v0.23 的 worker_busy_loop 对字符串 RPC 使用
+    # getattr(self.worker, method)，即方法必须定义在 NPUWorker（或
+    # WorkerWrapperBase 的 __getattr__ 代理目标）上。把 PD_REBUILD 的
+    # KV connector 更新入口安装到 NPUWorker，并由 ITSNPUWorker 在
+    # 初始化时把 StrategyHandler 挂到 wrapped worker 上。
+    try:
+        from vllm_ascend.worker.worker import NPUWorker
+
+        if not hasattr(NPUWorker, "update_kv_connector_for_pd"):
+
+            def update_kv_connector_for_pd(self, strategy):
+                handler = getattr(self, "_its_strategy_handler", None)
+                if handler is None:
+                    raise RuntimeError(
+                        "ITS StrategyHandler is not attached to this worker; "
+                        "PD_REBUILD KV connector update cannot run."
+                    )
+                return handler.execute_strategy(strategy)
+
+            NPUWorker.update_kv_connector_for_pd = (
+                update_kv_connector_for_pd
+            )
+            logger.info(
+                "PATCH: NPUWorker.update_kv_connector_for_pd "
+                "(PD_REBUILD healthy-instance KV connector update)"
+            )
+    except ImportError as e:
+        logger.warning(
+            "Failed to patch NPUWorker.update_kv_connector_for_pd: %s", e
+        )
 
     # 模型计算相关patch。
     # v0.23.0 的 AscendFusedMoE/expert_map 已经由 hetero patch 处理，
@@ -83,8 +124,9 @@ def apply():
         from packaging.version import Version
 
         _vllm_ge_023 = vllm.__version__ == "dev" or Version(vllm.__version__) >= Version("0.23.0")
-    except Exception:
-        _vllm_ge_023 = False
+    except Exception as e:
+        logger.exception("Fatal: failed to detect vllm version")
+        raise RuntimeError(f"Failed to detect vllm version: {e}") from e
 
     if _vllm_ge_023:
         logger.info("vllm>=0.23.0: skip legacy AscendFusedMoE replacement (hetero patches cover it)")
@@ -110,25 +152,29 @@ def apply():
         # DeepSeek-V4 由后面的 heterogeneous-TP patches 处理。
         logger.info("vllm>=0.23.0: skip legacy Qwen/varlen asymmetric patches")
 
-        import vllm.config.model
-        from .vllm.config.patch_model_v023 import verify_with_parallel_config
+        try:
+            import vllm.config.model
+            from .vllm.config.patch_model_v023 import verify_with_parallel_config
 
-        vllm.config.model.ModelConfig.verify_with_parallel_config = (
-            verify_with_parallel_config
-        )
-        logger.info(
-            "Replaced verify_with_parallel_config with v0.23 patched version"
-        )
+            vllm.config.model.ModelConfig.verify_with_parallel_config = (
+                verify_with_parallel_config
+            )
+            logger.info(
+                "Replaced verify_with_parallel_config with v0.23 patched version"
+            )
 
-        # 该方法由 EngineCore 使用，提前 patch（使用 v0.23 同源实现）。
-        from vllm.v1.core import kv_cache_utils
-        from .vllm.v1.core.patch_kv_cache_utils import get_kv_cache_configs
+            # 该方法由 EngineCore 使用，提前 patch（使用 v0.23 同源实现）。
+            from vllm.v1.core import kv_cache_utils
+            from .vllm.v1.core.patch_kv_cache_utils import get_kv_cache_configs
 
-        kv_cache_utils.get_kv_cache_configs = get_kv_cache_configs
-        logger.info(
-            "Replaced vllm.v1.core.kv_cache_utils.get_kv_cache_configs "
-            "with v0.23 patched version"
-        )
+            kv_cache_utils.get_kv_cache_configs = get_kv_cache_configs
+            logger.info(
+                "Replaced vllm.v1.core.kv_cache_utils.get_kv_cache_configs "
+                "with v0.23 patched version"
+            )
+        except Exception as e:
+            logger.exception("Fatal: failed to apply v0.23 config patches")
+            raise RuntimeError(f"Failed to apply v0.23 config patches: {e}") from e
     else:
         # ============ vLLM 0.18 legacy patch path ============
         # qwen2
@@ -226,150 +272,146 @@ def apply():
     # ==================================================================
     # DeepSeek-V4 DP4TP4 -> DP4TP(3,4,4,4) heterogeneous-TP restart
     # All model-specific logic is implemented as runtime patches.
+    # These are load-bearing for DeepSeek-V4 heterogeneous restart: any
+    # failure here must abort startup instead of leaving a half-patched
+    # service that loads wrong weights / wrong MoE groups.
     # ==================================================================
-    try:
-        from .vllm.distributed.patch_hetero_utils import (
-            apply_hetero_distributed_utils_patch,
-        )
-        apply_hetero_distributed_utils_patch()
-        logger.info("Applied heterogeneous-TP distributed utils patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch distributed utils for heterogeneous TP: {e}")
+    def _apply_hetero_import(relative_module: str, apply_name: str) -> None:
+        """Import a zero_interrupt hetero patch module and run its apply."""
+        from importlib import import_module
 
-    try:
-        from .vllm.model_executor.layers.patch_hetero_parameter import (
-            apply_hetero_parameter_patch,
+        module = import_module(
+            f"vllm_custom_plugins.plugins.zero_interrupt.{relative_module}"
         )
-        apply_hetero_parameter_patch()
-        logger.info("Applied heterogeneous-TP parameter weight-loader patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch parameter weight loaders for heterogeneous TP: {e}")
+        getattr(module, apply_name)()
+        logger.info("Applied %s.%s", relative_module, apply_name)
 
-    try:
-        from .vllm.model_executor.layers.patch_hetero_vocab import (
-            apply_hetero_vocab_patch,
-        )
-        apply_hetero_vocab_patch()
-        logger.info("Applied heterogeneous-TP vocab embedding padding patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch vocab embedding for heterogeneous TP: {e}")
+    def _apply_hetero_patch(label: str, apply_func) -> None:
+        try:
+            apply_func()
+        except Exception as e:
+            logger.exception("Fatal: failed to apply %s", label)
+            raise RuntimeError(f"Failed to apply {label}: {e}") from e
 
-    try:
-        from .vllm.model_executor.layers.fused_moe.runner.patch_hetero_moe_runner import (
-            apply_hetero_moe_runner_patch,
-        )
-        apply_hetero_moe_runner_patch()
-        logger.info("Applied heterogeneous-TP MoERunner shared-output padding patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch MoERunner for heterogeneous TP: {e}")
-
-    try:
-        from .vllm.model_executor.model_loader.patch_hetero_default_loader import (
-            apply_hetero_default_loader_patch,
-        )
-        apply_hetero_default_loader_patch()
-        logger.info("Applied heterogeneous-TP default model loader patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch default model loader for heterogeneous TP: {e}")
-
-    try:
-        from .vllm.config.patch_speculative_hetero import (
-            apply_speculative_hetero_patch,
-        )
-        apply_speculative_hetero_patch()
-        logger.info("Applied heterogeneous-TP speculative config patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch speculative config for heterogeneous TP: {e}")
-
-    try:
-        from .vllm_ascend.models.patch_deepseek_v4 import (
-            apply_deepseek_v4_hetero_patch,
-        )
-        apply_deepseek_v4_hetero_patch()
-        logger.info("Applied DeepSeek-V4 heterogeneous-TP model patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch DeepSeek-V4 model for heterogeneous TP: {e}")
-
-    try:
-        from .vllm_ascend.models.patch_deepseek_v4_mtp import (
-            apply_deepseek_v4_mtp_hetero_patch,
-        )
-        apply_deepseek_v4_mtp_hetero_patch()
-        logger.info("Applied DeepSeek-V4 MTP heterogeneous-TP patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch DeepSeek-V4 MTP for heterogeneous TP: {e}")
-
-    try:
-        from .vllm_ascend.patch.patch_hetero_tp import (
-            apply_hetero_forward_context_patch,
-        )
-        apply_hetero_forward_context_patch()
-        logger.info("Applied heterogeneous-TP ascend forward context patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch ascend forward context for heterogeneous TP: {e}")
-
-    try:
-        from .vllm_ascend.patch.patch_hetero_ascend_config import (
-            apply_hetero_ascend_config_patch,
-        )
-        apply_hetero_ascend_config_patch()
-        logger.info("Applied heterogeneous-TP ascend config/enable_sp patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch ascend config for heterogeneous TP: {e}")
-
-    try:
-        from .vllm_ascend.ops.patch_hetero_custom_ops import (
-            apply_hetero_custom_ops_patch,
-        )
-        apply_hetero_custom_ops_patch()
-        logger.info("Applied heterogeneous-TP MoE custom-op patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch MoE custom ops for heterogeneous TP: {e}")
-
-    try:
-        from .vllm_ascend.ops.fused_moe.patch_hetero_moe import (
-            apply_hetero_moe_patch,
-        )
-        apply_hetero_moe_patch()
-        logger.info("Applied heterogeneous-TP MoE prepare/finalize/dispatcher patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch MoE ops for heterogeneous TP: {e}")
-
-    try:
-        from .vllm_ascend.attention.patch_deepseek_v4_attention_hetero import (
-            apply_deepseek_v4_attention_hetero_patch,
-        )
-        apply_deepseek_v4_attention_hetero_patch()
-        logger.info("Applied DeepSeek-V4 DSA attention heterogeneous-TP patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch DeepSeek-V4 attention for heterogeneous TP: {e}")
-
-    try:
-        from .vllm_ascend.worker.patch_hetero_model_runner import (
-            apply_hetero_model_runner_patch,
-        )
-        apply_hetero_model_runner_patch()
-        logger.info("Applied heterogeneous-TP NPUModelRunner patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch NPUModelRunner for heterogeneous TP: {e}")
-
-    try:
-        from .vllm_ascend.spec_decode.patch_hetero_spec_decode import (
-            apply_hetero_spec_decode_patch,
-        )
-        apply_hetero_spec_decode_patch()
-        logger.info("Applied heterogeneous-TP MTP proposer patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch spec-decode proposer for heterogeneous TP: {e}")
-
-    try:
-        from .vllm_ascend.distributed.kv_transfer.patch_hetero_mooncake import (
-            apply_hetero_mooncake_patch,
-        )
-        apply_hetero_mooncake_patch()
-        logger.info("Applied heterogeneous-TP Mooncake hybrid connector patch")
-    except Exception as e:
-        logger.warning(f"Failed to patch Mooncake connector for heterogeneous TP: {e}")
+    _apply_hetero_patch(
+        "heterogeneous-TP distributed utils patch",
+        lambda: _apply_hetero_import(
+            "vllm.distributed.patch_hetero_utils",
+            "apply_hetero_distributed_utils_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP parameter weight-loader patch",
+        lambda: _apply_hetero_import(
+            "vllm.model_executor.layers.patch_hetero_parameter",
+            "apply_hetero_parameter_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP vocab embedding padding patch",
+        lambda: _apply_hetero_import(
+            "vllm.model_executor.layers.patch_hetero_vocab",
+            "apply_hetero_vocab_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP MoERunner shared-output padding patch",
+        lambda: _apply_hetero_import(
+            "vllm.model_executor.layers.fused_moe.runner.patch_hetero_moe_runner",
+            "apply_hetero_moe_runner_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP default model loader patch",
+        lambda: _apply_hetero_import(
+            "vllm.model_executor.model_loader.patch_hetero_default_loader",
+            "apply_hetero_default_loader_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP speculative config patch",
+        lambda: _apply_hetero_import(
+            "vllm.config.patch_speculative_hetero",
+            "apply_speculative_hetero_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "DeepSeek-V4 heterogeneous-TP model patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.models.patch_deepseek_v4",
+            "apply_deepseek_v4_hetero_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "DeepSeek-V4 MTP heterogeneous-TP patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.models.patch_deepseek_v4_mtp",
+            "apply_deepseek_v4_mtp_hetero_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP ascend forward context patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.patch.patch_hetero_tp",
+            "apply_hetero_forward_context_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP ascend config/enable_sp patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.patch.patch_hetero_ascend_config",
+            "apply_hetero_ascend_config_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP MoE custom-op patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.ops.patch_hetero_custom_ops",
+            "apply_hetero_custom_ops_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP Ascend linear patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.ops.patch_hetero_ascend_linear",
+            "apply_hetero_ascend_linear_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP MoE prepare/finalize/dispatcher patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.ops.fused_moe.patch_hetero_moe",
+            "apply_hetero_moe_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "DeepSeek-V4 DSA attention heterogeneous-TP patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.attention.patch_deepseek_v4_attention_hetero",
+            "apply_deepseek_v4_attention_hetero_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP NPUModelRunner patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.worker.patch_hetero_model_runner",
+            "apply_hetero_model_runner_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP MTP proposer patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.spec_decode.patch_hetero_spec_decode",
+            "apply_hetero_spec_decode_patch",
+        ),
+    )
+    _apply_hetero_patch(
+        "heterogeneous-TP Mooncake hybrid connector patch",
+        lambda: _apply_hetero_import(
+            "vllm_ascend.distributed.kv_transfer.patch_hetero_mooncake",
+            "apply_hetero_mooncake_patch",
+        ),
+    )
 
 # 导出以兼容插件框架
 class ZeroInterruptPluginPatch:

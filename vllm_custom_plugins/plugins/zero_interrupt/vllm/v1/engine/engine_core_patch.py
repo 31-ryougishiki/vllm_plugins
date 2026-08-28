@@ -25,7 +25,6 @@ from vllm.v1.engine.core import EngineCoreRequestType, EngineShutdownState
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.config import ParallelConfig
 from datetime import timedelta
 
 
@@ -41,41 +40,57 @@ def is_pd_separated(vllm_config) -> bool:
     return (vllm_config.kv_transfer_config is not None and 
             (vllm_config.kv_transfer_config.kv_role == "kv_producer" or vllm_config.kv_transfer_config.kv_role == "kv_consumer"))
 
-def has_unfinished_dp_fast_timeout(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
-    """
-        代码逻辑拷贝自ParallelConfig.has_unfinished_dp, 但设置较短的timeout。目的是让core_busy_loop不要阻塞。
-        
-        目前timeout设置时间为10s。原因代码在推理时，上层同步时间不应发生10s的等待时间。
-        所以用10s作为分界线，用于处理部分executor接收到策略并执行，而部分executor需同步后才能进入下一个循环执行扩/缩容策略。
-        
-        问题根因：dp_group包含了idle-executor和active-executor的，而idle-executor在worker层面
-        没法与active-executor管理的worker同步。所以会出现别的executor处于扩容，而idle-executor处于同步的死锁状态。
-        
-        允许timeout的方案：
-        当idle-executor发生timeout后，能继续执行到idle-executor的core_busy_loop只能不断试错，
-        core_busy_loop保证其它active-executor需要进行通信的时候它能及时进行通信
-    """
-    tensor = torch.tensor([has_unfinished], dtype=torch.int32, device="cpu")
+def sync_dp_state_fast_timeout(
+    dp_group: ProcessGroup,
+    has_unfinished: bool,
+    pending_pause: bool,
+    timeout_seconds: float = 10,
+) -> tuple[bool, bool] | None:
+    """v0.23 ``ParallelConfig.sync_dp_state`` with a bounded wait.
 
-    work = torch.distributed.all_reduce(tensor, group=dp_group, async_op=True)
+    Uses the exact same two-element SUM all-reduce shape as
+    ``ParallelConfig.sync_dp_state`` so it remains interchangeable with the
+    full-restart barrier and with other DP ranks that are still inside this
+    same collective.  Returns ``(has_unfinished_global, pause_consensus)``,
+    or ``None`` when the collective timed out and had to be abandoned.
+    """
+    tensor = torch.tensor(
+        [int(has_unfinished), int(pending_pause)],
+        dtype=torch.int32,
+        device="cpu",
+    )
+    work = torch.distributed.all_reduce(
+        tensor, op=torch.distributed.ReduceOp.SUM, group=dp_group,
+        async_op=True,
+    )
+    completed = False
     try:
-        work.wait(timeout=timedelta(seconds=10))  # 10秒超时(远小于默认值)
+        completed = bool(work.wait(timeout=timedelta(seconds=timeout_seconds)))
     except Exception as e:
-        logger.info(f"[has_unfinished_dp]all_reduce 超时，执行异常处理, e={e}")
+        logger.info(
+            "[sync_dp_state_fast_timeout] all_reduce wait raised: %s", e
+        )
+    if not completed:
+        # Do not leave a live collective behind: the next DP collective on
+        # this group could otherwise pair with the abandoned one and corrupt
+        # both results.
+        try:
+            work.abort()
+        except Exception as abort_exc:  # noqa: BLE001
+            logger.warning(
+                "[sync_dp_state_fast_timeout] failed to abort timed-out "
+                "all_reduce: %s",
+                abort_exc,
+            )
+        return None
 
-        # TODO: 应该统一返回什么? 
-        # 1. 返回 True（engines_running = True）
-        # 下一轮循环继续正常执行：handle_shutdown → _process_input_queue() → _process_engine_step()
-        # 如果本 rank 有请求，执行真实 batch；如果没有但其他 rank 有，执行 dummy batch（保证 MoE expert 层的 TP/EP 集合通信对齐）
-        # 前 31 步必然走这条路（step_counter % 32 != 0 直接返回 True，跳过 all-reduce）
-        # 2. 返回 False（engines_running = False）
-        # 执行以下收尾动作，然后引擎进入空闲等待：
-        # 发送 wave 完成通知：dp_rank == 0（有 coordinator 时）或每个 rank（无 coordinator 时）向 output_queue 写入 EngineCoreOutputs(wave_complete=self.current_wave)，通知 coordinator/前端当前 wave 已结束
-        # 递增 wave 计数：self.current_wave += 1，self.step_counter = 0
-        # 下一轮进入空闲：_process_input_queue() 中 has_work() 返回 False（engines_running=False 且无本地请求），引擎阻塞在 input_queue.get(block=True) 等待新请求或 START_DP_WAVE 消息
-        return False
-    aggregated_has_unfinished = bool(tensor.item())
-    return aggregated_has_unfinished
+    dp_size = int(dp_group.size())
+    pause_count = int(tensor[1].item())
+    has_unfinished_global = int(tensor[0].item()) > 0 or (
+        pause_count % dp_size != 0
+    )
+    pause_consensus = pause_count == dp_size
+    return has_unfinished_global, pause_consensus
 
 def patch_engine_core() -> None:
     """Patch EngineCore._handle_shutdown 以支持部署策略执行。
@@ -103,6 +118,7 @@ def patch_engine_core() -> None:
 
     original_has_global_unfinished_reqs = getattr(DPEngineCoreProc, "_has_global_unfinished_reqs", None)
     original_execute_dummy_batch = getattr(EngineCoreProc, "execute_dummy_batch", None)
+    original_step = getattr(EngineCoreProc, "step", None)
 
     original_step_with_batch_queue_dp = getattr(DPEngineCoreProc, "step_with_batch_queue", None)
     original_step_with_batch_queue = getattr(EngineCoreProc, "step_with_batch_queue", None)
@@ -146,14 +162,17 @@ def patch_engine_core() -> None:
             local_unfinished = False
             logger.debug(f"_has_global_unfinished_reqs: forcing local_unfinished=False in idle/paused mode")
 
-        # 原始has_global_unfinished_reqs代码逻辑
+        # v0.23 two-phase DP pause protocol.  Use sync_dp_state's exact
+        # two-element SUM collective (with a bounded wait) so this call can
+        # pair with the full-restart barrier and with peers that are already
+        # inside the same collective; bypassing pending_pause here would
+        # break EngineCore.pause()/resume_scheduler() permanently.
         self.step_counter += 1
         logger.debug(f"[patched_has_global_unfinished_reqs][4.1] step_counter={self.step_counter}")
         mode = getattr(self, "zero_interrupt_mode", None)
 
         if mode == "degrade":
             # NOTE: 缩容场景下，每次前向进行一次同步（效率极低），用于规避idle-executor阻塞恢复命令执行
-            # 后续缩容过程中能重新建立gloo通信组时去掉这部分逻辑
             ar_every_n_step = 1
         else:
             ar_every_n_step = 32
@@ -161,14 +180,26 @@ def patch_engine_core() -> None:
         if self.step_counter % ar_every_n_step != 0:
             return True
 
-        if mode == "degrade":
-            res = ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
-        else:
-            res = has_unfinished_dp_fast_timeout(self.dp_group, local_unfinished)
+        pending_pause = bool(getattr(self, "pending_pause", False))
+        result = sync_dp_state_fast_timeout(
+            self.dp_group, local_unfinished, pending_pause
+        )
+        if result is None:
+            # Timed out while a peer may be executing the deployment
+            # strategy.  Keep the loop alive so this executor can reach
+            # _handle_shutdown and join the full-restart barrier on the next
+            # iteration.
+            return True
+        has_unfinished_global, pause_consensus = result
+        if pause_consensus:
+            self.ignore_start_dp_wave = True
+            self.pending_pause = False
+            logger.debug(
+                "[patched_has_global_unfinished_reqs] DP pause consensus reached"
+            )
 
         logger.debug(f"[patched_has_global_unfinished_reqs][4.2] all-reduce done")
-        return res
-        # return original_has_global_unfinished_reqs(self, local_unfinished)
+        return has_unfinished_global
 
     # ------------------------------------------------------------------
     # 2. patched_handle_client_request：world_size==0 时丢弃 ADD 请求
@@ -235,14 +266,21 @@ def patch_engine_core() -> None:
                         executor.wait_new_deployment.clear()
                     # 阻塞新请求进入，立即中止正在执行的请求
                     self.process_input_queue_block = True
-                    # 立即中止所有正在执行的请求
-                    self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+                    # 立即中止所有正在执行的请求，并把 abort 结果通知客户端
+                    aborted_reqs = self.scheduler.finish_requests(
+                        None, RequestStatus.FINISHED_ABORTED
+                    )
+                    self._send_abort_outputs(aborted_reqs)
                     # 等待请求中止完成（短暂等待即可）
                     for _ in range(50):  # 最多等待5秒
                         if not self.scheduler.has_unfinished_requests():
                             break
                         time.sleep(0.1)
-                    assert not self.scheduler.has_unfinished_requests(), "still has_unfinished_requests after wating 5 sec"
+                    if self.scheduler.has_unfinished_requests():
+                        logger.warning(
+                            "Requests still unfinished after 5s abort wait; "
+                            "continuing with deployment strategy anyway."
+                        )
 
                     # 设置暂停并执行策略
                     self._paused_for_restart = True # TODO: [lqf] 实际上没有并发的流程，这个flag好像并没有作用
@@ -280,13 +318,18 @@ def patch_engine_core() -> None:
                         self.step_counter = 0
                     self.engines_running = False # force the engine-core to wait for new req after degrade/recover
                     # TODO: [lqf] 这里要再次清理请求? 防止缩容过程中用户下发了新的请求?
-                    self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+                    aborted_reqs = self.scheduler.finish_requests(
+                        None, RequestStatus.FINISHED_ABORTED
+                    )
+                    self._send_abort_outputs(aborted_reqs)
                     for _ in range(50):
                         if not self.scheduler.has_unfinished_requests():
                             break
                         time.sleep(0.1)
-                    self.scheduler.finished_req_ids.clear() # hack
-                    self.batch_queue.clear()
+                    # 不要 clear finished_req_ids：scheduler 用该集合跟踪
+                    # 已完成请求，清空会破坏后续 scheduler output 跟踪。
+                    if self.batch_queue is not None:
+                        self.batch_queue.clear()
                 elif wait_set:
                     logger.info("WaitNewDeployment received, waiting for RecvNewDeployment")
                     executor.wait_new_deployment.clear()
@@ -300,7 +343,10 @@ def patch_engine_core() -> None:
                         logger.info("RecvNewDeployment received, executing strategy")
                         recv_set.clear()
                         # 阻塞新请求进入，立即中止正在执行的请求
-                        self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+                        aborted_reqs = self.scheduler.finish_requests(
+                            None, RequestStatus.FINISHED_ABORTED
+                        )
+                        self._send_abort_outputs(aborted_reqs)
                         for _ in range(50):
                             if not self.scheduler.has_unfinished_requests():
                                 break
@@ -343,6 +389,68 @@ def patch_engine_core() -> None:
             self.process_input_queue_block = True
 
 
+
+    def patched_step(
+        self,
+    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        """v0.23 ``EngineCoreProc.step`` with ITS fault handling.
+
+        With default PP=1 / async-scheduling-off, ``max_concurrent_batches``
+        is 1 and ``batch_queue`` is None, so ``step_fn`` points at this
+        method -- the patched ``step_with_batch_queue`` above is never used.
+        Keep the same scheduling behaviour as v0.23 but do not feed a None
+        model output into ``scheduler.update_from_output`` after a worker
+        failure; the health monitor will trigger the deployment flow.
+        """
+        if not self.scheduler.has_requests():
+            return {}, False
+        scheduler_output = self.scheduler.schedule()
+
+        executor = getattr(self, "model_executor", None)
+        world_size = getattr(executor, "world_size", None) if executor else None
+        paused = getattr(self, "_paused_for_restart", False)
+        if world_size == 0 or paused:
+            return {}, False
+
+        exec_future = self.model_executor.execute_model(
+            scheduler_output, non_block=True
+        )
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        with (
+            self.log_error_detail(scheduler_output),
+            self.log_iteration_details(scheduler_output),
+        ):
+            model_output = exec_future.result()
+            if model_output is None:
+                try:
+                    model_output = self.model_executor.sample_tokens(
+                        grammar_output
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[patched_step] sample_tokens failed after execute "
+                        "model returned None: %s",
+                        exc,
+                    )
+                    model_output = None
+
+        # Before processing the model output, process any aborts that happened
+        # during the model execution.
+        self._process_aborts_queue()
+        if model_output is None:
+            logger.warning(
+                "[patched_step] model output is None (worker failure); "
+                "skipping scheduler update for this step."
+            )
+            return {}, False
+
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
+        return (
+            engine_core_outputs,
+            scheduler_output.total_num_scheduled_tokens > 0,
+        )
 
     def patched_step_with_batch_queue(
         self,
@@ -407,14 +515,12 @@ def patch_engine_core() -> None:
                 #          ↓ 队列满了，才阻塞等待 Batch A 的结果  
                 # Step 3: pop Batch A → future.result() → 处理输出  
                 batch_queue.appendleft((future, scheduler_output, exec_future))
-                if (
-                    model_executed
-                    and len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
+                if len(batch_queue) < self.batch_queue_size and (
+                    model_executed or self.scheduler.has_requests()
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
-                    return None, True
+                    return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -559,11 +665,14 @@ def patch_engine_core() -> None:
         outputs.engine_index = engine_core.engine_index
 
         try:
-            vllm_config = engine_core.vllm_config
-            api_server_count = vllm_config.parallel_config._api_process_count
-            for client_idx in range(api_server_count):
+            # 与 idle 通知保持一致，使用本 EngineCore 实际连接的输出
+            # socket 数量，不要用 _api_process_count：两者在多 client /
+            # external LB / hybrid LB 下并不相等，漏发会导致客户端无法
+            # 清除 idle 标记。
+            num_output_sockets = len(engine_core.addresses.outputs)
+            for client_idx in range(num_output_sockets):
                 engine_core.output_queue.put_nowait((client_idx, outputs)) # 发给所有client
-            logger.info(f"Engine {engine_core.engine_index} sent recovered notification to all {api_server_count} clients")
+            logger.info(f"Engine {engine_core.engine_index} sent recovered notification to all {num_output_sockets} clients")
 
             # 只有DP>1时才有coordinator，此时使用DPEngineCoreProc，特殊负载分数才应生效
             if isinstance(engine_core, DPEngineCoreProc):
@@ -869,6 +978,10 @@ def patch_engine_core() -> None:
     if original_execute_dummy_batch:
         EngineCoreProc.execute_dummy_batch = patched_execute_dummy_batch
         logger.info("PATCH: EngineCoreProc.execute_dummy_batch (skip when world_size=0)")
+
+    if original_step:
+        EngineCoreProc.step = patched_step
+        logger.info("PATCH: EngineCoreProc.step (fault-tolerant None model output)")
 
     if original_step_with_batch_queue_dp:
         DPEngineCoreProc.step_with_batch_queue = patched_step_with_batch_queue

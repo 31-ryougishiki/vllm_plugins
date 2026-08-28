@@ -586,6 +586,35 @@ def _code_shape_compatible(target_func, new_func) -> bool:
 
 
 _ORIG_KV_RECV_INIT = None
+_ORIG_PLAIN_WORKER_INIT = None
+_ORIG_LAYERWISE_WORKER_INIT = None
+
+
+def _setdefault_ascend_connect_timeout() -> None:
+    """Align ADXL link establishment with the transfer timeout.
+
+    hetero_cp adds this to the plain and layerwise Mooncake connectors as
+    well (the hybrid patch above already does it); without it cross-node
+    ADXL/HcclCommPrepare keeps the default 10s window and may fail with
+    E19999/HCCL_E_TIMEOUT even though the peer is healthy.
+    """
+    from vllm_ascend.distributed.kv_transfer.utils.utils import (
+        get_transfer_timeout_value,
+    )
+
+    os.environ.setdefault(
+        "ASCEND_CONNECT_TIMEOUT", str(get_transfer_timeout_value())
+    )
+
+
+def _patched_plain_worker_init(self, *args, **kwargs):
+    _setdefault_ascend_connect_timeout()
+    _ORIG_PLAIN_WORKER_INIT(self, *args, **kwargs)
+
+
+def _patched_layerwise_worker_init(self, *args, **kwargs):
+    _setdefault_ascend_connect_timeout()
+    _ORIG_LAYERWISE_WORKER_INIT(self, *args, **kwargs)
 
 
 def _patched_kv_recv_thread_init(self, *args, **kwargs):
@@ -1043,17 +1072,54 @@ def apply_hetero_mooncake_patch():
         logger.debug("plain mooncake_connector not importable; skipping optional patch")
     if plain_mod is not None:
         worker_cls = getattr(plain_mod, "MooncakeConnectorWorker", None)
-        if worker_cls is not None and hasattr(worker_cls, "_get_remote_host_info_by_port"):
-            symbol, problems = _patch_method_code(
-                worker_cls, "_get_remote_host_info_by_port", _patched_get_remote_host_info_by_port
+        if worker_cls is not None:
+            global _ORIG_PLAIN_WORKER_INIT
+            if _ORIG_PLAIN_WORKER_INIT is None:
+                _ORIG_PLAIN_WORKER_INIT = worker_cls.__init__
+            worker_cls.__init__ = _patched_plain_worker_init
+            patched.append("mooncake_connector.MooncakeConnectorWorker.__init__")
+            if hasattr(worker_cls, "_get_remote_host_info_by_port"):
+                symbol, problems = _patch_method_code(
+                    worker_cls, "_get_remote_host_info_by_port", _patched_get_remote_host_info_by_port
+                )
+                if problems:
+                    mismatches.extend(problems)
+                else:
+                    patched.append(f"mooncake_connector.{symbol}")
+
+    # Optional layerwise connector: only the ADXL connect-timeout setdefault
+    # from hetero_cp is missing on this connector.
+    try:
+        import vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector as layerwise_mod
+    except ImportError:
+        layerwise_mod = None
+        logger.debug(
+            "layerwise mooncake connector not importable; skipping optional patch"
+        )
+    if layerwise_mod is not None:
+        layerwise_worker_cls = getattr(
+            layerwise_mod, "MooncakeLayerwiseConnectorWorker", None
+        )
+        if layerwise_worker_cls is not None:
+            global _ORIG_LAYERWISE_WORKER_INIT
+            if _ORIG_LAYERWISE_WORKER_INIT is None:
+                _ORIG_LAYERWISE_WORKER_INIT = layerwise_worker_cls.__init__
+            layerwise_worker_cls.__init__ = _patched_layerwise_worker_init
+            patched.append(
+                "mooncake_layerwise_connector."
+                "MooncakeLayerwiseConnectorWorker.__init__"
             )
-            if problems:
-                mismatches.extend(problems)
-            else:
-                patched.append(f"mooncake_connector.{symbol}")
 
     if mismatches:
         logger.warning("hetero mooncake patch mismatches: %s", mismatches)
+        critical = [
+            m for m in mismatches if m.startswith("mooncake_hybrid_connector.")
+        ]
+        if critical:
+            raise RuntimeError(
+                "MooncakeHybridConnector hetero patch signature/name "
+                f"mismatches: {critical}"
+            )
     logger.info("hetero mooncake patch applied. patched=%s", patched)
     return {"patched": patched, "mismatches": mismatches}
 

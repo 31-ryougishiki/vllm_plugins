@@ -52,7 +52,10 @@
    使用旧通信域。
 2. **跨 DP 重启 barrier**：`_cleanup_and_restart_workers()` 在杀 worker
    之前通过 EngineCore 的 CPU DP group 做 all-reduce rendezvous（默认
-   120s 超时）。若决策中心只给故障 DP 下发策略，barrier 会超时并 fail
+   120s 超时）。barrier 使用与 `ParallelConfig.sync_dp_state` 相同的
+   2-element SUM collective，因此即使某个 DP 仍在
+   `_has_global_unfinished_reqs` 同步中，也不会因 collective 形状不同
+   交叉死锁。若决策中心只给故障 DP 下发策略，barrier 会超时并 fail
    closed，而不是让新 15-rank `init_process_group` 无限等待。
 3. **P 端 engine_id 轮换**：producer 全量重启时
    `_execute_deployment_strategy` 强制轮换 `kv_transfer_config.engine_id`
@@ -75,6 +78,15 @@
    `tp_size` 得到。
 7. **设备隔离不变**：故障卡从 DP0 的 `ASCEND_RT_VISIBLE_DEVICES` 中
    剔除，DP0 仅剩 3 张健康卡；其他 executor 保持 4 张卡。
+8. **RECOVER 同样全量重启**：从 `DP4TP(3,4,4,4)` 恢复对称拓扑也会重建
+   world_size 与通信组，因此 `_strategy_requires_full_restart` 在
+   `RECOVER` 且当前为异构/当前 tp 与备份 tp 不一致时同样要求全部 DP
+   rame 进入 barrier 后一起重启。
+
+> 已知限制：本插件支持“对称启动 -> 策略触发异构重启”。直接以异构拓扑
+> 启动（hetero_cp 的 `--heterogeneous-dp-config`）以及 EngineCore 启动期
+> 的设备隔离/Ray 路径尚未接入，当前仍依赖每个 executor 独立设置
+> `ASCEND_RT_VISIBLE_DEVICES`。
 
 ## 4 DeepSeek-V4 patch 清单
 

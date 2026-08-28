@@ -16,7 +16,7 @@ from vllm.logger import logger
 from vllm_custom_plugins.plugins.zero_interrupt.common.constants import (
     VLLM_ITS_HTTP_SERVER_PORT_START,
 )
-from vllm_custom_plugins.plugins.zero_interrupt.common.types import DeployStrategy, DeployType, EngineParallelConfig, ServerInfo, NPUInfo, EngineNPUHealthyState
+from vllm_custom_plugins.plugins.zero_interrupt.common.types import DeployStrategy, DeployType, EngineParallelConfig, ServerInfo, NPUInfo, EngineNPUHealthyState, UpdateEngineInfo
 
 
 class ITSHttpServer:
@@ -35,15 +35,23 @@ class ITSHttpServer:
             self,
             port: int = VLLM_ITS_HTTP_SERVER_PORT_START,
             strategy_sync_thread: Optional[Any] = None,
+            expected_executor_id: Optional[str] = None,
     ):
         """Initialize the HTTP server.
 
         Args:
             port: Port number to listen on
             strategy_sync_thread: Reference to StrategySyncThread for passive receiving
+            expected_executor_id: If set, POST /deploy strategies whose
+                top-level executor_id does not match are rejected with 400.
         """
         self.port = port
         self.strategy_sync_thread = strategy_sync_thread
+        self.expected_executor_id = (
+            None
+            if expected_executor_id is None
+            else str(expected_executor_id)
+        )
         self._app = FastAPI(title="ITS Executor API", version="1.0.0")
         self._server_thread: threading.Thread | None = None
         self._running = False
@@ -115,6 +123,23 @@ class ITSHttpServer:
                 # Parse the strategy from request
                 strategy = self._parse_deploy_request(data)
 
+                # Reject strategies addressed to another executor.  A wrong
+                # top-level executor_id would otherwise make
+                # _get_engine_parallel_config silently pick another DP's
+                # topology and restart with the wrong tp/dp/rank offset.
+                if (
+                    self.expected_executor_id is not None
+                    and str(strategy.executor_id) != self.expected_executor_id
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "executor_id mismatch: strategy is for "
+                            f"'{strategy.executor_id}', this executor is "
+                            f"'{self.expected_executor_id}'"
+                        ),
+                    )
+
                 logger.info(
                     f"Received deployment strategy from decision center: "
                     f"deploy_type={strategy.deploy_type.value}, executor_id={strategy.executor_id}"
@@ -148,13 +173,15 @@ class ITSHttpServer:
         Returns:
             DeployStrategy object
         """
-        # Handle invalid deploy type gracefully
+        # Reject invalid deploy_type instead of silently degrading to DEGRADE.
         logger.info(f"parsing deploy request: {data}")
         try:
             deploy_type = DeployType(data.get("deploy_type", "DEGRADE"))
-        except ValueError:
-            logger.warning(f"Invalid deploy_type: {data.get('deploy_type')}, using DEGRADE")
-            deploy_type = DeployType.DEGRADE
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid deploy_type: {data.get('deploy_type')!r}",
+            ) from e
         executor_id = data.get("executor_id", "")
 
         # Convert raw dict list to EngineParallelConfig objects
@@ -211,11 +238,23 @@ class ITSHttpServer:
             for npu_state_data in npu_state_data_list
         ]
 
+        update_engine_info = None
+        raw_update_info = data.get("update_engine_info")
+        if isinstance(raw_update_info, dict):
+            orig_engine_id = raw_update_info.get("orig_engine_id")
+            new_engine_id = raw_update_info.get("new_engine_id")
+            if orig_engine_id is not None and new_engine_id is not None:
+                update_engine_info = UpdateEngineInfo(
+                    orig_engine_id=str(orig_engine_id),
+                    new_engine_id=str(new_engine_id),
+                )
+
         return DeployStrategy(
             deploy_type=deploy_type,
             executor_id=executor_id,
             engine_parallel_config=engine_parallel_config,
             engine_npu_healthy_state=engine_npu_healthy_state,
+            update_engine_info=update_engine_info,
         )
 
     def start(self) -> None:
