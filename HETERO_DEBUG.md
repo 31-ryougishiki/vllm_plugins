@@ -5,6 +5,43 @@
 
 ---
 
+## 0. 当前进度（更新于 2026-08-28）
+
+### 已确认状态
+
+| 阶段 | 状态 | 说明 |
+|---|---|---|
+| 对称 DP4TP4 正常拉起 + 普通请求推理 | ✅ 已验证 | 输出内容正常；§4.3/§4.4 两类错误均不再出现 |
+| trigger 下发到 4 个 executor | ✅ 已验证 | 发送侧 4 个 HTTP 200；四个 DP 均进入策略执行 |
+| 全量重启 barrier | ✅ 已通过 | dp0/dp2 日志均有 `Full-restart barrier passed` |
+| DP2 重启 worker NPU 可见性 | ✅ 已修复 | `ASCEND_RT_VISIBLE_DEVICES` 改为数值排序（§4.5） |
+| DP0 TP=3 worker 模型加载 | 🔧 已修复，待 A3 复测 | `8192 is not divisible by 3`（§4.7） |
+| 重复 trigger 静默丢弃 | ✅ 已修复 | `strategy_sync` 重复策略会转发而非 return（§4.6） |
+| 异构重启后发请求 / 续推 | ⏳ 未验证 | 下一步必须在 A3 执行 |
+| PD / Mooncake engine_id 轮换链路 | ⏳ 未验证 | 需结合 D 端验证 |
+
+### 本地提交（均已合入 `hetero` 分支）
+
+```text
+89b9974 fix(linear): scaffold Ascend linears with divisible sizes under hetero TP
+098dc63 fix(strategy_sync): forward duplicate deployment strategies instead of dropping them
+6312296 fix(executor): sort healthy NPU ids numerically for ASCEND_RT_VISIBLE_DEVICES
+39484bb fix(deepseek_v4): restore Ascend pluggable linear classes for symmetric inference
+```
+
+### 下一步顺序（不要跳步）
+
+1. A3 重新安装并拉起对称服务，先发普通请求确认输出正常。
+2. 触发 `trigger_hetero_restart.sh`，确认：
+   - 4 个 DP 都有 `restarting workers of EVERY DP instance`；
+   - 没有 `8192 is not divisible by 3`；
+   - 没有 `Invalid device ID` / `expanded size`。
+3. 重启完成后发请求，验证续推内容和 token 一致性。
+4. 再检查 PD/Mooncake 日志：
+   `heterogeneous producer restart rotates engine_id`。
+
+---
+
 ## 1. 背景
 
 - 目标功能：当 vLLM 推理服务所在 A3 节点出现 NPU 卡故障时，以**异构方式**重启推理 worker，规避单卡故障。
@@ -321,6 +358,10 @@ bash trigger_hetero_restart.sh
 grep -R "restarting workers of EVERY DP instance" logs/prefill/
 grep -R "Full-restart barrier passed" logs/prefill/
 grep -R "heterogeneous producer restart rotates engine_id" logs/prefill/
+# 本轮新增必查：
+grep -R "Invalid device ID" logs/prefill/               # 应为空（§4.5）
+grep -R "8192 is not divisible by 3" logs/prefill/      # 应为空（§4.7）
+grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应出现 warning 而非静默（§4.6）
 
 # 6. 重启后再发请求，确认续推/PD 链路正常
 ```
