@@ -17,7 +17,7 @@
 | DP2 重启 worker NPU 可见性 | ✅ 已修复 | `ASCEND_RT_VISIBLE_DEVICES` 改为数值排序（§4.5） |
 | DP0 TP=3 worker 模型加载 | ✅ 已验证（10:21 复测） | `8192 is not divisible by 3` 不再出现（§4.7/§4.8） |
 | 异构重启后 profile_run / KV cache 重建 | ✅ 已验证（10:21 复测） | `available_memory` 为真实数值，KV 重建成功（§4.9） |
-| 异构重启后 MTP draft RoPE 崩溃 | 🔧 修复后不再崩溃，但正确性未闭环 | §4.10 修复已生效；当前问题转为输出乱码 |
+| 异构重启后 MTP draft RoPE 崩溃 | 🔧 修复后不再崩溃 | 该问题只阻塞流程；按 speculative 原理它**不是乱码根因**（§4.10/§4.11） |
 | 重复 trigger 静默丢弃 | ✅ 已修复 | `strategy_sync` 重复策略会转发而非 return（§4.6） |
 | 异构重启后发请求 | ❌ 单请求可完成，但输出乱码 | 当前主战场；排查方向见 §4.11 |
 | PD / Mooncake engine_id 轮换链路 | ✅ P 端已验证；⏳ D 端待验证 | dp0/dp1 均已 `KV connector metadata updated` + recovered 通知 |
@@ -39,7 +39,7 @@
 1. 当前唯一目标：**先让异构重启后的单请求输出与对称推理逐 token 一致**。
    - 先确认乱码发生在哪些 DP（dp0 请求 / dp1~3 请求）、prefill 阶段还是 decode 阶段。
    - 用相同 seed/prompt 对比 trigger 前后输出，记录第一个分叉 token 和 logits。
-2. 按 §4.11 的优先级排查正确性：DSA-CP restore/o_proj → MoE gather/unpad → MTP draft → 权重加载。
+2. 按 §4.11 的优先级排查正确性：DSA-CP restore/o_proj → MoE gather/unpad → spec 模式主模型输入映射 → 权重加载。
 3. 输出一致后再验证多请求、续推内容和 PD/Mooncake D 端：
    `heterogeneous producer restart rotates engine_id`。
 
@@ -373,7 +373,8 @@ git -C vllm_plugins diff HEAD
 - 回归：新增
   `vllm_ascend/attention/tests/test_patch_deepseek_v4_attention_hetero.py`，
   覆盖“主模型 LCM / MoE drafter LCM / 稠密 drafter 不 LCM”三种情况。
-- 现状：该修复后单请求不再崩溃，但**输出仍是乱码**，正确性排查见 §4.11。
+- 现状：该修复后单请求不再崩溃；但当前乱码是**独立的主模型正确性问题**
+  （draft 不参与最终采样），排查见 §4.11。
 
 ### 4.11 当前问题：单请求能跑完但输出乱码（进行中）
 
@@ -386,6 +387,16 @@ git -C vllm_plugins diff HEAD
 - 性质：**已经越过了所有“形状/集合通信错误”，进入数值正确性问题**。
   此时张量形状、collective 大小都合法，但 token 顺序、head 顺序、专家
   结果或权重分片被错误排列。
+
+- **总原则：draft 模型不影响最终输出。**
+  speculative decoding 的最终 token 永远由 target 模型自己的 logits 验证/
+  采样得到；draft 错误只会改变接受率、耗时，或造成 draft 路径 crash，
+  **不可能成为“输出乱码”的根因**。因此乱码只可能来自主模型的
+  attention/MoE/权重加载，或 target logits→sampler 的输入映射。
+  “关闭 MTP 后输出变了/没变”不能用来判定 draft 是否有 bug；它只能说明
+  spec 模式下主模型的 batch 布局（verify batch、draft token 位置、
+  attention metadata、logits indices）是否被正确喂给主模型。
+
 - 排查优先级（从最可能到最不可能）：
 
   1. **DSA-CP attention 的 head 恢复 / o_proj**
@@ -405,13 +416,12 @@ git -C vllm_plugins diff HEAD
      - `patch_hetero_moe_runner` 中 shared/routed 两条分支谁长补谁，补的
        必须是 padding 行、且最后不能把 padding 当有效行输出。
 
-  3. **MTP draft 路径**
-     - 即使 draft token 错误，rejection sampling 理论上会拒绝；但
-       `maybe_pad_and_reduce` 后 hidden buffer 的切片如果错位，可能污染
-       target logits / indices。
-     - 隔离方法：临时关闭 speculative（`num_speculative_tokens=0` 或等价
-       参数）跑异构请求。若关闭后输出正确，问题在 draft；若仍乱码，
-       问题在主模型。
+  3. **spec 模式下的主模型输入/输出映射**
+     - 开启 MTP 时，主模型一次 verify 的是 `[已接受 token + 1 个 draft
+       token]` 的 batch；若 `query_start_loc`、positions、slot_mapping 或
+       `token_indices_to_sample` 在异构 TP 下错位，主模型拿到错误输入，
+       最终输出就会乱码。排查对象仍是**主模型 forward 的输入装配**，不是
+       draft 模型本身。
 
   4. **异构权重加载**
      - `_patched_col_init/_patched_row_init` 的双重 create + 重建后，
@@ -425,7 +435,9 @@ git -C vllm_plugins diff HEAD
      找出第一个分叉 token；
   2. 看乱码请求是否只发生在 DP0（TP=3 + ratios）还是所有 DP；若只有
      DP0，直接锁定 `[2,1,1]` 非对称路径；
-  3. 关闭 MTP 后重测，区分 target 与 draft；
+  3. 关闭 MTP 重测可以**简化主模型 batch**（去掉 verify 里的 draft 位置），
+     便于锁定“普通 batch 主模型错”还是“spec 模式下主模型输入装配错”；
+     但无论结果如何，根因仍归主模型；
   4. 在 `_restore_tp_head_layout` 和 MoE prepare/finalize 出口打印：
      `hidden_states.shape`、`local_attn_output.shape`、
      `n_local_heads/n_local_groups`、`wo_a.weight.dim()`（§9.2 的现场清单）；
