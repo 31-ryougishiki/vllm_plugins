@@ -178,6 +178,23 @@ git -C vllm_plugins diff HEAD
 - 验证顺序：先对称普通请求（`grep "expanded size" logs/prefill/` 应为空，
   且输出语义正常），再触发异构重启。
 
+### 4.5 异构重启 worker 启动 `aclInit error 107001 / Invalid device ID`（已修复）
+
+- 现象：触发 `trigger_hetero_restart.sh` 后，DP0（TP=3）能拉起，但
+  DP2 新 worker 进程报：
+  `RuntimeError: aclInit, error code is 107001 ... Invalid device ID.
+  Expected value: [0, 0).`
+- 根因：`its_multiproc_executor._init_workers()` 过滤健康 NPU 后，
+  用 `sorted(new_npu_id_list)`（**字符串排序**）生成
+  `ASCEND_RT_VISIBLE_DEVICES`。DP2 的物理卡是 `8,9,10,11`，
+  字符串排序得到 `10,11,8,9`。NPU runtime 不认可这种非升序
+  列表，子进程 aclInit 时按 0 个可见设备初始化，报 Invalid device ID。
+- 修复：所有生成 `ASCEND_RT_VISIBLE_DEVICES` 的地方统一改为
+  `sorted(..., key=int)`，包括独立部署分支、mm_scene 分支和
+  物理卡 ID 到逻辑 ID 的映射列表。
+- 验证：重启后 grep `Setting ASCEND_RT_VISIBLE_DEVICES`，DP2 应为
+  `8,9,10,11`，且无 `Invalid device ID`。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
@@ -276,6 +293,7 @@ grep -R "heterogeneous producer restart rotates engine_id" logs/prefill/
 | 异构重启后挂死 | DP 同步 / barrier collective 形状不匹配 | 已修复（同形 2×int32 SUM） |
 | 只给故障 DP 下发策略 | barrier 120s 超时 fail-closed，EngineCore 退出 | 设计如此；决策中心必须广播完整策略 |
 | `inplace_partial_rotary_mul` / `EZ9999: Inner Error` | `local_cos` 行数（tokens_per_rank）与 q 行数不一致，常见于 draft metadata 被 LCM 对齐 | 已修复（draft builder 不 LCM） |
+| 异构重启后 worker `aclInit 107001 / Invalid device ID, Expected [0,0)` | `ASCEND_RT_VISIBLE_DEVICES` 被 `sorted()` 按字符串排序，`8,9,10,11` 变成 `10,11,8,9`，NPU runtime 解析失败 | 已修复（`sorted(..., key=int)`） |
 
 ---
 

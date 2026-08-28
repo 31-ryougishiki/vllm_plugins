@@ -1185,14 +1185,16 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     cur_healthy_npu_ids = set([str(i) for i in self.init_executor_state_request.npu_id])
 
                     # 从物理npu-id映射到从0开始的连续逻辑id
-                    sorted_mounted_npu_id_list_str = sorted(list(mounted_npu_id_list_str))
+                    sorted_mounted_npu_id_list_str = sorted(
+                        mounted_npu_id_list_str, key=int
+                    )
                     new_npu_id_list = []
                     for npu_id in cur_healthy_npu_ids:
                         new_npu_id_list.append(str(sorted_mounted_npu_id_list_str.index(npu_id)))
                 else:
                     # 独立部署：--privilege + RT_VISIBLE
                     new_npu_id_list = [str(i) for i in self.init_executor_state_request.npu_id]
-                healthy_npu_str = ",".join(sorted(new_npu_id_list))
+                healthy_npu_str = ",".join(sorted(new_npu_id_list, key=int))
                 logger.info(f"Setting ASCEND_RT_VISIBLE_DEVICES to healthy NPUs: {healthy_npu_str}")
                 os.environ["ASCEND_RT_VISIBLE_DEVICES"] = healthy_npu_str
             else:
@@ -1216,11 +1218,15 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     cur_healthy_npu_ids = set([str(i) for i in self.init_executor_state_request.npu_id]) & set(visible_health_npu_ids)
 
                     # 从物理npu-id映射到从0开始的连续逻辑id
-                    sorted_mounted_npu_id_list_str = sorted(list(mounted_npu_id_list_str))
+                    sorted_mounted_npu_id_list_str = sorted(
+                        mounted_npu_id_list_str, key=int
+                    )
                     new_npu_id_list = []
                     for npu_id in cur_healthy_npu_ids:
                         new_npu_id_list.append(str(sorted_mounted_npu_id_list_str.index(npu_id)))
-                    healthy_npu_str = ",".join(sorted(new_npu_id_list))
+                    healthy_npu_str = ",".join(
+                        sorted(new_npu_id_list, key=int)
+                    )
                     logger.info(f"Setting ASCEND_RT_VISIBLE_DEVICES to healthy NPUs: {healthy_npu_str}")
                     logger.debug(f"self.init_executor_state_request.npu_id={self.init_executor_state_request.npu_id}, {type(self.init_executor_state_request.npu_id[0])},healthy_npu_list={healthy_npu_list}, cur_healthy_npu_ids: {cur_healthy_npu_ids}, visible_health_npu_ids={visible_health_npu_ids}, sorted_mounted_npu_id_list_str={sorted_mounted_npu_id_list_str}, mounted_health_npu_ids={mounted_health_npu_ids}, ")
                     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = healthy_npu_str
@@ -1232,7 +1238,9 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                         for npu_id in npu_id_list:
                             if npu_id in healthy_npu_list:
                                 new_npu_id_list.append(npu_id)
-                        healthy_npu_str = ",".join(sorted(new_npu_id_list))
+                        healthy_npu_str = ",".join(
+                            sorted(new_npu_id_list, key=int)
+                        )
                         logger.info(f"Setting ASCEND_RT_VISIBLE_DEVICES to healthy NPUs: {healthy_npu_str}")
                         os.environ["ASCEND_RT_VISIBLE_DEVICES"] = healthy_npu_str
 
