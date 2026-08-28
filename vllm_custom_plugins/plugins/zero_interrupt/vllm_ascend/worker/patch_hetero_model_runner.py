@@ -102,9 +102,10 @@ def _patched_sync_metadata_across_dp(
 def _patched_profile_run(self):
     origin_max_num_tokens = self.max_num_tokens
     if self.pcp_size > 1:
-        self.max_num_tokens = (
-            math.ceil(self.max_num_tokens / (self.pcp_size * 2)) * 2
-        )
+        # The saved original profile_run already applies the PCP token
+        # adjustment once; do NOT pre-apply it here or max_num_tokens gets
+        # rounded down twice (e.g. 100 -> 50 -> 26 instead of 100 -> 50).
+        pass
     elif bool(
         getattr(self.vllm_config.parallel_config, "is_heterogeneous_tp", False)
     ):

@@ -53,11 +53,15 @@ def _reshape_wo_a_for_dsa(layer) -> None:
     if weight is None or weight.dim() != 2:
         return
 
-    from vllm.distributed import get_tensor_model_parallel_world_size
+    from vllm.distributed import (
+        get_tensor_model_parallel_rank,
+        get_tensor_model_parallel_world_size,
+    )
 
     try:
         cfg = get_current_vllm_config()
         hf_config = cfg.model_config.hf_text_config
+        parallel_config = cfg.parallel_config
     except Exception:  # noqa: BLE001
         return
     o_groups = getattr(hf_config, "o_groups", 0)
@@ -67,7 +71,28 @@ def _reshape_wo_a_for_dsa(layer) -> None:
     tp_size = getattr(layer, "tp_size", None) or (
         get_tensor_model_parallel_world_size()
     )
-    n_local_groups = o_groups // tp_size
+    tp_rank = getattr(layer, "tp_rank", None)
+    if tp_rank is None:
+        tp_rank = get_tensor_model_parallel_rank()
+
+    # Under heterogeneous TP the wo_a groups follow tp_asymmetric_shardings
+    # (e.g. tp=3 with [2,1,1] -> 4/2/2 groups).  ``o_groups // tp_size`` is
+    # wrong there and would make rank0's reshape check fail (expecting
+    # 2*1024 rows instead of the real 4*1024), leaving wo_a 2-D for the DSA
+    # batchmatmul kernels.
+    ratios = getattr(layer, "_tp_sharding_ratios", None)
+    if ratios is None and getattr(parallel_config, "is_heterogeneous_tp", False):
+        ratios = parallel_config.get_sharding_ratios_for_dp(
+            parallel_config.data_parallel_rank
+        )
+    if ratios:
+        from vllm.distributed.utils import get_tp_partition_size
+
+        n_local_groups = get_tp_partition_size(
+            o_groups, tp_rank, tp_size, ratios
+        )
+    else:
+        n_local_groups = o_groups // tp_size
     if n_local_groups <= 0 or weight.shape[0] != n_local_groups * o_lora_rank:
         return
 
