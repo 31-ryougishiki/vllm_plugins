@@ -15,7 +15,7 @@
 | trigger 下发到 4 个 executor | ✅ 已验证 | 发送侧 4 个 HTTP 200；四个 DP 均进入策略执行 |
 | 全量重启 barrier | ✅ 已通过 | dp0/dp2 日志均有 `Full-restart barrier passed` |
 | DP2 重启 worker NPU 可见性 | ✅ 已修复 | `ASCEND_RT_VISIBLE_DEVICES` 改为数值排序（§4.5） |
-| DP0 TP=3 worker 模型加载 | 🔧 已修复，待 A3 复测 | `8192 is not divisible by 3`（§4.7） |
+| DP0 TP=3 worker 模型加载 | 🔧 已修复，待 A3 复测 | `8192 is not divisible by 3`（§4.7/§4.8） |
 | 重复 trigger 静默丢弃 | ✅ 已修复 | `strategy_sync` 重复策略会转发而非 return（§4.6） |
 | 异构重启后发请求 / 续推 | ⏳ 未验证 | 下一步必须在 A3 执行 |
 | PD / Mooncake engine_id 轮换链路 | ⏳ 未验证 | 需结合 D 端验证 |
@@ -281,6 +281,28 @@ git -C vllm_plugins diff HEAD
 - 注意：后续若出现其它 Ascend linear 子类（如 QKV）在异构 TP 下
   `divide` 报错，同样需要做“临时可整除维度 + 重建真实分区”的处理。
 
+### 4.8 异构重启后 DP0 worker 仍报 `8192 is not divisible by 3`（已修复）
+
+- 现象：本次 A3 复测触发 trigger 后，DP0（TP=3）三个新 worker 都在
+  `wo_a` 的 `AscendColumnParallelLinear.__init__` 处失败：
+  `AssertionError: 8192 is not divisible by 3`。traceback 位置仍是
+  stock `linear.py:405` 的
+  `[divide(output_size, self.tp_size) for output_size in self.output_sizes]`。
+- 根因：§4.7 的“临时可整除尺寸”修复在调用 stock init **之前**就执行了
+  `self.output_sizes = real_output_sizes or [output_size]`。而 stock
+  `AscendColumnParallelLinear.__init__` 的可整除判断是
+  `if hasattr(self, "output_sizes")`，读的是**实例属性**
+  `self.output_sizes`，不是入参 `output_sizes`。所以即使传入
+  `output_size=8193, output_sizes=None`，stock init 仍按预置的
+  `[8192]` 做 `divide(8192, 3)`，修复被绕过。
+- 修复：异构分支在调用 stock init 前，把 `self.output_sizes` 临时替换为
+  `[uniform_output_size]`（可整除的 scaffolding 尺寸），stock init
+  返回后再恢复真实尺寸并执行 ratio 重建。普通 Column 与 Merged 子类
+  （预先设置 `output_sizes`）两条路径都已覆盖；Row 路径原实现已正确。
+- 回归：新增 `vllm_ascend/ops/tests/test_patch_hetero_ascend_linear.py`，
+  用最小 stock-init 替身精确复现 `hasattr(self, "output_sizes")` 行为，
+  覆盖 Column / Merged / Row 三条 scaffolding 路径。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
@@ -385,6 +407,7 @@ grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应�
 | `inplace_partial_rotary_mul` / `EZ9999: Inner Error` | `local_cos` 行数（tokens_per_rank）与 q 行数不一致，常见于 draft metadata 被 LCM 对齐 | 已修复（draft builder 不 LCM） |
 | 异构重启后 worker `aclInit 107001 / Invalid device ID, Expected [0,0)` | `ASCEND_RT_VISIBLE_DEVICES` 被 `sorted()` 按字符串排序，`8,9,10,11` 变成 `10,11,8,9`，NPU runtime 解析失败 | 已修复（`sorted(..., key=int)`） |
 | 异构重启后 DP0 worker `8192 is not divisible by 3`（`wo_a/wo_b` 初始化） | stock `AscendColumnParallelLinear`/`AscendRowParallelLinear` 先做整除校验；TP=3 时 8192 不整除 | 已修复（临时可整除维度搭 scaffolding，再按 ratios 重建权重） |
+| 同上错误在 §4.7 修复后复现 | stock col init 读预置的 `self.output_sizes` 而非入参，scaffolding 尺寸被绕过 | 已修复（§4.8） |
 
 ---
 

@@ -214,23 +214,32 @@ def _patched_col_init(
             disable_tp, prefix, self, "column"
         )
         uniform_output_size = _ceil_divisible(output_size, self.tp_size)
-        _ORIG_COL_INIT(
-            self,
-            input_size=input_size,
-            output_size=uniform_output_size,
-            bias=bias,
-            gather_output=gather_output,
-            skip_bias_add=skip_bias_add,
-            params_dtype=params_dtype,
-            quant_config=quant_config,
-            output_sizes=None,
-            prefix=prefix,
-            return_bias=return_bias,
-            disable_tp=disable_tp,
-        )
-        # Restore the real geometry before rebuilding weights.
-        self.output_size = output_size
-        self.output_sizes = real_output_sizes or [output_size]
+        # The stock init does ``if hasattr(self, "output_sizes")`` and
+        # divides ``self.output_sizes``, *not* the ``output_sizes`` argument.
+        # We set the attribute above (for the Merged subclass path), so it
+        # must temporarily hold the divisible scaffolding size here;
+        # otherwise stock init still divides the real 8192 by tp=3 and
+        # raises before the rebuild below can run.
+        self.output_sizes = [uniform_output_size]
+        try:
+            _ORIG_COL_INIT(
+                self,
+                input_size=input_size,
+                output_size=uniform_output_size,
+                bias=bias,
+                gather_output=gather_output,
+                skip_bias_add=skip_bias_add,
+                params_dtype=params_dtype,
+                quant_config=quant_config,
+                output_sizes=None,
+                prefix=prefix,
+                return_bias=return_bias,
+                disable_tp=disable_tp,
+            )
+        finally:
+            # Restore the real geometry even if stock init raised.
+            self.output_size = output_size
+            self.output_sizes = real_output_sizes or [output_size]
         _rebuild_col_weights(self, output_size, ratios)
     else:
         _ORIG_COL_INIT(
