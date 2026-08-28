@@ -974,139 +974,6 @@ def restore_tp_head_layout(
     )
     return recv.view(-1, self.n_local_heads, self.head_dim)
 
-
-def _align_dsa_o_proj_output(
-    proj_output: torch.Tensor,
-    output: torch.Tensor,
-) -> torch.Tensor:
-    """Make the o_proj result match the pre-allocated output buffer.
-
-    ``_restore_tp_head_layout`` returns the FULL padded token stream
-    (num_tokens_pad rows) while the output buffer passed by
-    ``AscendDeepseekSparseAttention.forward`` is allocated from the current
-    ``hidden_states`` tensor.  The two differ for non-SP forwards -- e.g. the
-    MTP draft-model forward, which runs with ``flash_comm_v1_enabled=False``
-    and feeds only the real tokens: TP=4 restore produces 4 rows for a single
-    decode token while ``output`` has 1 row.  Valid tokens are always a prefix
-    of the restored stream, so trim to the buffer size; if graph mode gave us
-    a LARGER output bucket, zero-fill the tail instead.
-    """
-    out_rows = output.shape[0]
-    proj_rows = proj_output.shape[0]
-    if out_rows == proj_rows:
-        return proj_output
-    if out_rows < proj_rows:
-        return proj_output[:out_rows]
-    aligned = proj_output.new_zeros(
-        (out_rows,) + tuple(proj_output.shape[1:])
-    )
-    aligned[:proj_rows] = proj_output
-    return aligned
-
-
-# --- AscendDSACPImpl.forward ---
-#
-# Copied from origin_0.23.0/vllm_ascend/attention/context_parallel/dsa_cp.py,
-# with the two ``output[...] = ...`` write-backs aligned to the actual output
-# buffer size (see _align_dsa_o_proj_output above).  Everything else is
-# identical so homogeneous CP behaviour does not change.
-
-def dsa_cp_forward(  # type: ignore[override]
-    self,
-    layer_name,
-    hidden_states: torch.Tensor,  # query in unified attn
-    kv_cache: tuple[torch.Tensor],
-    attn_metadata: list[M],
-    need_gather_q_kv: bool = False,
-    output: torch.Tensor | None = None,
-) -> torch.Tensor:
-    assert output is not None, "Output tensor must be provided."
-    if attn_metadata is None:
-        # Profiling run.
-        return output.fill_(0)
-    if not isinstance(attn_metadata, list):
-        attn_metadata = [attn_metadata]
-    wait_for_kv_layer_from_connector(layer_name)
-    full_gather_wo_a_enabled = (
-        self.tp_size > 1
-        and self.enable_dsa_cp_with_o_proj_tp
-        and attn_metadata[0].attn_state
-        not in {
-            AscendAttentionState.DecodeOnly,
-            AscendAttentionState.SpecDecoding,
-        }
-    )
-    local_attn_output, o_proj_full_handles = self._forward(
-        layer_name,
-        hidden_states,
-        kv_cache,
-        attn_metadata,
-        need_gather_q_kv,
-        full_gather_wo_a_enabled,
-    )
-    o_proj_input = self._restore_tp_head_layout(
-        local_attn_output,
-        layer_name,
-        attn_metadata[0],
-        skip_all_to_all=full_gather_wo_a_enabled,
-    )
-    num_tokens = o_proj_input.shape[0]
-
-    # o
-    if full_gather_wo_a_enabled:
-        self._switch_o_proj_to_full_weight(o_proj_full_handles)
-    o_proj_groups = self.n_group if full_gather_wo_a_enabled else self.n_local_groups
-    try:
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
-            o = o_proj_input.view(num_tokens, o_proj_groups, -1)
-            o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
-            o = torch_npu.npu_transpose_quant_batchmatmul(
-                o,
-                self.wo_a.weight,
-                dtype=torch.bfloat16,
-                bias=None,
-                group_sizes=(0, 0, 32),
-                x1_scale=swiglu_out_scale.view(torch.float8_e8m0fnu),
-                x2_scale=self.wo_a.weight_scale.view(torch.float8_e8m0fnu),
-                perm_x1=(1, 0, 2),
-                perm_x2=(0, 1, 2),
-                perm_y=(1, 0, 2),
-            )
-            o = o.reshape(num_tokens, -1)
-            output[...] = _align_dsa_o_proj_output(
-                self._apply_wo_b(o, full_gather_wo_a_enabled), output
-            )
-        else:
-            o_proj_input = o_proj_input.view(num_tokens, o_proj_groups, -1)
-            if olora_tp_enable():
-                o_proj_input = self.wo_a(o_proj_input)
-            else:
-                # wo_a = self.wo_a.weight.view(o_proj_groups, self.o_lora_rank, -1)
-                # o = torch.einsum("tgd,grd->tgr", o, wo_a)
-                o_proj_input = torch_npu.npu_transpose_batchmatmul(
-                    o_proj_input,
-                    self.wo_a.weight,
-                    bias=None,
-                    scale=None,
-                    perm_x1=(1, 0, 2),
-                    perm_x2=(0, 1, 2),
-                    perm_y=(1, 0, 2),
-                    batch_split_factor=1,
-                )
-            o_proj_input = o_proj_input.reshape(num_tokens, -1)
-            output[...] = _align_dsa_o_proj_output(
-                self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled),
-                output,
-            )
-    finally:
-        if full_gather_wo_a_enabled:
-            self._switch_o_proj_to_tp_weight()
-
-    maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
-
-    return output
-
-
 _DS_V1_PATCHED_SYMBOLS = (
     "AscendDSAMetadataBuilder.build_prefill_metadata",
     "AscendDSAMetadataBuilder.build_decode_metadata",
@@ -1119,7 +986,6 @@ _DS_CP_PATCHED_SYMBOLS = (
     "AscendDSACPMetadataBuilder._build_local_token_metadata",
     "AscendDSACPImpl.__init__",
     "AscendDSACPImpl._restore_tp_head_layout",
-    "AscendDSACPImpl.forward",
 )
 
 
@@ -1147,11 +1013,6 @@ def apply_deepseek_v4_attention_hetero_patch() -> dict[str, list[str]]:
     dsa_v1_module.__dict__.setdefault("_get_dsa_local_heads", _get_dsa_local_heads)
     dsa_cp_module.__dict__.setdefault("get_tp_partition_size", get_tp_partition_size)
     dsa_cp_module.__dict__.setdefault("get_tp_partition_offset", get_tp_partition_offset)
-    # ``dsa_cp_forward`` runs with the target method's globals, so the helper
-    # must live in the target module namespace as well.
-    dsa_cp_module.__dict__["_align_dsa_o_proj_output"] = (
-        _align_dsa_o_proj_output
-    )
 
     # Save original dsa_cp method function objects in this module, then bind
     # the wrappers as new class attributes.  The originals keep their own
@@ -1191,14 +1052,12 @@ def apply_deepseek_v4_attention_hetero_patch() -> dict[str, list[str]]:
     dsa_cp_module.AscendDSACPImpl.process_weights_after_loading = (
         _patched_dsa_cp_process_weights_after_loading
     )
-    # ``_restore_tp_head_layout`` and ``forward`` are standalone copied bodies
-    # whose globals must stay the target module namespace (torch, dist,
-    # helpers above), so code-object replacement is the right installation
-    # method for them.
+    # ``_restore_tp_head_layout`` is a standalone copied body whose globals
+    # must stay the target module namespace (torch, dist, helpers above), so
+    # code-object replacement is the right installation method for it.
     dsa_cp_module.AscendDSACPImpl._restore_tp_head_layout.__code__ = (
         restore_tp_head_layout.__code__
     )
-    dsa_cp_module.AscendDSACPImpl.forward.__code__ = dsa_cp_forward.__code__
 
     _ATTENTION_HETERO_PATCH_APPLIED = True
     return {

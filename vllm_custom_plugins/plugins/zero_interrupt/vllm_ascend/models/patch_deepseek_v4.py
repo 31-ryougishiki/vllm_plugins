@@ -37,12 +37,6 @@ from vllm.model_executor.models.utils import (
     sequence_parallel_chunk,
 )
 
-from vllm_custom_plugins.plugins.zero_interrupt.vllm.model_executor.layers.patch_linear import (
-    ColumnParallelLinearAsymmetric,
-    MergedColumnParallelLinearAsymmetric,
-    RowParallelLinearAsymmetric,
-)
-
 _ORIG_DSV4_MLP_INIT = None
 _ORIG_DSV4_MOE_INIT = None
 _ORIG_DSV4_MOE_FORWARD = None
@@ -558,13 +552,13 @@ def apply_deepseek_v4_hetero_patch():
     _ORIG_DSV4_ATTN_INIT = m.DeepseekV4Attention.__init__
     _ORIG_DSV4_LOAD_WEIGHTS = m.AscendDeepseekV4ForCausalLM.load_weights
 
-    # Bind asymmetric-TP linear classes in the DeepSeek-V4 module namespace.
-    # DeepSeek-V4 constructs these classes through module-global names, so
-    # swapping the names is the surgical way to make all its MLP/MLA linear
-    # layers honor tp_asymmetric_shardings (e.g. [2,1,1]).
-    m.ColumnParallelLinear = ColumnParallelLinearAsymmetric
-    m.MergedColumnParallelLinear = MergedColumnParallelLinearAsymmetric
-    m.RowParallelLinear = RowParallelLinearAsymmetric
+    # Keep the module-global linear classes untouched.  Symmetric launches
+    # MUST use the stock vLLM classes so the pluggable-layer registry
+    # dispatches them to AscendRowParallelLinear / SequenceRowParallelOp
+    # (FlashComm1 token-dim reduce_scatter).  The heterogeneous ratio
+    # sharding is handled by patch_hetero_ascend_linear, which patches the
+    # Ascend classes themselves; swapping in the vLLM asymmetric subclasses
+    # bypasses that registry and corrupts normal DP4TP4 inference.
 
     m.DeepseekV2MLP.__init__ = _patched_dsv4_mlp_init
     m.DeepseekV4MoE.__init__ = _patched_dsv4_moe_init

@@ -139,46 +139,44 @@ git -C vllm_plugins diff HEAD
   2. quant method 是否为 unquantized；
   3. 上述 patch 是否在模型加载前应用。
 
-### 4.4 DSA-CP 输出写回 `expanded size (1) must match (4)`（已修复）
+### 4.4 对称正常推理 `expanded size (1) must match (4)` / 输出混乱（已修复）
 
-- 场景：**对称 DP4TP4 正常拉起服务、尚未触发异构重启**，打上插件 patch 后
-  发普通请求（MTP decode/profiling）即复现。不是只有异构重启后才出现。
-- 现象：`dsa_cp.py` 的 `output[...] = self._apply_wo_b(...)` 报
-  `RuntimeError: The expanded size of the tensor (1) must match the
-  existing size (4) at non-singleton dimension 0. Target sizes: [1, 4096].
-  Tensor sizes: [4, 4096]`。
+- 场景：**对称 DP4TP4 正常拉起服务、尚未触发异构重启**。报错发生在
+  `AscendDeepseekV4ForCausalLM.forward`（主模型），不是 MTP draft。
+- 现象：
+  - 先报 `dsa_cp.py` 的 `output[...] = self._apply_wo_b(...)`：
+    `RuntimeError: expanded size (1) must match existing size (4)`；
+  - 若用“裁剪 output 行数”的方式绕过该报错，服务不再崩，但**输出内容混乱**。
 - 根因（对称场景就成立）：
-  - `_restore_tp_head_layout()` 返回的是 **全量 padded token 流**
-    （TP=4、1 个 decode token 时是 4 行）。SP 场景下 `wo_b` 的
-    `matmul_and_reduce` 会做 token 维 reduce_scatter，把 4 行收敛回
-    output buffer 的 1 行；但 MTP draft 前向
-    `flash_comm_v1_enabled=False`，`wo_b` 退回
-    `tensor_model_parallel_all_reduce`，**保留 4 行**。
-  - `AscendDeepseekSparseAttention.forward` 按当前 `hidden_states`
-    分配 output buffer（draft 不带 SP padding，只有 1 行），写回时形状冲突。
-  - 之所以在“打 patch 后”才看到该错误，是因为 §4.3 先把 2D `wo_a`
-    reshape 成 3D，前向得以越过 `npu_transpose_batchmatmul` 的
-    `IndexError`，才暴露出下一处形状不匹配。
-  - 异构 LCM 部分是**另一层**隐患：patch 的 `_build_local_token_metadata`
-    曾无条件把 `num_input_tokens` 对齐到 `lcm(3,4,4,4)=12`。异构重启后
-    MTP draft 前向同样没有 LCM padding，会让 local_cos / attention 输出
-    比真实 hidden 更宽，所以一并修正。
-- 修复：
-  - `patch_deepseek_v4_attention_hetero.py` 新增
-    `AscendDSACPImpl.forward` 的整函数 patch：写回 output 前用
-    `_align_dsa_o_proj_output()` 把 o_proj 结果裁剪/补零到 output 的
-    `shape[0]`。
-  - `AscendSpecDecodeBaseProposer.initialize_attn_backend` 的 patch 在
-    draft attention groups/builder 创建后给 DSA-CP draft builder 打上
-    `_is_dsa_cp_draft_builder` 标记；`_build_local_token_metadata` 对
-    draft builder 不再做 LCM 对齐，保持原始的本地 `tp_size` 对齐。
-  - `patch_hetero_ascend_linear._reshape_wo_a_for_dsa()` 改为按
-    `tp_asymmetric_shardings` 计算 `n_local_groups`（DP0 [2,1,1] 下是
-    4/2/2，而不是统一 `8//3=2`），避免 DP0 rank0 的 wo_a 漏 reshape。
-  - 顺手修复 `patch_hetero_model_runner._patched_profile_run()`：PCP
-    分支原本在 wrapper 和原始 `profile_run()` 里各做一次 token 对齐，
-    导致 `max_num_tokens` 被连续两次向下取整；现在 PCP 完全交给原始
-    实现处理，只对异构非 PCP 场景预对齐 `lcm(tp_sizes)`。
+  - `patch_deepseek_v4.py` 之前**无条件**把 `deepseek_v4` 模块里的
+    `ColumnParallelLinear / MergedColumnParallelLinear / RowParallelLinear`
+    换成了插件里的 vLLM `*Asymmetric` 子类。
+  - vLLM 的 pluggable-layer 注册表只认基类名 `RowParallelLinear`；
+    `RowParallelLinearAsymmetric.__name__` 不在 OOT 注册表里，因此
+    对称启动时 `wo_b/down_proj` 实例化的是**普通 vLLM RowParallel**，
+    而不是 `AscendRowParallelLinear`。
+  - 普通 RowParallel 的 forward 只做 TP all_reduce，**没有 FlashComm1 的
+    token 维 reduce_scatter**。DSA-CP restore 返回全量 padded 流
+    （TP4 + 1 token → 4 行），wo_b 不再把 4 行收敛成 output 的 1 行，
+    于是形状冲突。
+  - 上一版用 `_align_dsa_o_proj_output()` 裁剪前缀只是把错误“吞掉”：
+    非 rank0 的 padding 行被当成有效输出写回，所以能跑但输出乱。
+- 修复（fail-closed，而不是裁剪掩盖）：
+  - **撤销 `AscendDSACPImpl.forward` 的整函数替换**，恢复 stock
+    `output[...] = self._apply_wo_b(...)`，让形状错误继续以异常暴露。
+  - **删除 `patch_deepseek_v4.py` 里对模块全局 linear 类的无条件替换**。
+    对称启动保持 stock 类名，使 pluggable-layer 注册表正常分发到
+    `AscendRowParallelLinear / SequenceRowParallelOp`。
+  - 异构 ratio 分片不再依赖 vLLM `*Asymmetric` 子类，统一由
+    `patch_hetero_ascend_linear.py` 直接 patch `Ascend*ParallelLinear`
+    自身完成（该 patch 已按 §4.3/§9.6 支持 ratios）。
+  - 保留 `_build_local_token_metadata` 的 draft-builder LCM 保护
+    （`_is_dsa_cp_draft_builder`，见 §9.3/§9.4）：那是异构重启后 draft
+    metadata 的独立隐患。
+  - 保留 `patch_hetero_model_runner._patched_profile_run()` 的 PCP
+    双重取整修复。
+- 验证顺序：先对称普通请求（`grep "expanded size" logs/prefill/` 应为空，
+  且输出语义正常），再触发异构重启。
 
 ## 5. 异构重启流程要点（0.23 适配结论）
 
@@ -242,8 +240,13 @@ bash install_vllm_plugins.sh
 nohup bash launch_prefill_hetero_test.sh \
   > /opt/its/z30055003/logs/launch.log 2>&1 &
 
-# 3. 先发一个普通请求，确认对称推理正常
-#    （重点确认 DSA-CP 的 npu_transpose_batchmatmul 不再报 IndexError）
+# 3. 先发一个普通请求，确认对称推理正常（第一回归站）
+#    重点确认两类错误都不再出现：
+#    a) npu_transpose_batchmatmul 的 IndexError（wo_a 2D，§4.3）
+#    b) output[...] 的 expanded size (1) must match (4)
+#       （MTP draft 无 SP padding，§4.4）
+grep -R "expanded size of the tensor" logs/prefill/     # 应为空
+grep -R "Dimension out of range" logs/prefill/          # 应为空
 
 # 4. 触发异构重启：DP4TP4 -> DP4TP(3,4,4,4)
 bash trigger_hetero_restart.sh
@@ -269,6 +272,161 @@ grep -R "heterogeneous producer restart rotates engine_id" logs/prefill/
 | `FutureWrapper.__init__() missing 'get_response'` | collective_rpc 0.18 语义 | 已修复 |
 | `AttributeError: 'NoneType' object has no attribute 'clear'`（策略触发时） | `batch_queue=None` | 已修复 |
 | `IndexError: Dimension out of range (expected [-2, 1], got 2)`，位于 `dsa_cp.py` 的 `npu_transpose_batchmatmul` | W8A8 未量化 `wo_a` 2D | 已修复 |
-| `RuntimeError: expanded size (1) must match existing size (4)`，位于 `dsa_cp.py` 的 `output[...] = _apply_wo_b(...)` | 对称拉起时 MTP draft 前向无 SP padding：restore 返回全量 padded token 流，`wo_b` 退化为 all_reduce 不收敛行数；异构重启后 draft metadata 还会被 LCM 对齐 | 已修复 |
+| `RuntimeError: expanded size (1) must match existing size (4)`，位于 `dsa_cp.py` 的 `output[...] = _apply_wo_b(...)`；裁剪绕过会导致输出混乱 | `patch_deepseek_v4.py` 无条件把模块 linear 类换成 vLLM `*Asymmetric`，绕过 Ascend pluggable-layer 注册，`wo_b` 失去 SP reduce_scatter | 已修复（不再替换模块类；异构 ratio 由 `patch_hetero_ascend_linear` 处理） |
 | 异构重启后挂死 | DP 同步 / barrier collective 形状不匹配 | 已修复（同形 2×int32 SUM） |
 | 只给故障 DP 下发策略 | barrier 120s 超时 fail-closed，EngineCore 退出 | 设计如此；决策中心必须广播完整策略 |
+| `inplace_partial_rotary_mul` / `EZ9999: Inner Error` | `local_cos` 行数（tokens_per_rank）与 q 行数不一致，常见于 draft metadata 被 LCM 对齐 | 已修复（draft builder 不 LCM） |
+
+---
+
+## 9. DSA-CP 关键形状与 patch 易错点（速查）
+
+> 本节是 §4.3/§4.4 反复踩坑后的结论，后续改 attention / MoE / spec_decode
+> patch 前先读这一节，能少走弯路。
+
+### 9.1 形状不变量
+
+记：
+
+```text
+N_real  = common_attn_metadata.num_actual_tokens
+N_in    = common_attn_metadata.num_input_tokens   # 已按本地 TP 或 DP 对齐后的值
+N_pad   = _build_local_token_metadata 算出的 num_tokens_pad
+L       = N_pad / tp_size                         # tokens_per_rank，本地 chunk 行数
+```
+
+DSA-CP 前向必须满足：
+
+1. `q`、`local_cos`、attention 输出都是 **L 行**；三者行数不一致会先死在
+   `inplace_partial_rotary_mul`（NPU 侧通常报 `EZ9999`）。
+2. `_restore_tp_head_layout()` 返回的是**全量 padded 流**：
+   `N_pad = L * tp_size` 行，不是本地行数。有效 token 是它的前缀
+   `[0, N_real)`，padding 在尾部。
+3. `wo_b` 是唯一会把行数收敛回来的环节，但**前提是它确实是
+   `AscendRowParallelLinear`**：
+   - SP 时 `SequenceRowParallelOp.matmul_and_reduce` 做 token 维
+     reduce_scatter，`N_pad -> N_pad/tp_size = L`；
+   - 如果 wo_b 被换成了普通 vLLM `RowParallelLinear`/`*Asymmetric` 子类，
+     forward 只有 TP all_reduce，**行数保持 N_pad**，立即触发
+     `output[...]` expanded-size。
+4. `output` buffer 行数 = 进入 `AscendDeepseekSparseAttention.forward` 时
+   `hidden_states.shape[0]`。对称 SP 主模型下它等于 L；不要假设它等于 N_pad。
+5. **不要用裁剪 `_apply_wo_b` 结果行数的方式绕过形状错误**。形状不一致
+   说明前面的线性层/SP 分发已经错了；裁剪会把 padding 行当有效输出写回，
+   表现为“能跑但输出混乱”。正确做法是修复产生 N_pad 行而不是 L 行的
+   上游根因（见 §9.5 PluggableLayer 陷阱）。
+
+### 9.2 报错 → 根因快速对照
+
+| 报错 | 第一时间怀疑 |
+|---|---|
+| `expanded size (1) must match existing size (4)`，位于 `output[...] = _apply_wo_b` | `wo_b` 不是 AscendRowParallelLinear（最常见：模块 linear 类被换成未注册的 `*Asymmetric` 子类），SP reduce_scatter 缺失 |
+| `IndexError: Dimension out of range (expected [-2, 1], got 2)`，位于 `npu_transpose_batchmatmul` | `wo_a.weight` 还是 2D（W8A8 未量化路径漏 reshape） |
+| `inplace_partial_rotary_mul` / `EZ9999` | `local_cos` 与 q 行数不一致：draft metadata 被 LCM 对齐，或 N_in 与真实 SP 流 padding 不一致 |
+| 非对称 all_to_all 尺寸/卡死 | `_hetero_head_ratios` 未生效、`n_local_heads/n_local_groups` 仍是均匀值，或 split_sizes 计算错误 |
+
+现场先打这几个值：
+
+```python
+forward_ctx = get_forward_context()
+print(
+    hidden_states.shape[0],           # output buffer 行数
+    output.shape[0],
+    _EXTRA_CTX.flash_comm_v1_enabled,
+    _EXTRA_CTX.flashcomm_v2_enabled,
+    forward_ctx.is_draft_model,
+    vllm_config.parallel_config.is_heterogeneous_tp,
+    self.n_local_heads, self.n_local_groups,
+    self.wo_a.weight.dim(),
+)
+```
+
+### 9.3 `_build_local_token_metadata` 对齐规则
+
+- 非异构：`align = tp_size`，保持 stock 行为。
+- 异构**主模型 SP**：`align = lcm(所有 per-DP tp_size)`，例如
+  `lcm(3,4,4,4)=12`。
+- **MTP draft（无论是否异构）**：绝不 LCM。draft 前向
+  `flash_comm_v1_enabled=False`，hidden stream 没有 LCM padding，对齐过宽
+  会让 local_cos 比 q 宽，先触发 §9.2 的 RoPE/EZ9999；即使侥幸越过，
+  也会让 restore 行数更宽，最终触发 output expanded size。
+- 区分方式：给 draft 的 `AscendDSACPMetadataBuilder` 打
+  `_is_dsa_cp_draft_builder=True`；主模型 builder 不打。
+
+### 9.4 draft builder 的 patch 时机陷阱
+
+- `draft_attn_groups` 及其 metadata builders 是在
+  `SpecDecodeBaseProposer.initialize_attn_backend()` 里创建的（runner 的
+  `initialize_metadata_builders` 阶段），**不是 `AscendSpecDecodeBaseProposer.__init__`**。
+- 所以任何“按 draft builder 分流”的 patch 都不能写在 `__init__` 包装里；
+  必须在 `initialize_attn_backend` 的包装中，先调用原实现、再遍历
+  `draft_attn_groups[*].metadata_builders` 打标记。
+- 当前实现：`patch_hetero_spec_decode._patched_initialize_attn_backend`。
+
+### 9.5 patch 安装方式（容易踩的 Python 坑）
+
+- `target_func.__code__ = new_func.__code__`：
+  目标函数对象保留自己的 `__globals__`（目标模块 namespace）。
+  适合“整函数复制体”。此时 `new_func` 里引用到的、目标模块没有的名字，
+  必须显式注入目标模块 `__dict__`（如 `_align_dsa_o_proj_output`）。
+- `TargetClass.method = wrapper_func`：
+  wrapper 的 `__globals__` 是当前 patch 模块。适合需要调用 saved original
+  的包装器；保存 original 后绝不能再用 `__code__` 替换同一个函数对象，
+  否则 saved original 的 `__code__` 会被一起改掉，wrapper 递归调用自己。
+- `AscendFusedMoE.__init__` 等带 `__class__` closure（零参 super）的函数，
+  不能用没有同样 closure 的新函数 `__code__` 替换；必须整函数绑定。
+- **PluggableLayer 注册只按 `cls.__name__` 分发**：`RowParallelLinear`
+  会实例化成 `AscendRowParallelLinear`，但 `RowParallelLinearAsymmetric`
+  这个名字不在 OOT 注册表里，实例化后是普通 vLLM RowParallel，丢失
+  FlashComm1 custom op。**永远不要把模型模块里的 linear 基类全局替换成
+  自定义子类**；要扩展行为就 patch `AscendRowParallelLinear` 自身
+  （`patch_hetero_ascend_linear.py` 的做法）。
+
+### 9.6 wo_a 3D reshape 的两个口径
+
+- 最终目标布局：`[n_local_groups, input_per_group, o_lora_rank]`，
+  由 `weight.view(n_local_groups, o_lora_rank, -1).transpose(1,2).contiguous()` 得到。
+- DSA-CP impl 的 `process_weights_after_loading` 用 `self.n_local_groups`
+  （`_patched_dsa_cp_init` 已按 ratios 修正）。
+- Ascend/VLLM `UnquantizedLinearMethod.process_weights_after_loading` 的
+  `_reshape_wo_a_for_dsa()` 里**不能写 `o_groups // tp_size`**：
+  DP0 tp=3 + `[2,1,1]` 时 rank0 是 4 组，均匀公式算成 2 会漏 reshape。
+  必须 `get_tp_partition_size(o_groups, tp_rank, tp_size, ratios)`，
+  并用 `weight.shape[0] == n_local_groups * o_lora_rank` 做防护。
+- 检查顺序：`wo_a.weight.dim()`；quant method 是否 unquantized；
+  patch 是否在模型加载前生效。
+
+### 9.7 profile_run 包装陷阱
+
+- 包装已有方法前先读原实现：`NPUModelRunner.profile_run` 自己已经做
+  PCP 的 `ceil(max/(pcp*2))*2`。wrapper 再预做一次会把
+  `100 -> 50 -> 26`。
+- 正确姿势：只对原实现没有覆盖的新分支（异构非 PCP 的
+  `lcm(tp_sizes)` 下对齐）做预调整，其余原样调用 `_ORIGINAL_PROFILE_RUN`。
+
+### 9.8 对称正常拉起是回归第一站
+
+- 打上 patch 后**先测 DP4TP4 对称普通请求，再触发异构重启**。
+- 对称场景下所有 `is_heterogeneous_tp` 分支必须是 no-op；如果对称路径
+  报错，优先怀疑无条件应用的外层 patch（forward/metadata/quant method
+  包装），而不是异构分支本身。
+- 典型例子：§4.3 修完 wo_a 后，对称主模型在 §4.4 报 expanded-size；
+  第一次尝试用裁剪 output 绕过，结果输出混乱。真正根因是
+  `patch_deepseek_v4.py` 的模块类替换绕过 Ascend pluggable-layer 注册。
+  **形状报错时优先查“当前实例化的类是不是 Ascend 类”，不要先裁剪张量。**
+- 安装后快速自检（应在模型加载完成后执行，输出 True）：
+  ```python
+  import vllm_ascend.models.deepseek_v4 as m
+  from vllm.model_executor.layers.linear import RowParallelLinear
+  from vllm_ascend.ops.linear import AscendRowParallelLinear
+
+  # patch_deepseek_v4 绝不能替换模块全局 linear 类
+  assert m.RowParallelLinear is RowParallelLinear
+  # 对称/异构的 wo_b 实例都必须是 AscendRowParallelLinear，
+  # 否则 SequenceRowParallelOp 的 SP reduce_scatter 缺失。
+  layer = next(
+      l for l in model.model.layers if hasattr(l, "self_attn")
+  ).self_attn
+  assert isinstance(layer.wo_b, AscendRowParallelLinear)
+  print(True)
+  ```
