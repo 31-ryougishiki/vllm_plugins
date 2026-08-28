@@ -15,12 +15,12 @@
 | trigger 下发到 4 个 executor | ✅ 已验证 | 发送侧 4 个 HTTP 200；四个 DP 均进入策略执行 |
 | 全量重启 barrier | ✅ 已通过 | dp0/dp2 日志均有 `Full-restart barrier passed` |
 | DP2 重启 worker NPU 可见性 | ✅ 已修复 | `ASCEND_RT_VISIBLE_DEVICES` 改为数值排序（§4.5） |
-| DP0 TP=3 worker 模型加载 | 🔧 已修复，待 A3 复测 | `8192 is not divisible by 3`（§4.7/§4.8） |
-| 异构重启后 profile_run / KV cache 重建 | 🔧 已修复，待 A3 复测 | `_EXTRA_CTX` 缺少 per-DP 布局，custom op 落入同形 view（§4.9） |
-| 异构重启后真实请求 MTP draft 前向 | 🔧 已修复，待 A3 复测 | MoE drafter 实际开 FlashComm1，draft metadata 错误跳过 LCM（§4.10） |
+| DP0 TP=3 worker 模型加载 | ✅ 已验证（10:21 复测） | `8192 is not divisible by 3` 不再出现（§4.7/§4.8） |
+| 异构重启后 profile_run / KV cache 重建 | ✅ 已验证（10:21 复测） | `available_memory` 为真实数值，KV 重建成功（§4.9） |
+| 异构重启后 MTP draft RoPE 崩溃 | 🔧 修复后不再崩溃，但正确性未闭环 | §4.10 修复已生效；当前问题转为输出乱码 |
 | 重复 trigger 静默丢弃 | ✅ 已修复 | `strategy_sync` 重复策略会转发而非 return（§4.6） |
-| 异构重启后发请求 / 续推 | ⏳ 未验证 | 下一步必须在 A3 执行 |
-| PD / Mooncake engine_id 轮换链路 | ⏳ 未验证 | 需结合 D 端验证 |
+| 异构重启后发请求 | ❌ 单请求可完成，但输出乱码 | 当前主战场；排查方向见 §4.11 |
+| PD / Mooncake engine_id 轮换链路 | ✅ P 端已验证；⏳ D 端待验证 | dp0/dp1 均已 `KV connector metadata updated` + recovered 通知 |
 
 ### 本地提交（均已合入 `hetero` 分支）
 
@@ -36,13 +36,11 @@
 
 ### 下一步顺序（不要跳步）
 
-1. A3 重新安装并拉起对称服务，先发普通请求确认输出正常。
-2. 触发 `trigger_hetero_restart.sh`，确认：
-   - 4 个 DP 都有 `restarting workers of EVERY DP instance`；
-   - 没有 `8192 is not divisible by 3`；
-   - 没有 `Invalid device ID` / `expanded size`。
-3. 重启完成后发请求，验证续推内容和 token 一致性。
-4. 再检查 PD/Mooncake 日志：
+1. 当前唯一目标：**先让异构重启后的单请求输出与对称推理逐 token 一致**。
+   - 先确认乱码发生在哪些 DP（dp0 请求 / dp1~3 请求）、prefill 阶段还是 decode 阶段。
+   - 用相同 seed/prompt 对比 trigger 前后输出，记录第一个分叉 token 和 logits。
+2. 按 §4.11 的优先级排查正确性：DSA-CP restore/o_proj → MoE gather/unpad → MTP draft → 权重加载。
+3. 输出一致后再验证多请求、续推内容和 PD/Mooncake D 端：
    `heterogeneous producer restart rotates engine_id`。
 
 ---
@@ -215,6 +213,8 @@ git -C vllm_plugins diff HEAD
   - 保留 `_build_local_token_metadata` 的 draft-builder LCM 保护
     （`_is_dsa_cp_draft_builder`，见 §9.3/§9.4）：那是异构重启后 draft
     metadata 的独立隐患。
+    **注意：该“draft 一律不 LCM”的保护后来被 §4.10 修正——MoE drafter
+    仍要 LCM，只有稠密 drafter 才跳过。**
   - 保留 `patch_hetero_model_runner._patched_profile_run()` 的 PCP
     双重取整修复。
 - 验证顺序：先对称普通请求（`grep "expanded size" logs/prefill/` 应为空，
@@ -308,7 +308,7 @@ git -C vllm_plugins diff HEAD
   用最小 stock-init 替身精确复现 `hasattr(self, "output_sizes")` 行为，
   覆盖 Column / Merged / Row 三条 scaffolding 路径。
 
-### 4.9 异构重启后 profile_run 报 `shape '[4, 8184, 4096]' is invalid`（已修复，待 A3 复测）
+### 4.9 异构重启后 profile_run 报 `shape '[4, 8184, 4096]' is invalid`（已修复，A3 已验证）
 
 - 现象：§4.8 修复后，DP0 三个 + DP1 四个新 worker 模型（含 MTP）加载成功，但
   `determine_available_memory -> profile_run -> _dummy_run -> MLP/MoE` 时报：
@@ -347,7 +347,7 @@ git -C vllm_plugins diff HEAD
   `vllm_ascend/patch/tests/test_patch_hetero_tp.py`，模拟“先 import、
   后 patch”的模块别名场景，断言旧别名被刷新且无关属性不被覆盖。
 
-### 4.10 异构重启后真实请求在 MTP draft 前向报 RoPE `dim0 must be equal`（已修复，待 A3 复测）
+### 4.10 异构重启后真实请求在 MTP draft 前向报 RoPE `dim0 must be equal`（修复后不再崩溃）
 
 - 现象：profile_run / KV cache 重建 / Mooncake 元数据恢复全部通过，
   DP0 收到真实请求后，worker 在 `sample_tokens ->
@@ -373,6 +373,66 @@ git -C vllm_plugins diff HEAD
 - 回归：新增
   `vllm_ascend/attention/tests/test_patch_deepseek_v4_attention_hetero.py`，
   覆盖“主模型 LCM / MoE drafter LCM / 稠密 drafter 不 LCM”三种情况。
+- 现状：该修复后单请求不再崩溃，但**输出仍是乱码**，正确性排查见 §4.11。
+
+### 4.11 当前问题：单请求能跑完但输出乱码（进行中）
+
+- 现象：trigger 异构重启、profile_run、KV 重建、Mooncake 元数据恢复全部通过；
+  发送单个请求能正常返回，但文本是乱码。
+  10:21 复测日志佐证：dp0 `available_memory=[25.4GB,28.0GB,28.0GB]`、
+  `KV cache re-initialized successfully`、`KV connector metadata updated
+  successfully`，dp0/dp1 均发送 recovered 通知；随后请求路径不再有
+  crash，只有乱码。
+- 性质：**已经越过了所有“形状/集合通信错误”，进入数值正确性问题**。
+  此时张量形状、collective 大小都合法，但 token 顺序、head 顺序、专家
+  结果或权重分片被错误排列。
+- 排查优先级（从最可能到最不可能）：
+
+  1. **DSA-CP attention 的 head 恢复 / o_proj**
+     - `_restore_tp_head_layout` 的异构分支：`head_sizes/head_offsets`、
+       `input_split_sizes/output_split_sizes` 是否按 `[2,1,1]` 正确；
+     - `n_local_heads / n_local_groups` 是否在 Attention 外层与
+       `AscendDSACPImpl` 内部两处都被修正；
+     - `wo_a` 3D reshape 的 `n_local_groups`（DP0 rank0 应为 4 组，不能是
+       `o_groups // tp_size = 2`），以及 `wo_b` 是否保持
+       `AscendRowParallelLinear` 的 SP reduce_scatter。
+
+  2. **MoE gather/unpad 与 shared/routed 输出拼接**
+     - `_maybe_all_gather_and_maybe_unpad_impl` 的 rank-by-rank unpad walk：
+       每个 rank 的 slot 都必须按 `uniform_rank` 前进，即使该 rank 没有
+       实际 token；
+     - `_maybe_pad_and_reduce_impl` 的 `padded_x` 偏移与尾部清零；
+     - `patch_hetero_moe_runner` 中 shared/routed 两条分支谁长补谁，补的
+       必须是 padding 行、且最后不能把 padding 当有效行输出。
+
+  3. **MTP draft 路径**
+     - 即使 draft token 错误，rejection sampling 理论上会拒绝；但
+       `maybe_pad_and_reduce` 后 hidden buffer 的切片如果错位，可能污染
+       target logits / indices。
+     - 隔离方法：临时关闭 speculative（`num_speculative_tokens=0` 或等价
+       参数）跑异构请求。若关闭后输出正确，问题在 draft；若仍乱码，
+       问题在主模型。
+
+  4. **异构权重加载**
+     - `_patched_col_init/_patched_row_init` 的双重 create + 重建后，
+       `weight_loader` 的 `get_tp_partition_offset` 必须与
+       `get_tp_partition_size` 用同一组 ratios；
+     - W8A8 的 `weight_scale/weight_offset` 等 per-channel 参数也要走同
+       一套 offset，不能沿用 `tp_rank * shard_size`。
+
+- 最小隔离实验（按顺序做）：
+  1. 相同 seed/prompt，分别记录**对称启动**和**异构重启后**的返回文本，
+     找出第一个分叉 token；
+  2. 看乱码请求是否只发生在 DP0（TP=3 + ratios）还是所有 DP；若只有
+     DP0，直接锁定 `[2,1,1]` 非对称路径；
+  3. 关闭 MTP 后重测，区分 target 与 draft；
+  4. 在 `_restore_tp_head_layout` 和 MoE prepare/finalize 出口打印：
+     `hidden_states.shape`、`local_attn_output.shape`、
+     `n_local_heads/n_local_groups`、`wo_a.weight.dim()`（§9.2 的现场清单）；
+  5. 对比 DP0 rank0 的每层 hidden_states 与对称运行的对应值（同一输入）。
+
+- 铁律：**不要用“裁剪 / 丢弃多出来的行 / 只取 rank0”来压掉形状差异**。
+  乱码说明某处已经悄悄错位，裁剪只会把错误固化（§4.4 教训）。
 
 ## 5. 异构重启流程要点（0.23 适配结论）
 
@@ -440,7 +500,7 @@ nohup bash launch_prefill_hetero_test.sh \
 #    重点确认两类错误都不再出现：
 #    a) npu_transpose_batchmatmul 的 IndexError（wo_a 2D，§4.3）
 #    b) output[...] 的 expanded size (1) must match (4)
-#       （MTP draft 无 SP padding，§4.4）
+#       （主模型 wo_b 失去 SP reduce_scatter，§4.4）
 grep -R "expanded size of the tensor" logs/prefill/     # 应为空
 grep -R "Dimension out of range" logs/prefill/          # 应为空
 
@@ -475,7 +535,7 @@ grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应�
 | `RuntimeError: expanded size (1) must match existing size (4)`，位于 `dsa_cp.py` 的 `output[...] = _apply_wo_b(...)`；裁剪绕过会导致输出混乱 | `patch_deepseek_v4.py` 无条件把模块 linear 类换成 vLLM `*Asymmetric`，绕过 Ascend pluggable-layer 注册，`wo_b` 失去 SP reduce_scatter | 已修复（不再替换模块类；异构 ratio 由 `patch_hetero_ascend_linear` 处理） |
 | 异构重启后挂死 | DP 同步 / barrier collective 形状不匹配 | 已修复（同形 2×int32 SUM） |
 | 只给故障 DP 下发策略 | barrier 120s 超时 fail-closed，EngineCore 退出 | 设计如此；决策中心必须广播完整策略 |
-| `inplace_partial_rotary_mul` / `EZ9999: Inner Error` | `local_cos` 行数（tokens_per_rank）与 q 行数不一致，常见于 draft metadata 被 LCM 对齐 | 已修复（draft builder 不 LCM） |
+| `inplace_partial_rotary_mul` / `EZ9999: Inner Error` | `local_cos` 行数（tokens_per_rank）与 q 行数不一致；draft 分支的最终规则见 §4.10：MoE drafter 要 LCM，稠密 drafter 不 LCM | 已修复（§4.10） |
 | 异构重启后 worker `aclInit 107001 / Invalid device ID, Expected [0,0)` | `ASCEND_RT_VISIBLE_DEVICES` 被 `sorted()` 按字符串排序，`8,9,10,11` 变成 `10,11,8,9`，NPU runtime 解析失败 | 已修复（`sorted(..., key=int)`） |
 | 异构重启后 DP0 worker `8192 is not divisible by 3`（`wo_a/wo_b` 初始化） | stock `AscendColumnParallelLinear`/`AscendRowParallelLinear` 先做整除校验；TP=3 时 8192 不整除 | 已修复（临时可整除维度搭 scaffolding，再按 ratios 重建权重） |
 | 同上错误在 §4.7 修复后复现 | stock col init 读预置的 `self.output_sizes` 而非入参，scaffolding 尺寸被绕过 | 已修复（§4.8） |
@@ -527,7 +587,7 @@ DSA-CP 前向必须满足：
 |---|---|
 | `expanded size (1) must match existing size (4)`，位于 `output[...] = _apply_wo_b` | `wo_b` 不是 AscendRowParallelLinear（最常见：模块 linear 类被换成未注册的 `*Asymmetric` 子类），SP reduce_scatter 缺失 |
 | `IndexError: Dimension out of range (expected [-2, 1], got 2)`，位于 `npu_transpose_batchmatmul` | `wo_a.weight` 还是 2D（W8A8 未量化路径漏 reshape） |
-| `inplace_partial_rotary_mul` / `EZ9999` | `local_cos` 与 q 行数不一致：draft metadata 被 LCM 对齐，或 N_in 与真实 SP 流 padding 不一致 |
+| `inplace_partial_rotary_mul` / `EZ9999` | `local_cos` 与 q 行数不一致；先查该 forward 是主模型、MoE drafter 还是稠密 drafter，再按 §9.3 判断它实际是否 LCM 分片 |
 | 非对称 all_to_all 尺寸/卡死 | `_hetero_head_ratios` 未生效、`n_local_heads/n_local_groups` 仍是均匀值，或 split_sizes 计算错误 |
 
 现场先打这几个值：
@@ -551,12 +611,18 @@ print(
 - 非异构：`align = tp_size`，保持 stock 行为。
 - 异构**主模型 SP**：`align = lcm(所有 per-DP tp_size)`，例如
   `lcm(3,4,4,4)=12`。
-- **MTP draft（无论是否异构）**：绝不 LCM。draft 前向
-  `flash_comm_v1_enabled=False`，hidden stream 没有 LCM padding，对齐过宽
-  会让 local_cos 比 q 宽，先触发 §9.2 的 RoPE/EZ9999；即使侥幸越过，
-  也会让 restore 行数更宽，最终触发 output expanded size。
+- **draft builder 是否 LCM，取决于 drafter 类型，不能一刀切**（§4.10）：
+  - **MoE drafter（DeepSeek-V4 MTP）**：`set_ascend_forward_context` 对
+    `is_drafter_moe_model()` 为 True 的 drafter 仍把
+    `flash_comm_v1_enabled` 设为 True，hidden stream 会先按
+    `lcm(tp_sizes)` padding 再 reduce_scatter；因此 draft metadata **必须
+    LCM**，否则 q 行数与 `local_cos` 不一致，报
+    `inplace_partial_rotary_mul ... dim0 must be equal`。
+  - **稠密 drafter**：`flash_comm_v1_enabled=False`，hidden stream 没有
+    LCM padding；此时才跳过 LCM，只按本地 `tp_size` 对齐。
 - 区分方式：给 draft 的 `AscendDSACPMetadataBuilder` 打
-  `_is_dsa_cp_draft_builder=True`；主模型 builder 不打。
+  `_is_dsa_cp_draft_builder=True`；再由 `is_drafter_moe_model()` 决定
+  该 draft builder 是否使用 LCM。
 
 ### 9.4 draft builder 的 patch 时机陷阱
 
