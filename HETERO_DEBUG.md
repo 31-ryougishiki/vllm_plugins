@@ -12,6 +12,7 @@
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | 对称 DP4TP4 正常拉起 + 普通请求推理 | ✅ 已验证 | 输出内容正常；§4.3/§4.4 两类错误均不再出现 |
+| hetero_cp 直接拉起异构服务 + 推理 | ✅ 输出正确 | **golden reference**：vllm_plugins 主模型数据面必须与其语义等价 |
 | trigger 下发到 4 个 executor | ✅ 已验证 | 发送侧 4 个 HTTP 200；四个 DP 均进入策略执行 |
 | 全量重启 barrier | ✅ 已通过 | dp0/dp2 日志均有 `Full-restart barrier passed` |
 | DP2 重启 worker NPU 可见性 | ✅ 已修复 | `ASCEND_RT_VISIBLE_DEVICES` 改为数值排序（§4.5） |
@@ -19,7 +20,7 @@
 | 异构重启后 profile_run / KV cache 重建 | ✅ 已验证（10:21 复测） | `available_memory` 为真实数值，KV 重建成功（§4.9） |
 | 异构重启后 MTP draft RoPE 崩溃 | 🔧 修复后不再崩溃 | 该问题只阻塞流程；按 speculative 原理它**不是乱码根因**（§4.10/§4.11） |
 | 重复 trigger 静默丢弃 | ✅ 已修复 | `strategy_sync` 重复策略会转发而非 return（§4.6） |
-| 异构重启后发请求 | ❌ 单请求可完成，但输出乱码 | 当前主战场；排查方向见 §4.11 |
+| 异构重启后发请求 | ❌ 单请求可完成，但输出乱码 | 以 hetero_cp 为 golden 逐模块 diff，排查方向见 §4.11 |
 | PD / Mooncake engine_id 轮换链路 | ✅ P 端已验证；⏳ D 端待验证 | dp0/dp1 均已 `KV connector metadata updated` + recovered 通知 |
 
 ### 本地提交（均已合入 `hetero` 分支）
@@ -37,10 +38,12 @@
 ### 下一步顺序（不要跳步）
 
 1. 当前唯一目标：**先让异构重启后的单请求输出与对称推理逐 token 一致**。
-   - 先确认乱码发生在哪些 DP（dp0 请求 / dp1~3 请求）、prefill 阶段还是 decode 阶段。
-   - 用相同 seed/prompt 对比 trigger 前后输出，记录第一个分叉 token 和 logits。
-2. 按 §4.11 的优先级排查正确性：DSA-CP restore/o_proj → MoE gather/unpad → spec 模式主模型输入映射 → 权重加载。
-3. 输出一致后再验证多请求、续推内容和 PD/Mooncake D 端：
+2. 以 **hetero_cp 直接拉起的异构服务（输出正确）** 为 golden reference，
+   按 §4.11 的模块比对清单逐段 diff 主模型数据面；不再以“看起来最可能错”
+   作为首要排查方式。
+3. 先处理与 hetero_cp“实现方式不同”的模块（linear 的 scaffold+rebuild、
+   DSA-CP wrapper、custom-op `__code__` 替换），再核对整段拷贝的模块。
+4. 输出一致后再验证多请求、续推内容和 PD/Mooncake D 端：
    `heterogeneous producer restart rotates engine_id`。
 
 ---
@@ -70,6 +73,12 @@
 | `vllm_plugins_hetero_test/` | 远程 A3 安装 / 拉起 / 触发异构重启脚本 |
 | `DeepSeek-V4-Flash-w8a8-mtp/` | 模型配置样例 |
 | `error.log` | 最近一次报错节选 |
+
+> **hetero_cp 的定位**：已确认其直接拉起的异构服务（同模型、同拓扑
+> DP4TP(3,4,4,4)）**推理输出正确**，因此它是正确性验证的 golden
+> reference。vllm_plugins 主模型数据面的每个实现都应能在下面的
+> `hetero_cp` 源码 diff 中找到等价逻辑；只有 restart / 策略 / Mooncake
+> 控制面属于插件独有实现。
 
 关键对比命令：
 
@@ -388,60 +397,51 @@ git -C vllm_plugins diff HEAD
   此时张量形状、collective 大小都合法，但 token 顺序、head 顺序、专家
   结果或权重分片被错误排列。
 
+- **最重要基准：hetero_cp 直接拉起的异构推理服务，输出是正确的。**
+  因此正确性验证应以 hetero_cp 为 golden reference：
+  - vllm_plugins 的 restart / 策略 / HTTP / Mooncake 控制面是插件独有，
+    不参与比较；
+  - 但**进入主模型 forward 的所有逻辑，都必须能在 hetero_cp 对应源码
+    diff 中找到等价实现**；
+  - 凡插件实现与 hetero_cp 语义不一致、又无法解释为 restart 必要增量的，
+    一律视为乱码嫌疑。
+
 - **总原则：draft 模型不影响最终输出。**
   speculative decoding 的最终 token 永远由 target 模型自己的 logits 验证/
   采样得到；draft 错误只会改变接受率、耗时，或造成 draft 路径 crash，
   **不可能成为“输出乱码”的根因**。因此乱码只可能来自主模型的
   attention/MoE/权重加载，或 target logits→sampler 的输入映射。
-  “关闭 MTP 后输出变了/没变”不能用来判定 draft 是否有 bug；它只能说明
-  spec 模式下主模型的 batch 布局（verify batch、draft token 位置、
-  attention metadata、logits indices）是否被正确喂给主模型。
 
-- 排查优先级（从最可能到最不可能）：
+- **正确性验证方法（diff 优先，不要靠“感觉”）**
+  1. 先拿到触发前后同 seed/prompt 的返回文本，确认第一个分叉 token 和
+     乱码发生在哪个 DP；若只有 DP0，直接锁定 `[2,1,1]` 非对称路径。
+  2. 对下表每个模块，生成 hetero_cp 源码 diff 并与 vllm_plugins 对应
+     patch 逐段比对：
+     ```bash
+     git -C hetero_cp/vllm diff 0fc695fc6d..HEAD -- <file>
+     git -C hetero_cp/vllm-ascend diff 5cb98caaa..HEAD -- <file>
+     ```
+  3. 比对顺序：**先查“实现方式不同”的模块，再查“整段拷贝”的模块**。
+     整段拷贝若还错，问题通常在 patch 绑定/调用时机/注入 globals，而不是
+     算法本身。
 
-  1. **DSA-CP attention 的 head 恢复 / o_proj**
-     - `_restore_tp_head_layout` 的异构分支：`head_sizes/head_offsets`、
-       `input_split_sizes/output_split_sizes` 是否按 `[2,1,1]` 正确；
-     - `n_local_heads / n_local_groups` 是否在 Attention 外层与
-       `AscendDSACPImpl` 内部两处都被修正；
-     - `wo_a` 3D reshape 的 `n_local_groups`（DP0 rank0 应为 4 组，不能是
-       `o_groups // tp_size = 2`），以及 `wo_b` 是否保持
-       `AscendRowParallelLinear` 的 SP reduce_scatter。
+| vllm_plugins 实现 | hetero_cp 参考 | 关系 | 乱码排查重点 |
+|---|---|---|---|
+| `patch_hetero_ascend_linear.py` | `vllm/model_executor/layers/linear.py` + `vllm_ascend/ops/linear.py` | **实现方式不同**：hetero_cp 在 `__init__` 直接用 `get_tp_partition_size` 建一次权重；插件用“可整除 scaffolding + rebuild”两次 create | 第一嫌疑。逐项核对 `output_partition_sizes/input_size_per_partition/bias/weight_loader offset`、`wo_a.n_local_groups`、`custom_op.update_attrs` 的最终值是否与 hetero_cp 完全一致 |
+| `patch_deepseek_v4_attention_hetero.py` | `vllm_ascend/attention/context_parallel/dsa_cp.py`、`dsa_v1.py`、`models/deepseek_v4.py` attention 部分 | 主体为整段拷贝 + 三个 wrapper（init / local_token_metadata / wo_a reshape） | 重点核对 `_restore_tp_head_layout` 的非均匀 all_to_all split、`n_local_heads/n_local_groups` 两处刷新、`wo_a` 3D reshape；§4.10 的 MoE-drafter LCM 是插件修正，需确认与主模型实际 SP 流一致 |
+| `patch_hetero_custom_ops.py` | `vllm_ascend/ops/register_custom_ops.py` | 整段拷贝，用 `__code__` 替换已注册 op | 核对五个 op 是否都替换成功、`_hetero_*` helper 是否注入目标模块 globals；unpad/reduce 的 slot 前进逻辑逐行对照 |
+| `patch_hetero_moe.py` | `ops/fused_moe/prepare_finalize.py`、`token_dispatcher.py`、`fused_moe_0_23_0.py`、`experts_selector.py` | 整段拷贝 | 核对 256/15 余数分布、ALLGATHER 回退、dispatch/combine 的 uneven expert 切分 |
+| `patch_deepseek_v4.py` / `patch_deepseek_v4_mtp.py` | `models/deepseek_v4.py`、`deepseek_v4_mtp.py` | Port | 主模型 MoE forward 的 `chunk_for_moe`、shared expert 复制、heads 权重加载 offset |
+| `patch_hetero_parameter.py` / `patch_hetero_vocab.py` / `patch_hetero_default_loader.py` | `vllm/model_executor/parameter.py`、`vocab_parallel_embedding.py`、`default_loader.py` | Port | 权重 offset 与 vocab padding 是否与 hetero_cp 一致；异构下 vocab 是否仍能统一 all_gather |
+| `patch_hetero_tp.py` / `patch_hetero_model_runner.py` | `ascend_forward_context.py`、`worker/model_runner_v1.py` | Port | per-DP 布局、`padded_length/padded_num_tokens`、DP metadata sync 的 EP-group 用法 |
+| `patch_hetero_spec_decode.py` | `spec_decode/llm_base_proposer.py` | Port + 插件修正 | 只影响 draft 执行；**不可能是乱码根因**，仅确认不 crash |
+| 直接替换的文件 | `vllm/config/parallel.py`、`vllm/distributed/parallel_state.py`、`fused_moe/config.py` | byte-identical | 已排除 |
+| `vllm_ascend/distributed/parallel_state.py`、`worker.py` | 同名 hetero_cp 文件 | hetero_cp 文件 + restart 增量 | 只查 restart 增量是否影响主模型 forward；基础部分已排除 |
 
-  2. **MoE gather/unpad 与 shared/routed 输出拼接**
-     - `_maybe_all_gather_and_maybe_unpad_impl` 的 rank-by-rank unpad walk：
-       每个 rank 的 slot 都必须按 `uniform_rank` 前进，即使该 rank 没有
-       实际 token；
-     - `_maybe_pad_and_reduce_impl` 的 `padded_x` 偏移与尾部清零；
-     - `patch_hetero_moe_runner` 中 shared/routed 两条分支谁长补谁，补的
-       必须是 padding 行、且最后不能把 padding 当有效行输出。
-
-  3. **spec 模式下的主模型输入/输出映射**
-     - 开启 MTP 时，主模型一次 verify 的是 `[已接受 token + 1 个 draft
-       token]` 的 batch；若 `query_start_loc`、positions、slot_mapping 或
-       `token_indices_to_sample` 在异构 TP 下错位，主模型拿到错误输入，
-       最终输出就会乱码。排查对象仍是**主模型 forward 的输入装配**，不是
-       draft 模型本身。
-
-  4. **异构权重加载**
-     - `_patched_col_init/_patched_row_init` 的双重 create + 重建后，
-       `weight_loader` 的 `get_tp_partition_offset` 必须与
-       `get_tp_partition_size` 用同一组 ratios；
-     - W8A8 的 `weight_scale/weight_offset` 等 per-channel 参数也要走同
-       一套 offset，不能沿用 `tp_rank * shard_size`。
-
-- 最小隔离实验（按顺序做）：
-  1. 相同 seed/prompt，分别记录**对称启动**和**异构重启后**的返回文本，
-     找出第一个分叉 token；
-  2. 看乱码请求是否只发生在 DP0（TP=3 + ratios）还是所有 DP；若只有
-     DP0，直接锁定 `[2,1,1]` 非对称路径；
-  3. 关闭 MTP 重测可以**简化主模型 batch**（去掉 verify 里的 draft 位置），
-     便于锁定“普通 batch 主模型错”还是“spec 模式下主模型输入装配错”；
-     但无论结果如何，根因仍归主模型；
-  4. 在 `_restore_tp_head_layout` 和 MoE prepare/finalize 出口打印：
-     `hidden_states.shape`、`local_attn_output.shape`、
-     `n_local_heads/n_local_groups`、`wo_a.weight.dim()`（§9.2 的现场清单）；
-  5. 对比 DP0 rank0 的每层 hidden_states 与对称运行的对应值（同一输入）。
+- 若逐模块 diff 后仍与 hetero_cp 等价，则问题转移到插件独有的
+  **restart 后状态差异**：`vllm_config` 重建是否丢失字段、patch 绑定时机
+  （§4.9 同类问题）、全局单例/缓存是否残留对称启动的值。此时在
+  hetero_cp 直接服务与插件重启服务上跑同一请求，逐层对比 rank0 hidden_states。
 
 - 铁律：**不要用“裁剪 / 丢弃多出来的行 / 只取 rank0”来压掉形状差异**。
   乱码说明某处已经悄悄错位，裁剪只会把错误固化（§4.4 教训）。
