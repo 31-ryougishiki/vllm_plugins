@@ -23,6 +23,7 @@
 ### 本地提交（均已合入 `hetero` 分支）
 
 ```text
+98b679e fix(linear): replace pre-set output_sizes with divisible scaffold in stock init
 89b9974 fix(linear): scaffold Ascend linears with divisible sizes under hetero TP
 098dc63 fix(strategy_sync): forward duplicate deployment strategies instead of dropping them
 6312296 fix(executor): sort healthy NPU ids numerically for ASCEND_RT_VISIBLE_DEVICES
