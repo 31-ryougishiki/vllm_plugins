@@ -1062,6 +1062,14 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 )
             self.vllm_config.validate_block_size()
 
+            # Step 4.5: Rebuild the scheduler-side KVCacheManager from the
+            # fresh config.  The scheduler was created before the restart and
+            # still holds the old block pool / prefix-cache mappings; reusing
+            # it after a worker restart can allocate stale block ids whose
+            # contents belong to earlier requests ("coherent but unrelated"
+            # completions).
+            self._rebuild_scheduler_kv_cache_manager(scheduler_kv_cache_config)
+
             # Step 5: Initialize workers with KV cache config
             self.initialize_from_config(kv_cache_configs)
             logger.info("KV cache re-initialized successfully")
@@ -1069,6 +1077,72 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         except Exception as e:
             logger.error(f"Failed to re-initialize KV cache: {e}")
             raise Exception(f"KV cache re-initialization failed: {e}")
+
+    def _rebuild_scheduler_kv_cache_manager(self, kv_cache_config) -> None:
+        """Replace the scheduler KVCacheManager after a worker restart.
+
+        The scheduler process survives a worker restart, so its
+        ``kv_cache_manager`` still references the pre-restart block pool.
+        Rebuild it from the freshly profiled ``KVCacheConfig`` and rebind the
+        scheduler-side KV connector to the new block pool.  Without this step,
+        a request scheduled after restart can receive block ids whose memory
+        was last written by a different request.
+        """
+        engine_core = getattr(self, "_engine_core_ref", None)
+        scheduler = getattr(engine_core, "scheduler", None)
+        if scheduler is None:
+            logger.warning(
+                "Scheduler KVCacheManager not rebuilt: engine_core scheduler "
+                "is unavailable."
+            )
+            return
+
+        from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+        old_manager = getattr(scheduler, "kv_cache_manager", None)
+        hash_block_size = getattr(scheduler, "block_size", None)
+        new_manager = KVCacheManager(
+            kv_cache_config=kv_cache_config,
+            max_model_len=scheduler.max_model_len,
+            scheduler_block_size=scheduler.block_size,
+            hash_block_size=hash_block_size or scheduler.block_size,
+            max_num_batched_tokens=(
+                scheduler.scheduler_config.max_num_batched_tokens
+            ),
+            enable_caching=scheduler.cache_config.enable_prefix_caching,
+            use_eagle=scheduler.use_eagle,
+            log_stats=scheduler.log_stats,
+            enable_kv_cache_events=scheduler.enable_kv_cache_events,
+            dcp_world_size=scheduler.dcp_world_size,
+            pcp_world_size=scheduler.pcp_world_size,
+            metrics_collector=scheduler.kv_metrics_collector,
+        )
+        scheduler.kv_cache_config = kv_cache_config
+        scheduler.kv_cache_manager = new_manager
+        scheduler.has_mamba_layers = bool(
+            getattr(kv_cache_config, "has_mamba_layers", False)
+        )
+        scheduler.needs_kv_cache_zeroing = bool(
+            getattr(kv_cache_config, "needs_kv_cache_zeroing", False)
+        )
+
+        connector = getattr(scheduler, "connector", None)
+        if connector is not None:
+            try:
+                connector.bind_gpu_block_pool(new_manager.block_pool)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to rebind scheduler KV connector block pool: %s",
+                    exc,
+                )
+
+        logger.info(
+            "Scheduler KVCacheManager rebuilt: num_blocks=%s groups=%s "
+            "(old manager was %s)",
+            getattr(kv_cache_config, "num_blocks", None),
+            len(getattr(kv_cache_config, "kv_cache_groups", []) or []),
+            type(old_manager).__name__ if old_manager is not None else None,
+        )
 
     def update_kv_connector_metadata(self, engine_core) -> None:
         """Update KV connector handshake metadata after worker restart.

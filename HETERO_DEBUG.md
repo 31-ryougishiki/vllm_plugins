@@ -536,6 +536,26 @@ git -C vllm_plugins diff HEAD
   - 回归：`vllm/v1/executor/tests/test_hetero_utils.py` 新增
     “pure DP scale-to-zero is not heterogeneous” 用例。
 
+### 4.15 重启后“回答通顺但答非所问”（scheduler KV cache 未重建，已修复待 A3 复测）
+
+- 现象：D 端 DP16TP1 -> DP15TP1 重启成功、无 crash，但直连 decode
+  engine 发请求返回的文本通顺却与 prompt 无关。
+- 根因：EngineCore/scheduler 进程在 worker 重启前后一直存活。
+  `_reinitialize_kv_cache()` 之前只重建 worker 端 KV cache，并更新
+  `vllm_config.cache_config.num_gpu_blocks`，**没有重建 scheduler 的
+  `KVCacheManager`**。scheduler 仍持有重启前的 block pool 和
+  prefix-cache 映射，重启后新请求可能分到“上一个请求写过的”block id，
+  输入上下文被旧 KV 污染，于是输出通顺但答非所问。
+- 修复：`_reinitialize_kv_cache()` 生成
+  `generate_scheduler_kv_cache_config()` 后，调用
+  `_rebuild_scheduler_kv_cache_manager()`：
+  1. 用新 `KVCacheConfig` 新建 `KVCacheManager`；
+  2. 替换 `scheduler.kv_cache_manager` / `scheduler.kv_cache_config`；
+  3. 同步 `has_mamba_layers` / `needs_kv_cache_zeroing`；
+  4. 若 scheduler 有 KV connector，`bind_gpu_block_pool(new_block_pool)`。
+- A3 复测：重装插件 → 重启 D → 用完全不同的 prompt（例如
+  `1+1=?`）直连 9100 验证回答不再携带上一次请求（例如量子计算）内容。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
@@ -577,6 +597,8 @@ git -C vllm_plugins diff HEAD
 2. **`_reinitialize_kv_cache` 未重建 scheduler 的 `KVCacheManager`**：
    - worker 端 KV cache 已重建，scheduler 端 block pool 仍是启动时配置。
    - 若新拓扑 `num_gpu_blocks` 变化，可能出现越界或内存利用不足。
+   - ✅ 已修复：重启后用新 `KVCacheConfig` 重建 scheduler
+     `KVCacheManager` 并 rebind connector block pool（§4.15）。
 3. **setup.py 仍直接替换源码文件**：
    - 当前依赖替换 `parallel.py/parallel_state.py/fused_moe config` 等，
      未完全符合“DeepSeek-V4 相关修改用 patch”的要求。
