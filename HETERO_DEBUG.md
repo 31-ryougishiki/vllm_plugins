@@ -25,12 +25,14 @@
 | PD 场景 2（D 坏 1 卡、P 不变） | 🔧 脚本已建；缩容重启修复已提交，待 A3 复测 | barrier 超时、scale-to-zero、KV extra dp 校验已修；§4.13/§4.14 |
 | D 单机 DP16TP1→DP15TP1 重启 | 🔧 存活组 barrier 方案已提交，待 A3 复测 | 存活 executor 用重新编号的 15-rank gloo group barrier 并替换 dp_group，不再等待 dp15（§4.16） |
 | RECOVER（P 异构→对称、D DP15→DP16） | 🔧 控制面与场景脚本已提交，待 A3 复测 | 纯 DP 恢复也会全量 barrier；目标 16-rank dp_group 重建后统一重启（§4.17） |
+| DecisionMakingCenter 适配 | 🔧 executor_id/role/上报已对齐，待 A3 联调 | 注册返回的 `exe-...` id 用于策略校验与状态上报；P/D role 转 P_ROLE/D_ROLE；场景脚本改用 DC 触发（§4.18） |
 | 重启后“答非所问” | 🔧 根因已定位并修复（待 A3 复测） | scheduler 端 KVCacheManager 未重建，旧 block pool 污染新请求；§4.15 |
 | PD / Mooncake engine_id 轮换链路 | ✅ P 端已验证；⏳ D 端待验证 | dp0/dp1 均已 `KV connector metadata updated` + recovered 通知 |
 
 ### 本地提交（均已合入 `hetero` 分支）
 
 ```text
+b65eec8 fix(executor): adapt executor id and role reporting to DecisionMakingCenter
 4b023f8 fix(executor): skip redundant RECOVER restart when topology already matches
 8271053 fix(executor): full-restart barrier and dp_group rebuild for RECOVER
 67fa13b fix(executor): barrier over surviving executors and replace dp_group
@@ -51,8 +53,8 @@ eb23da3 fix(linear): load Ascend linears with ratio-aware offsets under hetero T
 ```
 
 > PD 测试脚本仓 `vllm_plugins_hetero_test` 的相关提交独立于本仓：
-> `e41fbde`（RECOVER 场景） / `b581ffa` / `e8103d1` / `998c4f8` /
-> `412171e` / `c410b32` 等。
+> `f1943ea`（决策中心触发） / `e41fbde`（RECOVER 场景） / `b581ffa` /
+> `e8103d1` / `998c4f8` / `412171e` / `c410b32` 等。
 
 ### 下一步顺序（不要跳步）
 
@@ -685,6 +687,45 @@ git -C vllm_plugins diff HEAD
      `Full-restart barrier passed`（不是 skipped），dp15 无
      `Idle mode (dp=0)` 新增，且恢复后输出与基线一致。
 
+### 4.18 DecisionMakingCenter 适配（已提交，待 A3 联调）
+
+- 目标：不再手动 POST executor 的 `/api/v1/executor/deploy`，改用
+  `7.246.78.79:8088` 决策中心的
+  `/test/trigger_fault` 与 `/repair/devices` 触发扩缩容/RECOVER。
+- 对齐点（只改 vllm_plugins / 测试脚本，未改决策中心）：
+  1. **注册返回的 executor_id**：决策中心在 `/init_executor_state` 返回
+     `exe-<service_id>-<engine_uid>-<n>`，旧插件只把返回值当 bool 丢弃。
+     现在 `DecisionCenterClient.report_init_state_with_executor_id()` 解析
+     并保存该 id；ITS HTTP 的 deploy 接口同时接受本地数字
+     `data_parallel_rank` 与 `exe-...` id，旧的直接 trigger 脚本仍可用。
+  2. **部署状态上报使用 exe id**：`_report_deploy_status()` 优先上报
+     `_decision_center_executor_id`。决策中心的
+     `EXECUTOR_SERVICE_MAP / SERVICE_HANDLERS` 都按 exe id 等待完成，
+     旧代码上报数字 id 会让 Handler 永远等不到。
+  3. **PD role 上报**：决策中心寻优只认
+     `EXECUTOR_PD_ROLE_MAP == "P_ROLE"`，而 vLLM kv_role 是
+     `kv_producer/kv_consumer`。上报时转换为 `P_ROLE/D_ROLE`，否则 P
+     executor 会被过滤、寻优结果为空。engine_core 内部仍按 vllm_config
+     的 kv_role 判断是否轮换 engine_id，不受影响。
+  4. **统一 VLLM_SERVICE_ID**：launch 脚本原来每个 dp 进程各用不同
+     service id（如 `hetero-test-dp4tp4-dp0`），决策中心会把它们注册成
+     多个服务。现在 launch 脚本尊重外部 `VLLM_SERVICE_ID`；
+     `decision_center/launch_*_dc.sh` 统一使用 `pd-hetero-service`。
+  5. **决策中心触发脚本**：新增 `vllm_plugins_hetero_test/decision_center/`：
+     - `launch_prefill_dc.sh` / `launch_decode_dc.sh`；
+     - `trigger_fault.sh <node_ip> <npu_id>`；
+     - `repair_devices.sh <node_ip>:<npu_id> ...`；
+     - `run_scenario{1,2,3}_dc.sh` 与 `run_all_dc.sh`；
+     - 原 `run_scenario{1,2,3}.sh` 增加 `TRIGGER_MODE=dc` 分支。
+- A3 联调检查：
+  - 20 个 executor 启动日志均出现 `assigned executor_id=exe-...`；
+  - `curl http://7.246.78.79:8088/api/v1/decision_center/health` 返回
+    `healthy`；
+  - 触发故障后决策中心日志出现 `策略下发成功`，executor 日志出现
+    `Received deployment strategy ... executor_id=exe-...`；
+  - 恢复时一次 `repair_devices.sh 7.246.78.75:3 7.246.78.76:15`，
+    决策中心确认服务无坏卡后自动下发 RECOVER。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
@@ -804,6 +845,9 @@ grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应�
 | dp15 scale-to-zero executor 报 `ZeroDivisionError` | `is_heterogeneous_restart()` 把 `new_tp=0` 当 TP 变化，`get_tp_asymmetric_shardings()` 对 0 做除法 | 已修复（忽略 `new_tp<=0`；zero 返回 `[]`，§4.14） |
 | 尝试“存活 executor 单独 barrier group”后卡住 | 首次实装仍用旧 `dp=16` parallel_config 建组，rank15 缺席使 gloo rendezvous 永久等待；`Address already in use` 只是重试日志 | 已修复（deepcopy + 重新编号 dp=15，barrier 后替换 EngineCore dp_group；§4.16） |
 | RECOVER DP15→DP16 健康 executor 不 barrier / 恢复 executor 在旧 16-rank group 上死等 | RECOVER 判断只看 TP；纯 DP 恢复被误判为单实例重启，而 EngineCore dp_group 已经变成 15/16 两套 | 已修复（`recover_requires_full_restart` 比较 backup/current/target dp；目标组重建后统一 barrier；§4.17） |
+| 决策中心下发策略被 executor 以 executor_id mismatch 拒绝 / 部署状态上报后 Handler 不结束 | 插件丢弃 `/init_executor_state` 返回的 `exe-...` id，HTTP 只认本地数字 rank，状态上报也上报数字 id | 已修复（保存 exe id、HTTP 接受双 id、上报优先 exe id；§4.18） |
+| 决策中心寻优无 P-Engine（`无 P-Role Executors`） | 插件把 `kv_producer` 原样上报，而决策中心只认 `P_ROLE` | 已修复（上报时 kv_producer→P_ROLE、kv_consumer→D_ROLE；§4.18） |
+| 决策中心把 P/D 注册成多个 service | launch 脚本每个 dp 使用独立 `VLLM_SERVICE_ID` | 已修复（脚本支持统一 service id；DC launch 脚本默认 `pd-hetero-service`；§4.18） |
 | 重启后“输出通顺但答非所问” | EngineCore/scheduler 存活，旧 `KVCacheManager` 未重建，新请求分到旧 block pool 内容 | 已修复（重建 scheduler KVCacheManager 并 rebind connector，§4.15） |
 | 场景1 trigger 全部 `Connection refused` | P 的 ITS HTTP 未监听（缺 fastapi/uvicorn 或未加载 zero_interrupt）；trigger 前应预检 ITS `/health` | 脚本已加预检；环境需装 `fastapi<0.124.0 httpx uvicorn` |
 | 场景1 输出“正常文本 + 无关 JSON 片段” | PD 首次请求 `stop_reason=recomputed`，代理拼接两段 completion；且 warmup 只覆盖一个 decoder | 脚本已修：temperature=0、全 decoder warmup、代理轮转、recomputed 日志 |
