@@ -17,45 +17,59 @@ _ORIG_ENABLE_SP = None
 def _patched_check_kv_extra_config(vllm_config):
     parallel_config = vllm_config.parallel_config
 
+    def _allowed_parallel_values(key: str) -> set[int]:
+        """Collect acceptable pool sizes for a restart/degrade scenario.
+
+        KV extra config describes the ORIGINAL remote pool layout.  After a
+        heterogeneous restart (P TP 4->3) or a decode degradation
+        (D DP 16->15) the local parallel config intentionally differs from
+        that original layout, so the check must accept the current value,
+        every per-DP value and every pre/post value carried by the
+        zero-interrupt strategy.
+        """
+        attr = {
+            "tp_size": "tensor_parallel_size",
+            "dp_size": "data_parallel_size",
+        }[key]
+        allowed = set()
+        current = getattr(parallel_config, attr, None)
+        if current is not None:
+            allowed.add(int(current))
+
+        if key == "tp_size" and getattr(
+            parallel_config, "is_heterogeneous_tp", False
+        ):
+            for dp_rank in range(parallel_config.data_parallel_size):
+                allowed.add(
+                    int(parallel_config.get_tp_size_for_dp(dp_rank))
+                )
+
+        additional = getattr(vllm_config, "additional_config", None) or {}
+        zi_config = additional.get("zero_interrupt_config", {}) or {}
+        cfg_key = key.removesuffix("_size")  # tp_size -> tp, dp_size -> dp
+        for cfg in zi_config.get("engine_parallel_config", []) or []:
+            for field in (cfg_key, f"new_{cfg_key}"):
+                value = cfg.get(field)
+                if value is not None and int(value) > 0:
+                    allowed.add(int(value))
+        return allowed
+
     def _check(name: str, config: dict):
-        tp_key = "tp_size"
-        dp_key = "dp_size"
-        if tp_key in config:
-            config_tp = config[tp_key]
-            if getattr(parallel_config, "is_heterogeneous_tp", False):
-                # The extra config describes the logical remote pool layout
-                # (e.g. prefill dp4/tp4).  The local instance is heterogeneous
-                # (dp0 tp=3, dp1..3 tp=4), so accept the pool tp_size as long
-                # as it matches one of the per-DP tp sizes; rank selection and
-                # side-channel ports are derived from the real per-DP sizes.
-                local_tp_sizes = sorted(
-                    {
-                        parallel_config.get_tp_size_for_dp(i)
-                        for i in range(parallel_config.data_parallel_size)
-                    }
-                )
-                if config_tp not in local_tp_sizes:
-                    raise ValueError(
-                        f"KV transfer '{name}' config has an incompatible "
-                        f"tensor parallel size. Expected one of the "
-                        f"heterogeneous per-DP tp sizes {local_tp_sizes}, "
-                        f"but got {config_tp}."
-                    )
-            else:
-                vllm_tp = parallel_config.tensor_parallel_size
-                if config_tp != vllm_tp:
-                    raise ValueError(
-                        f"KV transfer '{name}' config has a conflicting tensor parallel size. "
-                        f"Expected {vllm_tp}, but got {config_tp}."
-                    )
-        if dp_key in config:
-            config_dp = config[dp_key]
-            vllm_dp = parallel_config.data_parallel_size
-            if config_dp != vllm_dp:
-                raise ValueError(
-                    f"KV transfer '{name}' config has a conflicting data parallel size. "
-                    f"Expected {vllm_dp}, but got {config_dp}."
-                )
+        for key, attr in (
+            ("tp_size", "tensor_parallel_size"),
+            ("dp_size", "data_parallel_size"),
+        ):
+            if key not in config:
+                continue
+            config_value = int(config[key])
+            allowed = _allowed_parallel_values(key)
+            if config_value in allowed:
+                continue
+            raise ValueError(
+                f"KV transfer '{name}' config has a conflicting "
+                f"{attr}. Expected one of {sorted(allowed)}, "
+                f"but got {config_value}."
+            )
 
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     if kv_transfer_config is None:

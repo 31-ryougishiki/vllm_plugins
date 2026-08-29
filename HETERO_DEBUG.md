@@ -484,6 +484,27 @@ git -C vllm_plugins diff HEAD
   单请求与 hetero_cp golden 逐 token 对比。若仍乱码，再按 §4.11 表
   继续查 custom-op / MoE 整段拷贝的 globals 注入。
 
+### 4.13 D 端单独缩容重启报 `KV transfer 'decode' config has a conflicting data parallel size. Expected 15, but got 16`（已修复，待 A3 复测）
+
+- 现象：decode 节点 DP16TP1 坏 1 卡缩容到 DP15TP1，PD_REBUILD 重启
+  worker 时 draft model 构造 `VllmConfig` 失败，pydantic 报
+  KV transfer decode `dp_size=16` 与当前 `data_parallel_size=15` 冲突。
+- 根因：`patch_hetero_ascend_config._patched_check_kv_extra_config`
+  只对**异构 TP** 放行了 tp_size；dp_size 仍严格要求与当前
+  `parallel_config.data_parallel_size` 相等。kv extra config 里的
+  `decode.dp_size=16` 描述的是原始远端池布局，D 缩容后本地 dp=15，
+  校验误判为冲突。
+- 修复：校验的允许集合改为：
+  1. 当前 `tensor_parallel_size/data_parallel_size`；
+  2. 异构 TP 时所有 per-DP tp_size；
+  3. `additional_config["zero_interrupt_config"].engine_parallel_config`
+     中的 `tp/dp` 与 `new_tp/new_dp`（正值）。
+  因此 DP16→15 时 `16` 和 `15` 都合法；无策略启动时的真正 mismatch
+  仍会 fail-closed。
+- 回归：新增
+  `vllm_ascend/patch/tests/test_patch_hetero_ascend_config.py`，
+  覆盖 D 缩容放行、无策略 mismatch 拒绝、P 异构 tp 放行三个场景。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
