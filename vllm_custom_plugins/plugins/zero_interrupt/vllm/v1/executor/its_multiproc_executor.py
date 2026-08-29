@@ -130,6 +130,13 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         # Initialize ITS-specific components
         self._its_enabled = True
 
+        # Executor id assigned by DecisionMakingCenter during
+        # /init_executor_state. The center-generated id
+        # (exe-<service>-<engine>-<n>) is used in every strategy payload and
+        # deploy-status report; the local numeric data_parallel_rank remains
+        # valid only for the old manual trigger scripts.
+        self._decision_center_executor_id: str | None = None
+
         # Configuration
         self._fault_keep_enabled = VLLM_ITS_ENABLE_FAULT_KEEP
         self._http_port = VLLM_ITS_HTTP_SERVER_PORT_START
@@ -360,11 +367,21 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                          f"enable_expert_parallel={engine_parallel_config.enable_expert_parallel}")
 
             # 2. 获取 PD 角色
-            # 从 kv_transfer_config.kv_role 获取，默认为 None
-            engine_pd_role = None
+            # DecisionMakingCenter 的 StrategyOptimizer 只把
+            # EXECUTOR_PD_ROLE_MAP == "P_ROLE" 的 executor 纳入 P-Engine 寻优，
+            # 而 vLLM kv_transfer_config 里的值是 kv_producer/kv_consumer。
+            # 这里转换为决策中心约定的 P_ROLE/D_ROLE，避免上报后寻优把
+            # prefill executor 全部过滤掉。
+            engine_pd_role = ""
             kv_transfer_config = getattr(self.vllm_config, "kv_transfer_config", None)
             if kv_transfer_config and hasattr(kv_transfer_config, "kv_role"):
-                engine_pd_role = kv_transfer_config.kv_role
+                kv_role = kv_transfer_config.kv_role
+                if kv_role == "kv_producer":
+                    engine_pd_role = "P_ROLE"
+                elif kv_role == "kv_consumer":
+                    engine_pd_role = "D_ROLE"
+                else:
+                    engine_pd_role = kv_role
             logger.debug(f"Instance PD role: {engine_pd_role}")
 
             # 3. 构建执行器地址
@@ -435,14 +452,30 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             logger.info(f"##########vllm_config: {self.vllm_config}")
 
             logger.info("Reporting init state to decision center...")
-            success = self._decision_center_client.report_init_state(self.init_executor_state_request)
+            assigned_executor_id = (
+                self._decision_center_client.report_init_state_with_executor_id(
+                    self.init_executor_state_request
+                )
+            )
 
-            if success:
+            if assigned_executor_id:
+                self._decision_center_executor_id = assigned_executor_id
+                if self._http_server is not None:
+                    self._http_server.add_expected_executor_id(
+                        assigned_executor_id
+                    )
                 logger.info(
-                    f"Successfully reported init state to decision center: {asdict(self.init_executor_state_request)}")
+                    "Successfully reported init state to decision center: "
+                    "assigned executor_id=%s; payload=%s",
+                    assigned_executor_id,
+                    asdict(self.init_executor_state_request),
+                )
             else:
                 logger.warning(
-                    f"Failed to report init state to decision center: {asdict(self.init_executor_state_request)}")
+                    "Failed to report init state to decision center (no "
+                    "executor_id returned): %s",
+                    asdict(self.init_executor_state_request),
+                )
 
         except Exception as e:
             logger.error(f"Error reporting init state: {e}", exc_info=True)
@@ -2115,13 +2148,23 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
     def _report_deploy_status(self, strategy: DeployStrategy, state: DeployState) -> None:
         """Report deployment status to decision center.
 
+        DecisionMakingCenter waits for ``report_deploy_status`` keyed by the
+        executor id it generated during ``/init_executor_state``
+        (``exe-<service>-<engine>-<n>``), not by the local numeric
+        data_parallel_rank. Prefer the registered id; fall back to the
+        strategy's top-level executor_id for manual trigger testing.
+
         Args:
             state: Deployment state
         """
         try:
             if self._decision_center_client:
+                executor_id = (
+                    self._decision_center_executor_id
+                    or str(strategy.executor_id)
+                )
                 self._decision_center_client.report_deploy_status(
-                    executor_id=str(strategy.executor_id),
+                    executor_id=executor_id,
                     deploy_state=state,
                     update_engine_info=strategy.update_engine_info
                 )

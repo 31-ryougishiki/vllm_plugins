@@ -52,6 +52,13 @@ class ITSHttpServer:
             if expected_executor_id is None
             else str(expected_executor_id)
         )
+        # DecisionMakingCenter assigns ``exe-<service>-<engine>-<n>`` during
+        # /init_executor_state registration. Strategies delivered by the
+        # center use that id, while the test scripts keep posting the local
+        # numeric data_parallel_rank. Accept both.
+        self.accepted_executor_ids: set[str] = set()
+        if self.expected_executor_id is not None:
+            self.accepted_executor_ids.add(self.expected_executor_id)
         self._app = FastAPI(title="ITS Executor API", version="1.0.0")
         self._server_thread: threading.Thread | None = None
         self._running = False
@@ -70,6 +77,23 @@ class ITSHttpServer:
         """
         self.strategy_sync_thread = strategy_sync_thread
         logger.info("Strategy sync thread reference set")
+
+    def add_expected_executor_id(self, executor_id: Any) -> None:
+        """Accept strategies addressed to an additional executor id.
+
+        DecisionMakingCenter registers every executor and returns a generated
+        id such as ``exe-<service_id>-<engine_uid>-<count>``. After the init
+        report completes, this id must be accepted by the deploy endpoint in
+        addition to the local numeric data_parallel_rank.
+        """
+        if executor_id is None:
+            return
+        self.accepted_executor_ids.add(str(executor_id))
+        logger.info(
+            "ITS HTTP server now accepts executor_id=%s (all accepted: %s)",
+            executor_id,
+            sorted(self.accepted_executor_ids),
+        )
 
     def _setup_routes(self) -> None:
         """Setup FastAPI routes."""
@@ -128,15 +152,15 @@ class ITSHttpServer:
                 # _get_engine_parallel_config silently pick another DP's
                 # topology and restart with the wrong tp/dp/rank offset.
                 if (
-                    self.expected_executor_id is not None
-                    and str(strategy.executor_id) != self.expected_executor_id
+                    self.accepted_executor_ids
+                    and str(strategy.executor_id) not in self.accepted_executor_ids
                 ):
                     raise HTTPException(
                         status_code=400,
                         detail=(
                             "executor_id mismatch: strategy is for "
-                            f"'{strategy.executor_id}', this executor is "
-                            f"'{self.expected_executor_id}'"
+                            f"'{strategy.executor_id}', this executor accepts "
+                            f"{sorted(self.accepted_executor_ids)}"
                         ),
                     )
 

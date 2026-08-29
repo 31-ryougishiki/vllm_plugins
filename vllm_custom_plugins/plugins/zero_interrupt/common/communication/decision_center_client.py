@@ -121,6 +121,30 @@ class DecisionCenterClient:
             logger.error(f"Request to {url} failed after {self.max_retries} retries: {e}")
             raise
 
+    def _post_init_executor_state(
+        self,
+        init_executor_state_request: InitExecutorStateRequest,
+    ) -> dict[str, Any] | None:
+        """POST /init_executor_state and return the response body.
+
+        ``None`` means the request failed (the exception is already logged).
+        """
+        request_data = asdict(init_executor_state_request)
+        logger.debug(f"Request payload: {request_data}")
+        try:
+            return self._make_request(
+                "POST",
+                API_INIT_EXECUTOR_STATE,
+                request_data,
+            )
+        except requests.RequestException as e:
+            logger.error(
+                "Failed to report init state to decision center: %s",
+                e,
+                exc_info=True,
+            )
+            return None
+
     def report_init_state(
             self,
             init_executor_state_request: InitExecutorStateRequest,
@@ -154,25 +178,44 @@ class DecisionCenterClient:
         logger.info("Reporting init state to decision center")
         logger.debug(f"Init executor state request: {init_executor_state_request}")
 
-        try:
-            # 将请求对象转换为字典
-            request_data = asdict(init_executor_state_request)
-            logger.debug(f"Request payload: {request_data}")
-
-            # 发送 POST 请求到决策中心
-            response = self._make_request(
-                "POST",
-                API_INIT_EXECUTOR_STATE,
-                request_data
-            )
-
-            logger.info(f"Successfully reported init state to decision center")
-            logger.debug(f"Response from decision center: {response}")
-            return True
-
-        except requests.RequestException as e:
-            logger.error(f"Failed to report init state to decision center: {e}", exc_info=True)
+        response = self._post_init_executor_state(init_executor_state_request)
+        if response is None:
             return False
+
+        logger.info("Successfully reported init state to decision center")
+        logger.debug(f"Response from decision center: {response}")
+        return True
+
+    def report_init_state_with_executor_id(
+        self,
+        init_executor_state_request: InitExecutorStateRequest,
+    ) -> str | None:
+        """Report init state and return the executor_id assigned by the center.
+
+        DecisionMakingCenter generates ``exe-<service_id>-<engine_uid>-<n>``
+        and returns it in the JSON body of ``/init_executor_state``. Every
+        strategy and deploy-status report must use this assigned id; the
+        local numeric ``data_parallel_rank`` is not known to the center.
+
+        Returns:
+            The assigned executor id, or ``None`` when the request failed or
+            the response has no executor_id.
+        """
+        response = self._post_init_executor_state(init_executor_state_request)
+        if not response:
+            return None
+        executor_id = response.get("executor_id")
+        if executor_id is None:
+            logger.warning(
+                "Decision center response has no executor_id: %s",
+                response,
+            )
+            return None
+        logger.info(
+            "Decision center assigned executor_id=%s",
+            executor_id,
+        )
+        return str(executor_id)
 
     def report_deploy_status(
             self,
