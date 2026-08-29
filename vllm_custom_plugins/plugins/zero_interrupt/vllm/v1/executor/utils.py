@@ -1,6 +1,42 @@
 import logging
+from collections import deque
+from collections.abc import Sequence
 
 logger = logging.getLogger("vllm_custom_plugins")
+
+
+class BarrierPortPool:
+    """Round-robin pool of pre-reserved barrier rendezvous ports.
+
+    Every full-restart barrier needs a fresh TCPStore port while the current
+    ``engine_core.dp_group`` (which occupies the port used by the previous
+    barrier) is still alive.  A two-slot pool is sufficient for sequential
+    degrade/recover cycles: each successful barrier destroys the group built
+    one generation earlier, so alternating between two ports guarantees the
+    selected port is free.
+
+    All DP executors, including scale-to-zero executors that skip the
+    barrier itself, must call :meth:`next_port` once per full-restart
+    generation.  This keeps every executor aligned on the same port for the
+    next RECOVER barrier.
+    """
+
+    def __init__(self, ports: Sequence[int] | None = None) -> None:
+        self._ports = deque(int(port) for port in (ports or []))
+
+    def __len__(self) -> int:
+        return len(self._ports)
+
+    def next_port(self) -> int:
+        """Return the next port and rotate it to the end of the queue."""
+        if not self._ports:
+            raise RuntimeError(
+                "No reserved barrier ports left; initialize the pool before "
+                "the first full-restart barrier."
+            )
+        port = int(self._ports[0])
+        self._ports.rotate(-1)
+        return port
 
 
 def _find_engine_parallel_config(zero_interrupt_config):

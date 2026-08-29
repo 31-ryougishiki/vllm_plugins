@@ -8,10 +8,10 @@ This module provides the ITS (Intelligent Transform Service) implementation
 of MultiprocExecutor with fault keep and deployment strategy execution.
 """
 from __future__ import annotations
-import copy
 import json
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -34,6 +34,7 @@ from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import model_parallel_is_initialized
 from vllm.distributed.utils import (
     stateless_destroy_torch_distributed_process_group,
+    stateless_init_torch_distributed_process_group,
 )
 from vllm.utils.network_utils import get_ip, get_loopback_ip, get_open_port, get_distributed_init_method
 from vllm.utils.system_utils import get_mp_context
@@ -54,6 +55,7 @@ from vllm_custom_plugins.plugins.zero_interrupt.common.types import DeployState,
 
 from vllm_custom_plugins.plugins.zero_interrupt.common.communication.decision_center_client import DecisionCenterClient
 from vllm_custom_plugins.plugins.zero_interrupt.vllm.v1.executor.utils import (
+    BarrierPortPool,
     get_global_start_rank,
     get_heterogeneous_dp_config,
     get_surviving_dp_barrier_geometry,
@@ -140,6 +142,27 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         # Configuration
         self._fault_keep_enabled = VLLM_ITS_ENABLE_FAULT_KEEP
         self._http_port = VLLM_ITS_HTTP_SERVER_PORT_START
+
+        # Full-restart barriers create a new stateless gloo group while the
+        # current engine-core dp_group (and its TCPStore port) must stay
+        # alive.  Reserve two ports from the shared DP port pool *before* the
+        # parent class spawns workers: worker processes get a copy of
+        # ``vllm_config`` and their ``get_next_dp_init_port()`` calls do not
+        # propagate back, so popping the barrier ports here is the only point
+        # where all DP executors can deterministically agree on the same
+        # ports.  The pool rotates, so the port used by the previous barrier
+        # is only reused after that group has been destroyed.
+        self._its_barrier_port_pool = BarrierPortPool()
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.data_parallel_size > 1:
+            barrier_ports = [
+                parallel_config.get_next_dp_init_port() for _ in range(2)
+            ]
+            self._its_barrier_port_pool = BarrierPortPool(barrier_ports)
+            logger.info(
+                "Reserved ITS full-restart barrier ports: %s",
+                barrier_ports,
+            )
 
         # Components (initialized in _init_executor)
         self._http_server: ITSHttpServer | None = None
@@ -798,33 +821,69 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 "Failed to destroy stateless DP group: %s", exc
             )
 
+    def _next_barrier_master_port(self) -> int:
+        """Advance the barrier-port generation and return the port to use.
+
+        All DP executors (including scale-to-zero executors that skip the
+        barrier) must call this exactly once per full-restart generation so
+        that a later RECOVER strategy picks the same port on every executor.
+        """
+        port = self._its_barrier_port_pool.next_port()
+        logger.info(
+            "Full-restart barrier: using reserved barrier master port %d.",
+            port,
+        )
+        return port
+
     def _build_surviving_dp_group(
-        self, surviving_dp_size: int, surviving_dp_rank: int
+        self,
+        surviving_dp_size: int,
+        surviving_dp_rank: int,
+        barrier_master_port: int,
     ):
         """Create a stateless gloo group over the surviving DP executors.
 
-        ``ParallelConfig`` is deep-copied so this method does not mutate the
-        pre-restart ``parallel_config``; that config is still needed by
-        ``_try_backup_origin_parallel_config_when_degrade`` to keep the
-        original symmetric geometry for a later RECOVER strategy. The copied
-        config uses the same pre-allocated DP port list as the original, so
-        all surviving executors deterministically select the same fresh
-        TCPStore port.
+        The barrier port is taken from a pool reserved before the first
+        worker was spawned.  The pre-restart ``parallel_config`` is not
+        mutated, so it is still available to
+        ``_try_backup_origin_parallel_config_when_degrade`` for a later
+        RECOVER strategy.
+
+        ``stateless_init_dp_group()`` pops a port from the shared DP port
+        list itself, but that list is stale in the EngineCore process:
+        workers pop ports on their private ``VllmConfig`` copies, so the
+        parent's next entry is the port still bound by the live worker
+        distributed group.  On top of that only rank 0 sees EADDRINUSE and
+        retries, while ranks > 0 stay on the old port.  Using an explicit
+        reserved port with a pre-bound listen socket avoids both problems.
         """
-        barrier_config = copy.deepcopy(self.parallel_config)
-        barrier_config.data_parallel_size = int(surviving_dp_size)
-        barrier_config.data_parallel_rank = int(surviving_dp_rank)
-        barrier_config.data_parallel_index = int(surviving_dp_rank)
-        if getattr(barrier_config, "nnodes", 1) == 1:
-            barrier_config.data_parallel_rank_local = int(surviving_dp_rank)
-            barrier_config.data_parallel_size_local = int(surviving_dp_size)
+        host = self.parallel_config.data_parallel_master_ip
+        listen_socket: socket.socket | None = None
+        if int(surviving_dp_rank) == 0:
+            listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listen_socket.bind((host, int(barrier_master_port)))
+                listen_socket.listen()
+            except Exception:
+                listen_socket.close()
+                raise
         logger.info(
             "Full-restart barrier: building target dp_group "
-            "world_size=%d rank=%d.",
+            "world_size=%d rank=%d port=%d.",
             surviving_dp_size,
             surviving_dp_rank,
+            barrier_master_port,
         )
-        return barrier_config.stateless_init_dp_group(return_store=True)
+        return stateless_init_torch_distributed_process_group(
+            host,
+            int(barrier_master_port),
+            int(surviving_dp_rank),
+            int(surviving_dp_size),
+            backend="gloo",
+            return_store=True,
+            listen_socket=listen_socket,
+        )
 
     def _mark_scale_to_zero_dp_excluded(self) -> None:
         """Stop the idle (scale-to-zero) EngineCore from using the old dp_group.
@@ -927,6 +986,12 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 raise
 
             if surviving_dp_size == 0:
+                # Advance the barrier port generation even though this
+                # executor does not join the rendezvous.  Healthy executors
+                # advance once when they build the survivor group; if this
+                # executor skipped that advance, a later RECOVER would pick
+                # a different barrier port and deadlock.
+                self._next_barrier_master_port()
                 logger.info(
                     "Full-restart barrier skipped: executor_id=%s is "
                     "scale-to-zero and cleans up independently.",
@@ -995,10 +1060,14 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     surviving_dp_size,
                 )
             # This must happen before `_get_engine_parallel_config` mutates
-            # parallel_config, hence the deep-copied renumbered config in
-            # `_build_surviving_dp_group`.
+            # parallel_config.  The reserved port rotates once per barrier
+            # generation, so the previous barrier's still-live dp_group never
+            # occupies the port selected here.
+            barrier_master_port = self._next_barrier_master_port()
             barrier_group, barrier_store = self._build_surviving_dp_group(
-                surviving_dp_size, surviving_dp_rank
+                surviving_dp_size,
+                surviving_dp_rank,
+                barrier_master_port,
             )
             temporary_group = True
 

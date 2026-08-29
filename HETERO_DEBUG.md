@@ -53,7 +53,7 @@
 | 异构重启后主模型输出乱码 | 🔧 已定位根因并修复（待 A3 复测） | DP0 v1 linear weight_loader 未按 `[2,1,1]` 取累计 offset；§4.12 |
 | PD 场景 1（P 转异构、D 不变） | 🔧 脚本已建，链路已打通；仍有输出污染/端口问题待复测 | trigger ITS 端口需预检；代理 warmup 需覆盖全部 decoder；§4.15 修复 scheduler KV |
 | PD 场景 2（D 坏 1 卡、P 不变） | 🔧 脚本已建；缩容重启修复已提交，待 A3 复测 | barrier 超时、scale-to-zero、KV extra dp 校验已修；§4.13/§4.14 |
-| D 单机 DP16TP1→DP15TP1 重启 | 🔧 存活组 barrier 方案已提交，待 A3 复测 | 存活 executor 用重新编号的 15-rank gloo group barrier 并替换 dp_group，不再等待 dp15（§4.16） |
+| D 单机 DP16TP1→DP15TP1 重启 | 🔧 存活组 barrier 方案已提交；本次 dp0.log 建组端口冲突已修复，待 A3 复测 | 存活 executor 用重新编号的 15-rank gloo group barrier 并替换 dp_group，不再等待 dp15（§4.16）；barrier 改用预留轮转端口 + rank0 预 bind（§4.19） |
 | RECOVER（P 异构→对称、D DP15→DP16） | 🔧 控制面与场景脚本已提交，待 A3 复测 | 纯 DP 恢复也会全量 barrier；目标 16-rank dp_group 重建后统一重启（§4.17） |
 | DecisionMakingCenter 适配 | 🔧 executor_id/role/上报已对齐，待 A3 联调 | 注册返回的 `exe-...` id 用于策略校验与状态上报；P/D role 转 P_ROLE/D_ROLE；场景脚本改用 DC 触发（§4.18） |
 | 重启后“答非所问” | 🔧 根因已定位并修复（待 A3 复测） | scheduler 端 KVCacheManager 未重建，旧 block pool 污染新请求；§4.15 |
@@ -105,9 +105,10 @@ eb23da3 fix(linear): load Ascend linears with ratio-aware offsets under hetero T
    - D：16 个 executor 全部 `Full-restart barrier passed`（恢复的 dp15
      **不是** skipped）、16 个 `/health` 就绪；
    - 代理重新加入 decoder15，恢复后输出与降级前基线一致。
-5. 遗留：故障 executor **永久不可达**场景由 §4.16 修复——存活组 barrier
-   不包含 scale-to-zero rank，重启后 EngineCore dp_group 也替换为
-   15-rank 新组。A3 需用“不给 dp15 下发策略”的方式单独回归一次。
+5. 遗留：故障 executor **永久不可达**场景由 §4.16/§4.19 修复——存活组
+   barrier 不包含 scale-to-zero rank，barrier 端口也不再依赖 dp15；
+   `trigger_decode_fault.sh` 对 dp15 已改为 best-effort。A3 需用
+   “dp15 ITS HTTP 拒绝连接”的方式单独回归一次。
 
 ---
 
@@ -644,8 +645,9 @@ git -C vllm_plugins diff HEAD
      `self.parallel_config` 仍是旧 `dp=16`；
   2. 直接用旧配置调 `stateless_init_dp_group()`，建的是 16-rank 组，
      而 rank15 已被排除、永远不会连接，gloo rendezvous 卡死；
-  3. `Address already in use. Retrying with a new port.` 只是表象，
-     真正卡点是 group init 等待缺席的 rank15。
+  3. `Address already in use. Retrying with a new port.` 当时被当成表象；
+     后经 §4.19 复测定位，它本身也是实打实的建组卡点（存活组弹到了
+     worker 仍在占用的端口，且只有 rank0 会重试），两个问题叠加。
 - 修复（commit 67fa13b）：
   1. 新增
      `get_surviving_dp_barrier_geometry()`：从策略算出存活 executor 的
@@ -667,13 +669,16 @@ git -C vllm_plugins diff HEAD
      末位剔除、中间 rank 剔除后的重新编号、scale-to-zero 分支和
      `new_dp` 不一致 fail-closed。
 - A3 复测关键日志：
-  - dp0-14：`building surviving-executor group world_size=15 rank=<0..14>` →
-    `Full-restart barrier passed` →
+  - dp0-14：`Reserved ITS full-restart barrier ports`（启动期）→
+    `using reserved barrier master port <p>` →
+    `building target dp_group world_size=15 rank=<0..14> port=<p>` →
+    `waiting for 1/15` → `Full-restart barrier passed` →
     `Adopted surviving dp_group world_size=15 rank=<0..14>`；
   - dp15：`scale-to-zero and cleans up independently`，稍后
-    `Idle mode (dp=0)`；
-  - 重启后发请求，`grep -R "Address already in use"` 若出现 1 次
-    `Retrying with a new port.` 属正常重试，但**必须**在数秒内继续。
+    `Idle mode (dp=0)`（若不可达则为可选）；
+  - `grep -R "Address already in use"` 不应再出现在 barrier 之后；若
+    出现，说明预留端口被外部进程占用，应按 §4.19 的预 bind 逻辑快速
+    失败而不是换端口继续。
 - 注意事项：
   - `_build_surviving_dp_group` 在 barrier 前创建新 group，此时旧 group
     仍存活（不能先拆：还有 DP 可能卡在业务同步里）。新旧两组互不干扰，
@@ -773,6 +778,53 @@ git -C vllm_plugins diff HEAD
     `Received deployment strategy ... executor_id=exe-...`；
   - 恢复时一次 `repair_devices.sh 7.246.78.75:3 7.246.78.76:15`，
     决策中心确认服务无坏卡后自动下发 RECOVER。
+
+### 4.19 D 单机复测：存活组 barrier 建组端口与 worker 端口冲突（已修复，待 A3 复测）
+
+- 现象（本次 `run_decode_fault_alone.sh`，dp0.log）：
+  - 10:55:56 已进入
+    `Full-restart barrier: excluding scale-to-zero executor ranks, building
+    surviving-executor group world_size=15 rank=0.`；
+  - 紧接着 `parallel.py:728 Address already in use. Retrying with a new
+    port.`；
+  - 之后既无 `waiting for 1/15` 也无 `Full-restart barrier passed`。
+- 根因：`_build_surviving_dp_group()` 原来 deepcopy 父进程
+  `parallel_config` 后调用 `stateless_init_dp_group()`，让
+  `get_next_dp_init_port()` 从父进程的端口 list 弹端口。但：
+  1. worker 是独立进程，它在 `VllmConfig` 副本上调
+     `get_next_dp_init_port()` 建 worker 全局组；这次 pop **不会回写**
+     EngineCore 父进程的 list；
+  2. 因此父进程 list 头部的下一个端口，正是仍被老 worker 全局组占用的
+     TCPStore 端口；
+  3. stateless gloo 组里只有 rank0 会 bind 端口：rank0 弹到占用端口后
+     自己重试换新端口，rank1..14 却仍在旧端口上 rendezvous，15 个 rank
+     被拆成两个组永久等待。
+- 修复：
+  1. 新增 `BarrierPortPool`（executor/utils.py）：两端口轮转。每次全量
+     barrier 消耗一个 generation，上一代 barrier 建出的 dp_group 在下一
+     代成功后被销毁，所以两端口交替即可保证所选项始终空闲。
+  2. `ITSMultiprocExecutor.__init__` 在 `super().__init__()`（即启动
+     worker）**之前**，从各 DP 共享的
+     `_data_parallel_master_port_list` 预留两个端口。这是唯一能让所有
+     EngineCore 进程确定性拿到同一组端口的时机。
+  3. `_build_surviving_dp_group()` 不再弹 list，改为使用显式预留端口；
+     survivor rank0 先 bind+listen，再调用
+     `stateless_init_torch_distributed_process_group(..., listen_socket=...)`，
+     避免 rank0 单独重试导致 rendezvous 分裂。
+  4. scale-to-zero executor 虽跳过 barrier，也调用一次 `next_port()`，
+     保证后续 RECOVER 时所有 executor 仍在同一端口 generation 上。
+  5. `trigger_decode_fault.sh` 对故障 executor 只做 best-effort POST 且
+     不等待其 marker；健康 executor 收不到故障节点策略也能完成缩容。
+- 回归：
+  - `test_hetero_utils.py` 新增 `TestBarrierPortPool`：两端口轮转、
+    空池 fail-closed、端口 int 归一化；
+  - A3 复测关键日志：dp0-14 出现
+    `using reserved barrier master port <p>` →
+    `building target dp_group ... port=<p>` → `waiting for 1/15` →
+    `Full-restart barrier passed`；不应出现
+    `Address already in use` 后永久停住。
+  - 另需按 §0 第 5 条，用“只给 dp0-14 下发策略、dp15 连不上”的方式
+    单独回归一次。
 
 ## 5. 异构重启流程要点（0.23 适配结论）
 
@@ -891,7 +943,7 @@ grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应�
 | D 缩容重启 worker 报 `KV transfer 'decode' config has a conflicting data parallel size. Expected 15, but got 16` | kv extra config 描述原始池 dp16，校验只认当前 dp15 | 已修复（§4.13，允许 current/strategy 中的 dp/tp） |
 | D 缩容 barrier 120s 超时；dp15 晚 4 分钟才进策略 | 故障卡 worker 卡在 NPU task（约 234s），旧 barrier 超时太短 | 已修复（存活组 barrier 不等待 dp15；§4.14/§4.16） |
 | dp15 scale-to-zero executor 报 `ZeroDivisionError` | `is_heterogeneous_restart()` 把 `new_tp=0` 当 TP 变化，`get_tp_asymmetric_shardings()` 对 0 做除法 | 已修复（忽略 `new_tp<=0`；zero 返回 `[]`，§4.14） |
-| 尝试“存活 executor 单独 barrier group”后卡住 | 首次实装仍用旧 `dp=16` parallel_config 建组，rank15 缺席使 gloo rendezvous 永久等待；`Address already in use` 只是重试日志 | 已修复（deepcopy + 重新编号 dp=15，barrier 后替换 EngineCore dp_group；§4.16） |
+| 尝试“存活 executor 单独 barrier group”后卡住 | 首次实装仍用旧 `dp=16` parallel_config 建组，rank15 缺席使 gloo rendezvous 永久等待；后确认 67fa13b 版本还会弹到 worker 占用的端口，且只有 rank0 重试导致 rendezvous 分裂 | 已修复（重新编号 dp=15 + 预留轮转 barrier 端口 + rank0 预 bind；§4.16/§4.19） |
 | RECOVER DP15→DP16 健康 executor 不 barrier / 恢复 executor 在旧 16-rank group 上死等 | RECOVER 判断只看 TP；纯 DP 恢复被误判为单实例重启，而 EngineCore dp_group 已经变成 15/16 两套 | 已修复（`recover_requires_full_restart` 比较 backup/current/target dp；目标组重建后统一 barrier；§4.17） |
 | 决策中心下发策略被 executor 以 executor_id mismatch 拒绝 / 部署状态上报后 Handler 不结束 | 插件丢弃 `/init_executor_state` 返回的 `exe-...` id，HTTP 只认本地数字 rank，状态上报也上报数字 id | 已修复（保存 exe id、HTTP 接受双 id、上报优先 exe id；§4.18） |
 | 决策中心寻优无 P-Engine（`无 P-Role Executors`） | 插件把 `kv_producer` 原样上报，而决策中心只认 `P_ROLE` | 已修复（上报时 kv_producer→P_ROLE、kv_consumer→D_ROLE；§4.18） |

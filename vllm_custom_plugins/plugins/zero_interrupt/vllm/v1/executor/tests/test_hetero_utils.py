@@ -13,6 +13,7 @@ _spec = importlib.util.spec_from_file_location(
 _utils = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_utils)
 
+BarrierPortPool = _utils.BarrierPortPool
 get_global_start_rank = _utils.get_global_start_rank
 get_global_world_size = _utils.get_global_world_size
 get_heterogeneous_dp_config = _utils.get_heterogeneous_dp_config
@@ -293,6 +294,27 @@ class TestHeteroUtils(unittest.TestCase):
                 target_dp=16,
             )
         )
+
+
+class TestBarrierPortPool(unittest.TestCase):
+    def test_two_slot_pool_alternates(self):
+        pool = BarrierPortPool([31001, 31002])
+        # Degrade barrier uses the first port while the old dp_group is still
+        # alive; RECOVER uses the second; the following degrade can reuse the
+        # first because its group was destroyed when RECOVER was adopted.
+        self.assertEqual(
+            [pool.next_port() for _ in range(5)],
+            [31001, 31002, 31001, 31002, 31001],
+        )
+
+    def test_empty_pool_fails_closed(self):
+        with self.assertRaises(RuntimeError):
+            BarrierPortPool().next_port()
+
+    def test_ports_are_normalized_to_int(self):
+        pool = BarrierPortPool(["31001", 31002])
+        self.assertEqual(pool.next_port(), 31001)
+        self.assertEqual(pool.next_port(), 31002)
 
 
 if __name__ == "__main__":
