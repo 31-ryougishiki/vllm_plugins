@@ -751,92 +751,39 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
     def _barrier_for_full_restart(
         self, timeout_seconds: int = VLLM_ITS_STRATEGY_TIMEOUT
     ) -> None:
-        """Barrier across DP executor processes before a full restart.
+        """Barrier across all old DP executor processes before a restart.
 
         DP4TP4 -> DP4TP(3,4,4,4) changes the global worker world from 16 to
         15 ranks and rebuilds every MoE/HCCL communication group.  If one
         executor killed its workers while the others were still serving from
         the old 16-rank world, the old collectives on the healthy executors
-        can fail in an uncontrolled way and the new 15-rank ``init_process_group``
-        can hang forever waiting for ranks that never join.
+        can fail in an uncontrolled way and the new 15-rank
+        ``init_process_group`` can hang forever waiting for ranks that never
+        join.
 
-        For scale-down topologies that shrink some executors to zero
-        (e.g. decode DP16TP1 -> DP15TP1), the executor owning the failed NPU
-        may be stuck in an NPU task for minutes.  Waiting for that executor
-        would block a perfectly healthy restart, so the rendezvous is rebuilt
-        over the surviving executors only; the scale-to-zero executor skips
-        the barrier and cleans up its own worker independently.
+        The engine-core processes share a CPU ``dp_group`` that survives
+        worker restarts.  Use it as a deterministic pre-restart rendezvous.
+        For a decode DP16TP1 -> DP15TP1 restart this waits for the
+        scale-to-zero executor as well; its EngineCore may be blocked in a
+        long NPU task, so the timeout is VLLM_ITS_STRATEGY_TIMEOUT (600s in
+        the test scripts) rather than the old hard-coded 120s.
         """
-        strategy = getattr(self, "current_strategy", None)
-        current_config = (
-            self._get_current_engine_config(strategy)
-            if strategy is not None else None
-        )
-        if current_config is not None and (
-            current_config.new_tp == 0 and current_config.new_dp == 0
-        ):
-            logger.info(
-                "Full-restart barrier skipped: executor_id=%s is "
-                "scale-to-zero and will clean up independently.",
-                strategy.executor_id,
-            )
-            return
-
-        scale_to_zero_ranks = set()
-        if strategy is not None:
-            for conf in strategy.engine_parallel_config:
-                if conf.new_tp == 0 and conf.new_dp == 0:
-                    scale_to_zero_ranks.add(
-                        int(getattr(conf, "data_parallel_rank", 0) or 0)
-                    )
-
         engine_core = getattr(self, "_engine_core_ref", None)
         dp_group = getattr(engine_core, "dp_group", None) if engine_core else None
-        temporary_group = False
-        barrier_group = dp_group
-        if scale_to_zero_ranks:
-            if dp_group is None:
-                logger.warning(
-                    "Full-restart barrier skipped: scale-to-zero topology "
-                    "requires a dp_group to build the surviving-rank group."
-                )
-                return
-            # active executor 的 parallel_config 已经按策略重新编号为
-            # 0..N-1（例如 D 端 16->15 后为 0..14）。用它建一个只包含
-            # 存活 executor 的 stateless gloo group。
-            logger.info(
-                "Full-restart barrier: excluding scale-to-zero executor "
-                "ranks %s, building surviving-executor group.",
-                sorted(scale_to_zero_ranks),
-            )
-            barrier_group = self.parallel_config.stateless_init_dp_group()
-            temporary_group = True
-
-        if barrier_group is None:
+        if dp_group is None:
             logger.info(
                 "Full-restart barrier skipped: no cross-executor DP group."
             )
             return
         try:
-            world_size = int(barrier_group.size())
-            rank_in_dp = int(barrier_group.rank())
+            world_size = int(dp_group.size())
+            rank_in_dp = int(dp_group.rank())
         except Exception as exc:  # defensive: non-torch/stateless group
             logger.warning(
-                "Full-restart barrier skipped: cannot query barrier group "
+                "Full-restart barrier skipped: cannot query dp_group "
                 "size/rank: %s",
                 exc,
             )
-            if temporary_group:
-                try:
-                    from vllm.distributed.utils import (
-                        stateless_destroy_torch_distributed_process_group,
-                    )
-
-                    stateless_destroy_torch_distributed_process_group(
-                        barrier_group
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
             return
         if world_size < 2:
             logger.info(
@@ -844,17 +791,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 "world_size=%d.",
                 world_size,
             )
-            if temporary_group:
-                try:
-                    from vllm.distributed.utils import (
-                        stateless_destroy_torch_distributed_process_group,
-                    )
-
-                    stateless_destroy_torch_distributed_process_group(
-                        barrier_group
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
             return
         logger.info(
             "Full-restart barrier: waiting for %d/%d DP executors to receive "
@@ -863,15 +799,16 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             world_size,
         )
         # Use the exact same collective shape/op as
-        # ParallelConfig.sync_dp_state (two int32 SUM).  That way, if a DP
-        # rank is still inside its `_has_global_unfinished_reqs` all-reduce
-        # when another rank reaches this barrier, the two calls still match
-        # at the gloo level instead of deadlocking against each other.
+        # ParallelConfig.sync_dp_state (two int32 SUM) on the SAME dp_group.
+        # That way, if a DP rank is still inside its
+        # `_has_global_unfinished_reqs` all-reduce when another rank reaches
+        # this barrier, the two calls still match at the gloo level instead
+        # of deadlocking against each other.
         tensor = torch.tensor([0, 0], dtype=torch.int32)
         work = torch.distributed.all_reduce(
             tensor,
             op=torch.distributed.ReduceOp.SUM,
-            group=barrier_group,
+            group=dp_group,
             async_op=True,
         )
         completed = False
@@ -883,21 +820,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             logger.warning(
                 "Full-restart barrier wait raised: %s", exc
             )
-        finally:
-            if temporary_group:
-                try:
-                    from vllm.distributed.utils import (
-                        stateless_destroy_torch_distributed_process_group,
-                    )
-
-                    stateless_destroy_torch_distributed_process_group(
-                        barrier_group
-                    )
-                except Exception as destroy_exc:  # noqa: BLE001
-                    logger.warning(
-                        "Failed to destroy temporary barrier group: %s",
-                        destroy_exc,
-                    )
         if not completed:
             try:
                 work.abort()

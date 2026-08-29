@@ -527,14 +527,18 @@ git -C vllm_plugins diff HEAD
      `ori_tp // asym_tp`。
 - 修复：
   - barrier 超时默认改为 `VLLM_ITS_STRATEGY_TIMEOUT`（A3 脚本默认 600s）；
-  - scale-to-zero executor 不再参与 full-restart barrier：存活 executor
-    用 `parallel_config.stateless_init_dp_group()` 建只含存活 rank 的
-    gloo group 完成 rendezvous，故障 executor 独立清理自己的 worker；
+  - 曾尝试让 scale-to-zero executor 不参与 barrier、存活 executor 新建
+    15-rank stateless gloo group，但 A3 实装后卡在
+    `stateless_init_dp_group()`（`Address already in use` 后无进展），
+    **已回退**：barrier 仍使用旧 16-rank dp_group，只是把超时放到 600s；
   - `is_heterogeneous_restart()` 忽略 `new_tp <= 0` 的 executor：
     纯 DP 缩容不再走 heterogeneous 配置注入；
   - `get_tp_asymmetric_shardings()` 对 `new_tp <= 0` 直接返回 `[]`；
   - 回归：`vllm/v1/executor/tests/test_hetero_utils.py` 新增
     “pure DP scale-to-zero is not heterogeneous” 用例。
+  - 遗留风险：若故障 executor 永久不可达，barrier 仍会在 600s 后失败；
+    真正的“不等待故障 rank”方案需要后续重构 EngineCore 的旧 dp_group
+    同步/拆除顺序。
 
 ### 4.15 重启后“回答通顺但答非所问”（scheduler KV cache 未重建，已修复待 A3 复测）
 
