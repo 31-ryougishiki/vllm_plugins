@@ -1821,6 +1821,27 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
         try:
             self.executor_state = ExecutorState.RECOVERING
+
+            # 决策中心可能重放同一份 RECOVER（strategy_sync 会转发重复策略）。
+            # DP>1 且当前拓扑已经等于目标拓扑时不需要重启：各 executor 的
+            # dp_group / worker world 都是目标布局，重复全量重启反而会在没有
+            # barrier 保护的情况下异步杀 worker。DP=1 没有跨 executor 通信域，
+            # 保留原来的无条件重启语义。
+            if self.parallel_config.data_parallel_size > 1 and (
+                not self._strategy_requires_full_restart(strategy)
+            ):
+                logger.info(
+                    "RECOVER strategy matches current topology "
+                    "(dp=%s, tp=%s); skipping redundant worker restart.",
+                    self.parallel_config.data_parallel_size,
+                    self.parallel_config.tensor_parallel_size,
+                )
+                self.executor_state = ExecutorState.RUNNING
+                self._report_deploy_status(
+                    strategy, DeployState.EXECUTOR_DEPLOY_SUCCESS
+                )
+                return True
+
             self._cleanup_and_restart_workers()
 
             # dp=0 场景：空转状态
