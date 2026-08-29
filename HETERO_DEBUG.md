@@ -527,6 +527,9 @@ git -C vllm_plugins diff HEAD
      `ori_tp // asym_tp`。
 - 修复：
   - barrier 超时默认改为 `VLLM_ITS_STRATEGY_TIMEOUT`（A3 脚本默认 600s）；
+  - scale-to-zero executor 不再参与 full-restart barrier：存活 executor
+    用 `parallel_config.stateless_init_dp_group()` 建只含存活 rank 的
+    gloo group 完成 rendezvous，故障 executor 独立清理自己的 worker；
   - `is_heterogeneous_restart()` 忽略 `new_tp <= 0` 的 executor：
     纯 DP 缩容不再走 heterogeneous 配置注入；
   - `get_tp_asymmetric_shardings()` 对 `new_tp <= 0` 直接返回 `[]`；
