@@ -23,13 +23,14 @@
 | 异构重启后主模型输出乱码 | 🔧 已定位根因并修复（待 A3 复测） | DP0 v1 linear weight_loader 未按 `[2,1,1]` 取累计 offset；§4.12 |
 | PD 场景 1（P 转异构、D 不变） | 🔧 脚本已建，链路已打通；仍有输出污染/端口问题待复测 | trigger ITS 端口需预检；代理 warmup 需覆盖全部 decoder；§4.15 修复 scheduler KV |
 | PD 场景 2（D 坏 1 卡、P 不变） | 🔧 脚本已建；缩容重启修复已提交，待 A3 复测 | barrier 超时、scale-to-zero、KV extra dp 校验已修；§4.13/§4.14 |
-| D 单机 DP16TP1→DP15TP1 重启 | 🔧 控制面修复已提交，待复测 | active-only barrier 方案卡住已回退，当前用 600s 超时等待故障 executor |
+| D 单机 DP16TP1→DP15TP1 重启 | 🔧 存活组 barrier 方案已提交，待 A3 复测 | 存活 executor 用重新编号的 15-rank gloo group barrier 并替换 dp_group，不再等待 dp15（§4.16） |
 | 重启后“答非所问” | 🔧 根因已定位并修复（待 A3 复测） | scheduler 端 KVCacheManager 未重建，旧 block pool 污染新请求；§4.15 |
 | PD / Mooncake engine_id 轮换链路 | ✅ P 端已验证；⏳ D 端待验证 | dp0/dp1 均已 `KV connector metadata updated` + recovered 通知 |
 
 ### 本地提交（均已合入 `hetero` 分支）
 
 ```text
+67fa13b fix(executor): barrier over surviving executors and replace dp_group
 44b3694 fix(kv-cache): rebuild scheduler KVCacheManager after worker restart
 2b3fd6f fix(executor): roll back surviving-executor barrier group
 c089cba fix(executor): exclude scale-to-zero executors from full-restart barrier  # 实装卡住，已由 2b3fd6f 回退
@@ -54,15 +55,16 @@ eb23da3 fix(linear): load Ascend linears with ratio-aware offsets under hetero T
 1. 在 A3 重新安装 vllm_plugins wheel，完整重启 P/D 服务后复测：
    - 场景 1：P 转异构、D 不变，确认 `Scheduler KVCacheManager rebuilt`
      日志出现，交叉 prompt 不再答非所问；
-   - 场景 2 / D 单机：`DP16TP1→DP15TP1` 重启 600s 内完成，故障 executor
-     进入 `Idle mode (dp=0)`。
+   - 场景 2 / D 单机：`DP16TP1→DP15TP1` 重启应**秒级完成、不等待 dp15**；
+     健康 dp0-14 日志出现 `Adopted surviving dp_group world_size=15`，
+     故障 executor 稍后独立清理并进入 `Idle mode (dp=0)`。
 2. 场景 1 输出仍需与对称/hetero_cp golden 逐 token 比对；先解决 PD 代理
    recompute 拼接与 all-decoder warmup 问题。
 3. 验证 D 端 Mooncake engine_id 轮换：P 重启后 D 按新
    `(engine_id, handshake_port)` 恢复链路。
-4. 遗留：故障 executor **永久不可达**时当前 barrier 仍会在 600s 超时；
-   排除 scale-to-zero rank 的存活组方案因 stateless gloo 端口冲突回退，
-   后续需重构旧 dp_group 拆除顺序后再做。
+4. 遗留：故障 executor **永久不可达**场景由 §4.16 修复——存活组 barrier
+   不包含 scale-to-zero rank，重启后 EngineCore dp_group 也替换为
+   15-rank 新组。A3 需用“不给 dp15 下发策略”的方式单独回归一次。
 
 ---
 
@@ -548,15 +550,17 @@ git -C vllm_plugins diff HEAD
   - 曾尝试让 scale-to-zero executor 不参与 barrier、存活 executor 新建
     15-rank stateless gloo group，但 A3 实装后卡在
     `stateless_init_dp_group()`（`Address already in use` 后无进展），
-    **已回退**：barrier 仍使用旧 16-rank dp_group，只是把超时放到 600s；
+    **一度回退**为旧 16-rank dp_group + 600s 超时；
+    根因是首次尝试仍用旧 `parallel_config`（dp=16）建组，rank15 缺席，
+    gloo rendezvous 永久等待。§4.16 用重新编号的 15-rank 配置修复；
   - `is_heterogeneous_restart()` 忽略 `new_tp <= 0` 的 executor：
     纯 DP 缩容不再走 heterogeneous 配置注入；
   - `get_tp_asymmetric_shardings()` 对 `new_tp <= 0` 直接返回 `[]`；
   - 回归：`vllm/v1/executor/tests/test_hetero_utils.py` 新增
     “pure DP scale-to-zero is not heterogeneous” 用例。
-  - 遗留风险：若故障 executor 永久不可达，barrier 仍会在 600s 后失败；
-    真正的“不等待故障 rank”方案需要后续重构 EngineCore 的旧 dp_group
-    同步/拆除顺序。
+  - 遗留风险（已由 §4.16 处理）：故障 executor 永久不可达时，存活
+    executor 不再等待它；重启后 EngineCore dp_group 也替换为 15-rank
+    新组，旧的 16-rank group 在 barrier 后本地销毁。
 
 ### 4.15 重启后“回答通顺但答非所问”（scheduler KV cache 未重建，已修复待 A3 复测）
 
@@ -578,6 +582,54 @@ git -C vllm_plugins diff HEAD
 - A3 复测：重装插件 → 重启 D → 用完全不同的 prompt（例如
   `1+1=?`）直连 9100 验证回答不再携带上一次请求（例如量子计算）内容。
 
+### 4.16 D 缩容 barrier 不再等待故障 executor（代码已提交，待 A3 复测）
+
+- 目标：`DP16TP1 -> DP15TP1` 时，dp0-14 不需要等 dp15 从 NPU task
+  timeout 里爬出来；dp15 **永久不可达**也不应阻塞健康 executor 重启。
+- 上次 c089cba 回退根因（见 dp0.log）：
+  1. `_barrier_for_full_restart` 在
+     `_get_engine_parallel_config()` **之前**执行，所以当时的
+     `self.parallel_config` 仍是旧 `dp=16`；
+  2. 直接用旧配置调 `stateless_init_dp_group()`，建的是 16-rank 组，
+     而 rank15 已被排除、永远不会连接，gloo rendezvous 卡死；
+  3. `Address already in use. Retrying with a new port.` 只是表象，
+     真正卡点是 group init 等待缺席的 rank15。
+- 修复（commit 67fa13b）：
+  1. 新增
+     `get_surviving_dp_barrier_geometry()`：从策略算出存活 executor 的
+     新 DP 数、重新编号后的 rank 和 scale-to-zero rank 集合；
+     scale-to-zero executor 返回 `(0, 0, ranks)` 并直接跳过 barrier。
+  2. `_build_surviving_dp_group()` **deepcopy** `parallel_config`，只改
+     `data_parallel_size/data_parallel_rank` 等 DP 几何后建 15-rank
+     stateless gloo 组。原 `parallel_config` 不动，保证
+     `_try_backup_origin_parallel_config_when_degrade()` 仍能备份原始
+     对称配置供 RECOVER 使用。
+  3. barrier 通过后 `_adopt_surviving_dp_group()` 把新 15-rank 组替换成
+     `engine_core.dp_group/dp_store`，再本地销毁旧 16-rank 组。此后
+     EngineCore 的 DP 状态同步（`sync_dp_state_fast_timeout`）也只在
+     15 个健康 executor 上进行。
+  4. scale-to-zero executor 打 `_its_dp_sync_excluded` 标记；
+     `patched_has_global_unfinished_reqs` 对该标记直接返回 False，
+     避免 idle loop 在已无人参与的旧 group 上反复 10s 超时。
+  5. 回归：`test_hetero_utils.py` 新增 geometry 用例，覆盖 DP16→15
+     末位剔除、中间 rank 剔除后的重新编号、scale-to-zero 分支和
+     `new_dp` 不一致 fail-closed。
+- A3 复测关键日志：
+  - dp0-14：`building surviving-executor group world_size=15 rank=<0..14>` →
+    `Full-restart barrier passed` →
+    `Adopted surviving dp_group world_size=15 rank=<0..14>`；
+  - dp15：`scale-to-zero and cleans up independently`，稍后
+    `Idle mode (dp=0)`；
+  - 重启后发请求，`grep -R "Address already in use"` 若出现 1 次
+    `Retrying with a new port.` 属正常重试，但**必须**在数秒内继续。
+- 注意事项：
+  - `_build_surviving_dp_group` 在 barrier 前创建新 group，此时旧 group
+    仍存活（不能先拆：还有 DP 可能卡在业务同步里）。新旧两组互不干扰，
+    旧组只在 barrier 全部通过后才销毁。
+  - 若后续做 `DP15 -> DP16` RECOVER，需要按同样思路重建含 dp15 的
+    EngineCore dp_group；当前 RECOVER 路径尚未在 D 端验证，不要假设旧
+    dp_group 仍可用。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。
@@ -589,6 +641,10 @@ git -C vllm_plugins diff HEAD
    - `_has_global_unfinished_reqs` 也使用该形状（带 10s 超时，超时 abort）。
    - `_barrier_for_full_restart` 也使用 2 个 int32 SUM all_reduce。
    - 这样即使某个 DP 还卡在业务同步中，也不会与 barrier 形状不匹配而交叉死锁。
+   - 存在 scale-to-zero executor 时，存活 executor 改用重新编号后的
+     15-rank stateless gloo 组做 barrier，并在 barrier 后替换
+     `engine_core.dp_group`（§4.16）；scale-to-zero executor 跳过 barrier
+     和后续 DP 状态同步。
 3. **worker 全局 rank 重算**：
    `WorkerProc.rank/local_rank` 保持 DP 内本地 rank；
    全局 torch rank 由替换后的 `init_distributed_environment` 按
@@ -689,9 +745,9 @@ grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应�
 | 真实请求 MTP draft 前向 `inplace_partial_rotary_mul` `dim0 must be equal` | MoE drafter 实际 FlashComm1=True、隐状态按 LCM 分片；draft builder 被错误地跳过 LCM，只用本地 TP 对齐 | 已修复（§4.10） |
 | 异构重启后单请求返回但输出乱码 | DP0 ratios `[2,1,1]` 下 Ascend Row/Merged 线性层继承 stock v1 loader，`start_idx=tp_rank*shard_size` 取错权重行（rank1/2 错位）；vllm linear.py 未替换，v2 parameter patch 对 Ascend 类不生效 | 代码已修复待 A3 复测（§4.12） |
 | D 缩容重启 worker 报 `KV transfer 'decode' config has a conflicting data parallel size. Expected 15, but got 16` | kv extra config 描述原始池 dp16，校验只认当前 dp15 | 已修复（§4.13，允许 current/strategy 中的 dp/tp） |
-| D 缩容 barrier 120s 超时；dp15 晚 4 分钟才进策略 | 故障卡 worker 卡在 NPU task（约 234s），旧 barrier 超时太短 | 已修复（超时改为 `VLLM_ITS_STRATEGY_TIMEOUT=600s`，§4.14） |
+| D 缩容 barrier 120s 超时；dp15 晚 4 分钟才进策略 | 故障卡 worker 卡在 NPU task（约 234s），旧 barrier 超时太短 | 已修复（存活组 barrier 不等待 dp15；§4.14/§4.16） |
 | dp15 scale-to-zero executor 报 `ZeroDivisionError` | `is_heterogeneous_restart()` 把 `new_tp=0` 当 TP 变化，`get_tp_asymmetric_shardings()` 对 0 做除法 | 已修复（忽略 `new_tp<=0`；zero 返回 `[]`，§4.14） |
-| 尝试“存活 executor 单独 barrier group”后卡住 | 新建 stateless gloo group 与旧 dp_group 端口/store 冲突，日志停在 `Address already in use` | 已回退；仍用旧 16-rank dp_group + 600s 超时（§4.14） |
+| 尝试“存活 executor 单独 barrier group”后卡住 | 首次实装仍用旧 `dp=16` parallel_config 建组，rank15 缺席使 gloo rendezvous 永久等待；`Address already in use` 只是重试日志 | 已修复（deepcopy + 重新编号 dp=15，barrier 后替换 EngineCore dp_group；§4.16） |
 | 重启后“输出通顺但答非所问” | EngineCore/scheduler 存活，旧 `KVCacheManager` 未重建，新请求分到旧 block pool 内容 | 已修复（重建 scheduler KVCacheManager 并 rebind connector，§4.15） |
 | 场景1 trigger 全部 `Connection refused` | P 的 ITS HTTP 未监听（缺 fastapi/uvicorn 或未加载 zero_interrupt）；trigger 前应预检 ITS `/health` | 脚本已加预检；环境需装 `fastapi<0.124.0 httpx uvicorn` |
 | 场景1 输出“正常文本 + 无关 JSON 片段” | PD 首次请求 `stop_reason=recomputed`，代理拼接两段 completion；且 warmup 只覆盖一个 decoder | 脚本已修：temperature=0、全 decoder warmup、代理轮转、recomputed 日志 |
