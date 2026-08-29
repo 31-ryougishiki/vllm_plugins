@@ -79,9 +79,11 @@ class TestHeteroUtils(unittest.TestCase):
         cfg = self._strategy()
         cfg["executor_id"] = "0"
         cfg["engine_parallel_config"][0]["tp_asymmetric_shardings"] = None
-        # 4 heads across 3 ranks: [1, 1, 2]
+        # 4 heads across 3 ranks; remainder goes to the lowest rank to match
+        # the DeepSeek-V4 golden topology (DecisionMakingCenter sends no
+        # explicit ratios).
         self.assertEqual(
-            get_tp_asymmetric_shardings(cfg), [1, 1, 2]
+            get_tp_asymmetric_shardings(cfg), [2, 1, 1]
         )
 
     def test_uniform_when_same_tp(self):

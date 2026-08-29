@@ -54,13 +54,16 @@ def get_tp_asymmetric_shardings(zero_interrupt_config):
     if asym_tp == ori_tp:
         return [1] * asym_tp
 
-    # Legacy fallback: distribute old_tp heads evenly across new_tp ranks,
-    # with the remainder assigned to the highest ranks.
+    # Legacy fallback: distribute old_tp heads evenly across new_tp ranks.
+    # DecisionMakingCenter does not send tp_asymmetric_shardings, so the
+    # plugin has to derive it. DeepSeek-V4 golden topology is
+    # old_tp=4 -> new_tp=3 => [2, 1, 1] (rank0 takes the remainder); assign
+    # the remainder to the LOWEST ranks to match hetero_cp.
     base = ori_tp // asym_tp
     remainder = ori_tp % asym_tp
     tp_asymmetric_shardings = [base] * asym_tp
     for i in range(remainder):
-        tp_asymmetric_shardings[asym_tp - 1 - i] += 1
+        tp_asymmetric_shardings[i] += 1
     return tp_asymmetric_shardings
 
 
