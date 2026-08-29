@@ -170,3 +170,110 @@ def _legacy_ratios(ori_tp: int, asym_tp: int) -> list[int]:
     for i in range(remainder):
         ratios[asym_tp - 1 - i] += 1
     return ratios
+
+
+def _original_dp_rank(conf: dict) -> int:
+    """Return the pre-restart DP rank of one engine_parallel_config entry."""
+    rank = conf.get("data_parallel_rank", None)
+    if rank is None:
+        rank = conf.get("executor_id", None)
+    try:
+        return int(rank)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"engine_parallel_config entry has no usable data_parallel_rank: "
+            f"{conf!r}"
+        ) from exc
+
+
+def get_scale_to_zero_dp_ranks(zero_interrupt_config) -> set[int]:
+    """Return the pre-restart DP ranks that a strategy shrinks to zero.
+
+    A scale-to-zero executor is one whose ``new_tp`` and ``new_dp`` are both
+    zero (e.g. decode DP16TP1 -> DP15TP1 executor 15). It owns no worker
+    ranks after the restart and therefore must not participate in the
+    pre-restart full-restart barrier.
+    """
+    scale_to_zero_ranks = set()
+    for conf in zero_interrupt_config.get("engine_parallel_config", []):
+        new_tp = conf.get("new_tp", None)
+        new_dp = conf.get("new_dp", None)
+        if new_tp is None:
+            new_tp = conf.get("tp", 1)
+        if new_dp is None:
+            new_dp = conf.get("dp", 1)
+        if int(new_tp) == 0 and int(new_dp) == 0:
+            scale_to_zero_ranks.add(_original_dp_rank(conf))
+    return scale_to_zero_ranks
+
+
+def get_surviving_dp_barrier_geometry(
+    zero_interrupt_config,
+) -> tuple[int, int, set[int]]:
+    """Compute the pre-restart rendezvous geometry for the surviving ranks.
+
+    Returns ``(surviving_dp_size, surviving_dp_rank, scale_to_zero_ranks)``:
+
+    - ``surviving_dp_size`` is the number of executors that keep workers;
+    - ``surviving_dp_rank`` is this executor's rank in the contiguous
+      renumbered survivor group (used by the stateless gloo barrier and by
+      the replacement engine-core ``dp_group``);
+    - ``scale_to_zero_ranks`` are the original DP ranks excluded from the
+      barrier.
+
+    For the scale-to-zero executor itself the first two values are ``0`` so
+    the caller can skip the barrier.
+    """
+    scale_to_zero_ranks = get_scale_to_zero_dp_ranks(zero_interrupt_config)
+    executor_id = str(zero_interrupt_config.get("executor_id", ""))
+
+    ordered = sorted(
+        zero_interrupt_config.get("engine_parallel_config", []),
+        key=_original_dp_rank,
+    )
+    survivors = []
+    for conf in ordered:
+        new_tp = conf.get("new_tp", None)
+        new_dp = conf.get("new_dp", None)
+        if new_tp is None:
+            new_tp = conf.get("tp", 1)
+        if new_dp is None:
+            new_dp = conf.get("dp", 1)
+        if int(new_tp) == 0 and int(new_dp) == 0:
+            continue
+        survivors.append(conf)
+
+    # Validate that the strategy is internally consistent: every active
+    # executor must agree on the new DP size and it must match the number of
+    # active entries. Otherwise the survivor group would hang waiting for a
+    # rank that the decision center did not intend to keep.
+    expected_new_dp = {
+        int(conf["new_dp"])
+        for conf in survivors
+        if conf.get("new_dp", None) is not None
+    }
+    if expected_new_dp and expected_new_dp != {len(survivors)}:
+        raise ValueError(
+            "engine_parallel_config is inconsistent: active executors "
+            f"declare new_dp={sorted(expected_new_dp)} but only "
+            f"{len(survivors)} active entries were found."
+        )
+
+    for new_rank, conf in enumerate(survivors):
+        if str(conf.get("executor_id", None)) == executor_id:
+            return len(survivors), new_rank, scale_to_zero_ranks
+
+    # The current executor was not among the survivors. Accept that only
+    # when it is one of the scale-to-zero entries; otherwise the strategy is
+    # missing this executor entirely.
+    if any(
+        str(conf.get("executor_id", None)) == executor_id
+        for conf in zero_interrupt_config.get("engine_parallel_config", [])
+        if _original_dp_rank(conf) in scale_to_zero_ranks
+    ):
+        return 0, 0, scale_to_zero_ranks
+
+    raise ValueError(
+        f"executor_id={executor_id!r} was not found in "
+        "engine_parallel_config."
+    )

@@ -157,6 +157,19 @@ def patch_engine_core() -> None:
         world_size = getattr(executor, "world_size", None) if executor else None
         paused = getattr(self, "_paused_for_restart", False)
 
+        # scale-to-zero executor：存活 executor 已经用新的 N-rank dp_group
+        # 取代旧 group，本 executor 没有通信对端。跳过 all_reduce，避免
+        # 每次 DP sync 都等 10s 超时并 abort 一个无人参与的 collective。
+        if (
+            world_size == 0
+            and getattr(self, "_its_dp_sync_excluded", False)
+        ):
+            logger.debug(
+                "_has_global_unfinished_reqs: scale-to-zero executor "
+                "excluded from DP sync, returning False"
+            )
+            return False
+
         # 空闲或暂停时：强制 local_unfinished = False
         if executor and (world_size == 0 or paused):
             local_unfinished = False

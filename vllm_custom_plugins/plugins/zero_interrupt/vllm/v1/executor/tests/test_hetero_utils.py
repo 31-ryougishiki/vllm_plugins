@@ -16,6 +16,8 @@ _spec.loader.exec_module(_utils)
 get_global_start_rank = _utils.get_global_start_rank
 get_global_world_size = _utils.get_global_world_size
 get_heterogeneous_dp_config = _utils.get_heterogeneous_dp_config
+get_scale_to_zero_dp_ranks = _utils.get_scale_to_zero_dp_ranks
+get_surviving_dp_barrier_geometry = _utils.get_surviving_dp_barrier_geometry
 get_tp_asymmetric_shardings = _utils.get_tp_asymmetric_shardings
 is_heterogeneous_restart = _utils.is_heterogeneous_restart
 
@@ -157,6 +159,74 @@ class TestHeteroUtils(unittest.TestCase):
         }
         self.assertFalse(is_heterogeneous_restart(cfg))
         self.assertEqual(get_tp_asymmetric_shardings(cfg), [])
+
+    def test_surviving_dp_barrier_geometry_excludes_scale_to_zero(self):
+        cfg = {
+            "executor_id": "14",
+            "engine_parallel_config": [
+                {"executor_id": str(i), "dp": 16, "tp": 1,
+                 "data_parallel_rank": i, "new_dp": 15, "new_tp": 1}
+                for i in range(15)
+            ] + [
+                {"executor_id": "15", "dp": 16, "tp": 1,
+                 "data_parallel_rank": 15, "new_dp": 0, "new_tp": 0}
+            ],
+        }
+        self.assertEqual(get_scale_to_zero_dp_ranks(cfg), {15})
+        self.assertEqual(
+            get_surviving_dp_barrier_geometry(cfg),
+            (15, 14, {15}),
+        )
+
+    def test_surviving_dp_barrier_geometry_renumbers_after_removed_rank(self):
+        cfg = {
+            "executor_id": "9",
+            "engine_parallel_config": [
+                {"executor_id": str(i), "dp": 16, "tp": 1,
+                 "data_parallel_rank": i, "new_dp": 15, "new_tp": 1}
+                for i in range(16)
+            ],
+        }
+        # Remove original DP rank 4: ranks 5..15 shift down by one.
+        cfg["engine_parallel_config"][4]["new_tp"] = 0
+        cfg["engine_parallel_config"][4]["new_dp"] = 0
+        self.assertEqual(get_scale_to_zero_dp_ranks(cfg), {4})
+        self.assertEqual(
+            get_surviving_dp_barrier_geometry(cfg),
+            (15, 8, {4}),
+        )
+
+    def test_surviving_dp_barrier_geometry_for_zero_executor(self):
+        cfg = {
+            "executor_id": "15",
+            "engine_parallel_config": [
+                {"executor_id": str(i), "dp": 16, "tp": 1,
+                 "data_parallel_rank": i, "new_dp": 15, "new_tp": 1}
+                for i in range(15)
+            ] + [
+                {"executor_id": "15", "dp": 16, "tp": 1,
+                 "data_parallel_rank": 15, "new_dp": 0, "new_tp": 0}
+            ],
+        }
+        self.assertEqual(
+            get_surviving_dp_barrier_geometry(cfg),
+            (0, 0, {15}),
+        )
+
+    def test_surviving_dp_barrier_geometry_rejects_inconsistent_new_dp(self):
+        cfg = {
+            "executor_id": "0",
+            "engine_parallel_config": [
+                {"executor_id": "0", "dp": 16, "tp": 1,
+                 "data_parallel_rank": 0, "new_dp": 14, "new_tp": 1},
+                {"executor_id": "1", "dp": 16, "tp": 1,
+                 "data_parallel_rank": 1, "new_dp": 15, "new_tp": 1},
+                {"executor_id": "2", "dp": 16, "tp": 1,
+                 "data_parallel_rank": 2, "new_dp": 0, "new_tp": 0},
+            ],
+        }
+        with self.assertRaises(ValueError):
+            get_surviving_dp_barrier_geometry(cfg)
 
 
 if __name__ == "__main__":
