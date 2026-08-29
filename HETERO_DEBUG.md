@@ -32,6 +32,7 @@
 ### 本地提交（均已合入 `hetero` 分支）
 
 ```text
+b90a36d fix(executor): derive golden tp_asymmetric_shardings for decision-center strategies
 b65eec8 fix(executor): adapt executor id and role reporting to DecisionMakingCenter
 4b023f8 fix(executor): skip redundant RECOVER restart when topology already matches
 8271053 fix(executor): full-restart barrier and dp_group rebuild for RECOVER
@@ -711,12 +712,20 @@ git -C vllm_plugins diff HEAD
      service id（如 `hetero-test-dp4tp4-dp0`），决策中心会把它们注册成
      多个服务。现在 launch 脚本尊重外部 `VLLM_SERVICE_ID`；
      `decision_center/launch_*_dc.sh` 统一使用 `pd-hetero-service`。
-  5. **决策中心触发脚本**：新增 `vllm_plugins_hetero_test/decision_center/`：
+  5. **tp_asymmetric_shardings 缺省推导**：决策中心策略没有
+     `tp_asymmetric_shardings` 字段，旧 legacy 推导把余数给高 rank
+     （4→3 得 `[1,1,2]`），与 hetero_cp golden 的 `[2,1,1]` 不一致。
+     改为余数给最低 rank：`DP4TP4 -> DP4TP3` 时插件自动得到
+     `[2,1,1]`。
+  6. **决策中心触发脚本**：新增 `vllm_plugins_hetero_test/decision_center/`：
      - `launch_prefill_dc.sh` / `launch_decode_dc.sh`；
      - `trigger_fault.sh <node_ip> <npu_id>`；
      - `repair_devices.sh <node_ip>:<npu_id> ...`；
      - `run_scenario{1,2,3}_dc.sh` 与 `run_all_dc.sh`；
-     - 原 `run_scenario{1,2,3}.sh` 增加 `TRIGGER_MODE=dc` 分支。
+     - 原 `run_scenario{1,2,3}.sh` 增加 `TRIGGER_MODE=dc` 分支；
+     - 场景2 dc 分支不写死 DP15：以决策中心实际保留的 decoder 数为准，
+       并把所有不可用 decoder 从代理摘除（决策中心可能因整除等约束
+       选择其它合法 DP 数）。
 - A3 联调检查：
   - 20 个 executor 启动日志均出现 `assigned executor_id=exe-...`；
   - `curl http://7.246.78.79:8088/api/v1/decision_center/health` 返回
