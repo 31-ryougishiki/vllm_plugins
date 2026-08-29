@@ -207,6 +207,37 @@ def get_scale_to_zero_dp_ranks(zero_interrupt_config) -> set[int]:
     return scale_to_zero_ranks
 
 
+def recover_requires_full_restart(
+    backup: dict,
+    current_tp: int,
+    current_dp: int,
+    current_is_heterogeneous: bool,
+    target_dp: int,
+) -> bool:
+    """Decide whether a RECOVER strategy needs the all-executor barrier.
+
+    Pure DP recovery (DP15TP1 -> DP16TP1) has no TP change. Only comparing
+    the backed-up TP with the current TP would mark it as a single-executor
+    restart: the healthy executors would kill the old 15-rank worker world
+    while the recovered executor is still waiting on the old 16-rank
+    barrier, and the new 16-rank ``init_process_group`` would wait forever.
+    """
+    backup_tp = backup.get("tensor_parallel_size")
+    backup_dp = backup.get("data_parallel_size")
+    return bool(
+        current_is_heterogeneous
+        or (
+            backup_tp is not None
+            and int(backup_tp) != int(current_tp)
+        )
+        or (
+            backup_dp is not None
+            and int(backup_dp) != int(current_dp)
+        )
+        or int(target_dp or 0) != int(current_dp or 0)
+    )
+
+
 def get_surviving_dp_barrier_geometry(
     zero_interrupt_config,
 ) -> tuple[int, int, set[int]]:

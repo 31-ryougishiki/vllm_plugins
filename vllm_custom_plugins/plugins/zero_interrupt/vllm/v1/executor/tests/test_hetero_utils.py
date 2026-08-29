@@ -20,6 +20,7 @@ get_scale_to_zero_dp_ranks = _utils.get_scale_to_zero_dp_ranks
 get_surviving_dp_barrier_geometry = _utils.get_surviving_dp_barrier_geometry
 get_tp_asymmetric_shardings = _utils.get_tp_asymmetric_shardings
 is_heterogeneous_restart = _utils.is_heterogeneous_restart
+recover_requires_full_restart = _utils.recover_requires_full_restart
 
 
 class TestHeteroUtils(unittest.TestCase):
@@ -227,6 +228,69 @@ class TestHeteroUtils(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             get_surviving_dp_barrier_geometry(cfg)
+
+    def test_recover_barrier_geometry_includes_restored_executor(self):
+        cfg = {
+            "executor_id": "15",
+            "engine_parallel_config": [
+                {"executor_id": str(i), "dp": 16, "tp": 1,
+                 "data_parallel_rank": i, "new_dp": 16, "new_tp": 1}
+                for i in range(16)
+            ],
+        }
+        self.assertEqual(get_scale_to_zero_dp_ranks(cfg), set())
+        self.assertEqual(
+            get_surviving_dp_barrier_geometry(cfg),
+            (16, 15, set()),
+        )
+
+    def test_recover_requires_full_restart_for_pure_dp_recovery(self):
+        # D 端场景 2 后健康 executor：dp16 -> dp15，tp 不变。
+        backup = {"tensor_parallel_size": 1, "data_parallel_size": 16}
+        self.assertTrue(
+            recover_requires_full_restart(
+                backup=backup,
+                current_tp=1,
+                current_dp=15,
+                current_is_heterogeneous=False,
+                target_dp=16,
+            )
+        )
+        # 空转 executor：dp15 阶段被缩到 0。
+        self.assertTrue(
+            recover_requires_full_restart(
+                backup=backup,
+                current_tp=0,
+                current_dp=0,
+                current_is_heterogeneous=False,
+                target_dp=16,
+            )
+        )
+
+    def test_recover_requires_full_restart_for_heterogeneous_tp_recovery(self):
+        # P 端场景 1 后：异构 TP 恢复为对称 TP，dp 不变。
+        backup = {"tensor_parallel_size": 4, "data_parallel_size": 4}
+        self.assertTrue(
+            recover_requires_full_restart(
+                backup=backup,
+                current_tp=3,
+                current_dp=4,
+                current_is_heterogeneous=True,
+                target_dp=4,
+            )
+        )
+
+    def test_recover_requires_full_restart_skips_unchanged_topology(self):
+        backup = {"tensor_parallel_size": 1, "data_parallel_size": 16}
+        self.assertFalse(
+            recover_requires_full_restart(
+                backup=backup,
+                current_tp=1,
+                current_dp=16,
+                current_is_heterogeneous=False,
+                target_dp=16,
+            )
+        )
 
 
 if __name__ == "__main__":

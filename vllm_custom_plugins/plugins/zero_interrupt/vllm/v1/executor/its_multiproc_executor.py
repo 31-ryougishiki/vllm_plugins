@@ -59,6 +59,7 @@ from vllm_custom_plugins.plugins.zero_interrupt.vllm.v1.executor.utils import (
     get_surviving_dp_barrier_geometry,
     get_tp_asymmetric_shardings,
     is_heterogeneous_restart,
+    recover_requires_full_restart,
 )
 from .health_monitor import ITSHealthMonitor, ITSFailureCallback
 from .http_server import ITSHttpServer
@@ -785,8 +786,8 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             barrier_config.data_parallel_rank_local = int(surviving_dp_rank)
             barrier_config.data_parallel_size_local = int(surviving_dp_size)
         logger.info(
-            "Full-restart barrier: excluding scale-to-zero executor ranks, "
-            "building surviving-executor group world_size=%d rank=%d.",
+            "Full-restart barrier: building target dp_group "
+            "world_size=%d rank=%d.",
             surviving_dp_size,
             surviving_dp_rank,
         )
@@ -910,11 +911,58 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         )
         temporary_group = False
 
-        if scale_to_zero_ranks:
-            # The old dp_group still contains the faulty executor. Build a
-            # group over the surviving ranks only. This must happen before
-            # `_get_engine_parallel_config` mutates parallel_config, hence
-            # the deep-copied renumbered config in
+        # The engine-core dp_group must cover exactly the target topology.
+        # - DP16 -> DP15: the old group still contains the faulty executor.
+        # - DP15 -> DP16 (RECOVER): healthy executors only have a 15-rank
+        #   group, while the previously scale-to-zero executor has a stale
+        #   16-rank group (and is marked _its_dp_sync_excluded). A new group
+        #   including all 16 target ranks must be created before any executor
+        #   kills its workers.
+        # - Heterogeneous TP recovery (DP4TP(3,4,4,4) -> DP4TP4) keeps the
+        #   same four engine-core processes, so the existing 4-rank group is
+        #   reused.
+        current_dp_size = getattr(
+            self.parallel_config, "data_parallel_size", None
+        )
+        old_dp_group_size = None
+        if barrier_group is not None:
+            try:
+                old_dp_group_size = int(barrier_group.size())
+            except Exception:  # noqa: BLE001
+                old_dp_group_size = None
+        dp_sync_excluded = bool(
+            getattr(engine_core, "_its_dp_sync_excluded", False)
+            if engine_core is not None else False
+        )
+        needs_target_dp_group = bool(scale_to_zero_ranks)
+        if surviving_dp_size is not None and (
+            dp_sync_excluded
+            or int(current_dp_size or 0) != int(surviving_dp_size)
+            or (
+                old_dp_group_size is not None
+                and int(old_dp_group_size) != int(surviving_dp_size)
+            )
+        ):
+            needs_target_dp_group = True
+
+        if needs_target_dp_group:
+            if scale_to_zero_ranks:
+                logger.info(
+                    "Full-restart barrier: excluding scale-to-zero executor "
+                    "ranks %s.",
+                    sorted(scale_to_zero_ranks),
+                )
+            else:
+                logger.info(
+                    "Full-restart barrier: current dp_group topology "
+                    "(current_dp=%s, group_size=%s) differs from target "
+                    "dp=%s, rebuilding.",
+                    current_dp_size,
+                    old_dp_group_size,
+                    surviving_dp_size,
+                )
+            # This must happen before `_get_engine_parallel_config` mutates
+            # parallel_config, hence the deep-copied renumbered config in
             # `_build_surviving_dp_group`.
             barrier_group, barrier_store = self._build_surviving_dp_group(
                 surviving_dp_size, surviving_dp_rank
@@ -1933,16 +1981,34 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         """
         if strategy.deploy_type == DeployType.RECOVER:
             # 从异构/缩容拓扑恢复同样会重建 world_size 和通信组。只要当前
-            # 拓扑是异构的，或备份的对称 tp 与当前 tp 不一致，就必须让全部
-            # DP 同时重启；否则会复现与 DEGRADE 相同的旧通信域问题。
+            # 拓扑是异构的，或备份的对称 tp/dp 与当前不一致，或目标 dp 与
+            # 当前不一致，就必须让全部 DP 同时重启；否则会复现与 DEGRADE
+            # 相同的旧通信域问题。
+            # 纯 DP 恢复（DP15TP1 -> DP16TP1）时 tp 没有变化，旧逻辑只看
+            # tp 会误判为“无需全量重启”：健康 executor 先杀旧 worker，而
+            # 恢复中的 executor 还在等 16-rank barrier，新 worker 的
+            # init_process_group 会永久等待。
             backup = getattr(self, "backup_parallel_config", {}) or {}
-            backup_tp = backup.get("tensor_parallel_size")
             current_tp = self.parallel_config.tensor_parallel_size
+            current_dp = self.parallel_config.data_parallel_size
             current_is_hetero = bool(
                 getattr(self.parallel_config, "is_heterogeneous_tp", False)
             )
-            requires_full_restart = current_is_hetero or (
-                backup_tp is not None and backup_tp != current_tp
+            target_dp = max(
+                (
+                    conf.new_dp
+                    if conf.new_dp is not None
+                    else conf.dp
+                    for conf in strategy.engine_parallel_config
+                ),
+                default=current_dp,
+            )
+            requires_full_restart = recover_requires_full_restart(
+                backup=backup,
+                current_tp=current_tp,
+                current_dp=current_dp,
+                current_is_heterogeneous=current_is_hetero,
+                target_dp=target_dp,
             )
             if not requires_full_restart:
                 return False
@@ -2262,6 +2328,21 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     self.parallel_config.data_parallel_rank_local,
                 )
                 self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
+                # __post_init__/rank 回写之后，index 与单节点 local 字段必须
+                # 与最终 rank 保持一致。D 端 DP15 -> DP16 恢复时
+                # data_parallel_size_local 之前仍可能是 15（或 scale-to-zero
+                # executor 的 0），会让 worker 的 Mooncake 端口偏移和
+                # node_rank 计算指向旧拓扑。
+                self.parallel_config.data_parallel_index = (
+                    self.parallel_config.data_parallel_rank
+                )
+                if self.parallel_config.nnodes == 1:
+                    self.parallel_config.data_parallel_rank_local = (
+                        self.parallel_config.data_parallel_rank
+                    )
+                    self.parallel_config.data_parallel_size_local = (
+                        self.parallel_config.data_parallel_size
+                    )
             elif strategy.deploy_type in (DeployType.DEGRADE, DeployType.PD_REBUILD):
                 # 连续多次缩容/异构重建只备份第一次的原始对称配置，
                 # 供后续 RECOVER 恢复。
