@@ -505,6 +505,34 @@ git -C vllm_plugins diff HEAD
   `vllm_ascend/patch/tests/test_patch_hetero_ascend_config.py`，
   覆盖 D 缩容放行、无策略 mismatch 拒绝、P 异构 tp 放行三个场景。
 
+### 4.14 D 缩容 full-restart barrier 120s 超时 + scale-to-zero executor ZeroDivisionError（已修复，待 A3 复测）
+
+- 现象（decode 单独测试 DP16TP1 -> DP15TP1）：
+  - dp0 等健康 executor 06:32:07 收到策略并进入
+    `Full-restart barrier: waiting for 1/16`；
+  - 故障 dp15 直到 06:36:27 才进入 strategy execution（其 worker 先卡在
+    `execute_dummy_batch`，随后 NPU 107020 event wait timeout）；
+  - dp0-14 的 barrier 默认 120s 在 06:34:07 超时并失败；
+  - dp15 之后 barrier 通过，但清理 worker 后在
+    `_update_vllm_config_for_restart` 里
+    `get_tp_asymmetric_shardings()` 对 `new_tp=0` 做除法，报
+    `ZeroDivisionError: integer division or modulo by zero`。
+- 根因：
+  1. `_barrier_for_full_restart` 写死 `timeout_seconds=120`。故障卡上的
+     旧 worker 可能正卡在 NPU 任务里，要等 200s+ 的 NPU task timeout 才能
+     让 EngineCore 进入策略路径；120s 不够。
+  2. `is_heterogeneous_restart()` 把 `new_tp=0` 的 scale-to-zero executor
+     当成了“TP 变化”，使纯 DP 缩容错误地进入异构配置注入；
+     `get_tp_asymmetric_shardings()` 再对 `asym_tp=0` 做
+     `ori_tp // asym_tp`。
+- 修复：
+  - barrier 超时默认改为 `VLLM_ITS_STRATEGY_TIMEOUT`（A3 脚本默认 600s）；
+  - `is_heterogeneous_restart()` 忽略 `new_tp <= 0` 的 executor：
+    纯 DP 缩容不再走 heterogeneous 配置注入；
+  - `get_tp_asymmetric_shardings()` 对 `new_tp <= 0` 直接返回 `[]`；
+  - 回归：`vllm/v1/executor/tests/test_hetero_utils.py` 新增
+    “pure DP scale-to-zero is not heterogeneous” 用例。
+
 ## 5. 异构重启流程要点（0.23 适配结论）
 
 1. **所有 DP 都必须重启**。

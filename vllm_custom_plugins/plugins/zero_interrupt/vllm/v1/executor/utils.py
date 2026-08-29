@@ -35,6 +35,9 @@ def get_tp_asymmetric_shardings(zero_interrupt_config):
 
     ori_tp = int(config.get("tp", 1))
     asym_tp = int(config.get("new_tp", config.get("tp", 1)))
+    if asym_tp <= 0:
+        # Scale-to-zero executor owns no TP ranks.
+        return []
 
     explicit = config.get("tp_asymmetric_shardings", None)
     if explicit is None:
@@ -69,7 +72,14 @@ def is_heterogeneous_restart(zero_interrupt_config) -> bool:
     """
     for conf in zero_interrupt_config.get("engine_parallel_config", []):
         new_tp = conf.get("new_tp", None)
-        if new_tp is not None and int(new_tp) != int(conf.get("tp", new_tp)):
+        if new_tp is None:
+            continue
+        new_tp = int(new_tp)
+        if new_tp <= 0:
+            # Scale-to-zero executor: it owns no ranks and does not make the
+            # restart heterogeneous (e.g. decode DP16TP1 -> DP15TP1).
+            continue
+        if new_tp != int(conf.get("tp", new_tp)):
             return True
         if conf.get("tp_asymmetric_shardings"):
             return True

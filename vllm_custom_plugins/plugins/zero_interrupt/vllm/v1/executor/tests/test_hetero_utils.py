@@ -143,6 +143,21 @@ class TestHeteroUtils(unittest.TestCase):
         cfg["executor_id"] = "3"
         self.assertEqual(get_global_start_rank(cfg), 8)
 
+    def test_pure_dp_scale_to_zero_is_not_heterogeneous(self):
+        cfg = {
+            "executor_id": "15",
+            "engine_parallel_config": [
+                {"executor_id": str(i), "dp": 16, "tp": 1,
+                 "data_parallel_rank": i, "new_dp": 15, "new_tp": 1}
+                for i in range(15)
+            ] + [
+                {"executor_id": "15", "dp": 16, "tp": 1,
+                 "data_parallel_rank": 15, "new_dp": 0, "new_tp": 0}
+            ],
+        }
+        self.assertFalse(is_heterogeneous_restart(cfg))
+        self.assertEqual(get_tp_asymmetric_shardings(cfg), [])
+
 
 if __name__ == "__main__":
     unittest.main()

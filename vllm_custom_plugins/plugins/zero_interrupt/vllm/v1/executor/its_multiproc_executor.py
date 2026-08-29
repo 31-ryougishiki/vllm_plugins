@@ -748,7 +748,9 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             logger.error(f"Error restarting workers: {e}")
             return False
 
-    def _barrier_for_full_restart(self, timeout_seconds: int = 120) -> None:
+    def _barrier_for_full_restart(
+        self, timeout_seconds: int = VLLM_ITS_STRATEGY_TIMEOUT
+    ) -> None:
         """Barrier across all DP executor processes before a full restart.
 
         DP4TP4 -> DP4TP(3,4,4,4) changes the global worker world from 16 to
@@ -828,9 +830,9 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 "Heterogeneous full restart barrier timed out after "
                 f"{timeout_seconds}s waiting for all {world_size} DP "
                 "executors. The decision center must push the same "
-                "engine_parallel_config to EVERY DP executor (heterogeneous "
-                "TP changes MoE weights and global communication groups, so "
-                "restarting only the faulty DP is invalid)."
+                "engine_parallel_config to EVERY DP executor (topology "
+                "changes rebuild MoE weights and global communication "
+                "groups, so restarting only the faulty DP is invalid)."
             )
         logger.info(
             "Full-restart barrier passed: all %d DP executors will now "
