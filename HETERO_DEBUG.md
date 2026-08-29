@@ -24,12 +24,14 @@
 | PD 场景 1（P 转异构、D 不变） | 🔧 脚本已建，链路已打通；仍有输出污染/端口问题待复测 | trigger ITS 端口需预检；代理 warmup 需覆盖全部 decoder；§4.15 修复 scheduler KV |
 | PD 场景 2（D 坏 1 卡、P 不变） | 🔧 脚本已建；缩容重启修复已提交，待 A3 复测 | barrier 超时、scale-to-zero、KV extra dp 校验已修；§4.13/§4.14 |
 | D 单机 DP16TP1→DP15TP1 重启 | 🔧 存活组 barrier 方案已提交，待 A3 复测 | 存活 executor 用重新编号的 15-rank gloo group barrier 并替换 dp_group，不再等待 dp15（§4.16） |
+| RECOVER（P 异构→对称、D DP15→DP16） | 🔧 控制面与场景脚本已提交，待 A3 复测 | 纯 DP 恢复也会全量 barrier；目标 16-rank dp_group 重建后统一重启（§4.17） |
 | 重启后“答非所问” | 🔧 根因已定位并修复（待 A3 复测） | scheduler 端 KVCacheManager 未重建，旧 block pool 污染新请求；§4.15 |
 | PD / Mooncake engine_id 轮换链路 | ✅ P 端已验证；⏳ D 端待验证 | dp0/dp1 均已 `KV connector metadata updated` + recovered 通知 |
 
 ### 本地提交（均已合入 `hetero` 分支）
 
 ```text
+8271053 fix(executor): full-restart barrier and dp_group rebuild for RECOVER
 67fa13b fix(executor): barrier over surviving executors and replace dp_group
 44b3694 fix(kv-cache): rebuild scheduler KVCacheManager after worker restart
 2b3fd6f fix(executor): roll back surviving-executor barrier group
@@ -48,7 +50,8 @@ eb23da3 fix(linear): load Ascend linears with ratio-aware offsets under hetero T
 ```
 
 > PD 测试脚本仓 `vllm_plugins_hetero_test` 的相关提交独立于本仓：
-> `b581ffa` / `e8103d1` / `998c4f8` / `412171e` / `c410b32` 等。
+> `e41fbde`（RECOVER 场景） / `b581ffa` / `e8103d1` / `998c4f8` /
+> `412171e` / `c410b32` 等。
 
 ### 下一步顺序（不要跳步）
 
@@ -62,7 +65,13 @@ eb23da3 fix(linear): load Ascend linears with ratio-aware offsets under hetero T
    recompute 拼接与 all-decoder warmup 问题。
 3. 验证 D 端 Mooncake engine_id 轮换：P 重启后 D 按新
    `(engine_id, handshake_port)` 恢复链路。
-4. 遗留：故障 executor **永久不可达**场景由 §4.16 修复——存活组 barrier
+4. 场景 3 RECOVER：先 `run_scenario1.sh` + `run_scenario2.sh` 制造前置状态，
+   再 `run_scenario3.sh`（`RECOVER_TARGET=both`）。关键检查：
+   - P：`Full-restart barrier passed` + `KV connector metadata updated`；
+   - D：16 个 executor 全部 `Full-restart barrier passed`（恢复的 dp15
+     **不是** skipped）、16 个 `/health` 就绪；
+   - 代理重新加入 decoder15，恢复后输出与降级前基线一致。
+5. 遗留：故障 executor **永久不可达**场景由 §4.16 修复——存活组 barrier
    不包含 scale-to-zero rank，重启后 EngineCore dp_group 也替换为
    15-rank 新组。A3 需用“不给 dp15 下发策略”的方式单独回归一次。
 
@@ -626,9 +635,52 @@ git -C vllm_plugins diff HEAD
   - `_build_surviving_dp_group` 在 barrier 前创建新 group，此时旧 group
     仍存活（不能先拆：还有 DP 可能卡在业务同步里）。新旧两组互不干扰，
     旧组只在 barrier 全部通过后才销毁。
-  - 若后续做 `DP15 -> DP16` RECOVER，需要按同样思路重建含 dp15 的
-    EngineCore dp_group；当前 RECOVER 路径尚未在 D 端验证，不要假设旧
-    dp_group 仍可用。
+
+### 4.17 RECOVER：纯 DP 恢复也要全量 barrier + 重建目标 dp_group（已提交，待 A3 复测）
+
+- 问题：场景 2 缩容后健康 executor 的 EngineCore dp_group 已换成
+  15-rank 新组，而空转 executor 还挂着旧 16-rank 组。旧 RECOVER 判断
+  只看 TP 是否变化，`DP15TP1 -> DP16TP1` 的 TP 始终为 1，于是：
+  - 健康 executor 认为不需要全量重启，直接杀旧 worker、起 16-rank 新
+    worker；
+  - 恢复中的 executor 却认为需要全量重启，在没人参与的旧 16-rank
+    gloo 组上等 barrier；
+  - 结果健康 executor 的新 `init_process_group` 永久等 rank15，
+    恢复流程挂死。
+- 修复：
+  1. 新增 `recover_requires_full_restart()`：RECOVER 时只要满足以下任一
+     条件就全量重启——当前是异构 TP、backup tp != 当前 tp、
+     backup dp != 当前 dp、目标 dp != 当前 dp。纯 DP 恢复因此进入全量
+     barrier。
+  2. `_barrier_for_full_restart()` 的建组条件由“策略里有
+     scale-to-zero executor”扩展为“当前 EngineCore dp_group 与目标 DP 数
+     不一致 / 当前 parallel_config dp 与目标不一致 / executor 带
+     `_its_dp_sync_excluded`”。这样 DP15→16 时：
+     - 健康 executor：current_dp=15、group_size=15 → 建 16-rank 目标组；
+     - 空转 executor：current_dp=0、`_its_dp_sync_excluded=True` →
+       同样建 16-rank 目标组；
+     - 16 个 executor 在新组上完成 barrier 后才统一清理旧 worker，
+       避免健康侧先杀 worker。
+  3. barrier 通过后 `_adopt_surviving_dp_group()` 把目标组替换为
+     EngineCore dp_group，并清掉恢复 executor 的
+     `_its_dp_sync_excluded` 标记。
+  4. `_get_engine_parallel_config()` RECOVER 分支补写
+     `data_parallel_index` / 单节点 `data_parallel_rank_local` /
+     `data_parallel_size_local`，防止恢复 executor 的 Mooncake 端口偏移
+     和 node_rank 计算沿用缩容后的旧值。
+  5. P 端异构 TP 恢复（DP4TP(3,4,4,4)→DP4TP4）DP 数不变，沿用原 4-rank
+     group barrier；控制面无需重建 dp_group。
+- 回归：`test_hetero_utils.py` 新增纯 DP 恢复、异构 TP 恢复、拓扑不变
+  三类 `recover_requires_full_restart` 用例，以及恢复 executor 的
+  barrier geometry 用例（当前 17 个用例全过）。
+- A3 复测：
+  1. D 单独：`run_decode_fault_alone.sh` 制造 DP15 状态后执行
+     `decode/run_decode_recover_alone.sh`；
+  2. PD 全链路：场景 1 + 场景 2 后执行 `run_scenario3.sh`（默认
+     `RECOVER_TARGET=both`，先恢复 P 再恢复 D）；
+  3. 关键日志：16 个 decode executor 全部出现
+     `Full-restart barrier passed`（不是 skipped），dp15 无
+     `Idle mode (dp=0)` 新增，且恢复后输出与基线一致。
 
 ## 5. 异构重启流程要点（0.23 适配结论）
 
@@ -748,6 +800,7 @@ grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应�
 | D 缩容 barrier 120s 超时；dp15 晚 4 分钟才进策略 | 故障卡 worker 卡在 NPU task（约 234s），旧 barrier 超时太短 | 已修复（存活组 barrier 不等待 dp15；§4.14/§4.16） |
 | dp15 scale-to-zero executor 报 `ZeroDivisionError` | `is_heterogeneous_restart()` 把 `new_tp=0` 当 TP 变化，`get_tp_asymmetric_shardings()` 对 0 做除法 | 已修复（忽略 `new_tp<=0`；zero 返回 `[]`，§4.14） |
 | 尝试“存活 executor 单独 barrier group”后卡住 | 首次实装仍用旧 `dp=16` parallel_config 建组，rank15 缺席使 gloo rendezvous 永久等待；`Address already in use` 只是重试日志 | 已修复（deepcopy + 重新编号 dp=15，barrier 后替换 EngineCore dp_group；§4.16） |
+| RECOVER DP15→DP16 健康 executor 不 barrier / 恢复 executor 在旧 16-rank group 上死等 | RECOVER 判断只看 TP；纯 DP 恢复被误判为单实例重启，而 EngineCore dp_group 已经变成 15/16 两套 | 已修复（`recover_requires_full_restart` 比较 backup/current/target dp；目标组重建后统一 barrier；§4.17） |
 | 重启后“输出通顺但答非所问” | EngineCore/scheduler 存活，旧 `KVCacheManager` 未重建，新请求分到旧 block pool 内容 | 已修复（重建 scheduler KVCacheManager 并 rebind connector，§4.15） |
 | 场景1 trigger 全部 `Connection refused` | P 的 ITS HTTP 未监听（缺 fastapi/uvicorn 或未加载 zero_interrupt）；trigger 前应预检 ITS `/health` | 脚本已加预检；环境需装 `fastapi<0.124.0 httpx uvicorn` |
 | 场景1 输出“正常文本 + 无关 JSON 片段” | PD 首次请求 `stop_reason=recomputed`，代理拼接两段 completion；且 warmup 只覆盖一个 decoder | 脚本已修：temperature=0、全 decoder warmup、代理轮转、recomputed 日志 |
