@@ -31,6 +31,7 @@
 ### 本地提交（均已合入 `hetero` 分支）
 
 ```text
+4b023f8 fix(executor): skip redundant RECOVER restart when topology already matches
 8271053 fix(executor): full-restart barrier and dp_group rebuild for RECOVER
 67fa13b fix(executor): barrier over surviving executors and replace dp_group
 44b3694 fix(kv-cache): rebuild scheduler KVCacheManager after worker restart
@@ -670,6 +671,8 @@ git -C vllm_plugins diff HEAD
      和 node_rank 计算沿用缩容后的旧值。
   5. P 端异构 TP 恢复（DP4TP(3,4,4,4)→DP4TP4）DP 数不变，沿用原 4-rank
      group barrier；控制面无需重建 dp_group。
+  6. 重复 RECOVER：DP>1 且当前拓扑已等于目标拓扑时直接返回成功，不再
+     无 barrier 地异步杀 worker（DP=1 保留无条件重启语义）。
 - 回归：`test_hetero_utils.py` 新增纯 DP 恢复、异构 TP 恢复、拓扑不变
   三类 `recover_requires_full_restart` 用例，以及恢复 executor 的
   barrier geometry 用例（当前 17 个用例全过）。
