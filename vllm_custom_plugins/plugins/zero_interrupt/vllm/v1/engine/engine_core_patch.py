@@ -458,7 +458,7 @@ def patch_engine_core() -> None:
         """
         对故障处理逻辑进行了需改，功能代码从vllm原生step_with_batch_queue代码拷贝而来
         """
-        logger.info("[patched_step_with_batch_queue]: start")
+        logger.debug("[patched_step_with_batch_queue]: start")
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
@@ -470,7 +470,38 @@ def patch_engine_core() -> None:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            logger.info("step_with_batch_queue: self.scheduler.has_requests() == True")
+            # has_requests() 为 True 只是说明 scheduler 还有“未完成请求”或
+            # “尚未在下一次 schedule() 中返回的 finished 请求”。PD 场景里
+            # WAITING_FOR_REMOTE_KVS 的请求也会让这里持续为 True，属于正常
+            # 的 1ms-yield 路径。为避免每个 step 都刷 INFO，只在状态变化或
+            # 每 30s 打印一次运行/等待计数与请求状态，便于判断是否卡住。
+            running, waiting = self.scheduler.get_request_counts()
+            now = time.monotonic()
+            last_log_ts = getattr(self, "_last_hetero_request_log_ts", None)
+            last_counts = getattr(self, "_last_hetero_request_counts", None)
+            if (
+                last_log_ts is None
+                or now - last_log_ts >= 30
+                or last_counts != (running, waiting)
+            ):
+                request_states = []
+                for req_id, req in list(
+                    getattr(self.scheduler, "requests", {}).items()
+                )[:10]:
+                    status = getattr(req, "status", None)
+                    request_states.append(
+                        f"{req_id}:{getattr(status, 'name', status)}"
+                    )
+                self._last_hetero_request_log_ts = now
+                self._last_hetero_request_counts = (running, waiting)
+                logger.info(
+                    "step_with_batch_queue: has_requests=True "
+                    "running=%d waiting=%d batch_queue=%d requests=%s",
+                    running,
+                    waiting,
+                    len(batch_queue),
+                    request_states,
+                )
             scheduler_output = self.scheduler.schedule()
             with self.log_error_detail(scheduler_output):
                 # patched: 获取零中断相关变量状态
