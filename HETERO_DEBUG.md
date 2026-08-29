@@ -7,12 +7,42 @@
 
 ## 0. 当前进度（更新于 2026-08-29）
 
+### 场景清单（当前共 3 个 PD 场景）
+
+> 手动 POST executor 和 DecisionMakingCenter 触发只是**触发方式**，不是
+> 新场景编号。当前 PD 分离测试共 3 个场景：
+
+| 场景 | 初始状态 | 目标状态 | 变化侧 |
+|---|---|---|---|
+| **场景 1** | P=`DP4TP4` 对称，D=`DP16TP1` | P=`DP4TP(3,4,4,4)` 异构，D=`DP16TP1` 不变 | 只动 P，P 坏 1 卡转异构 |
+| **场景 2** | P=`DP4TP4` 对称，D=`DP16TP1` | P=`DP4TP4` 不变，D=`DP16TP1 -> DP15TP1`（决策中心可能选择其它合法 DP 数） | 只动 D，D 坏 1 卡缩容 |
+| **场景 3** | 场景 1 + 场景 2 后的降级状态：P=`DP4TP(3,4,4,4)`，D=`DP15TP1` | P=`DP4TP4` 对称，D=`DP16TP1` | P、D 都恢复（RECOVER） |
+
+- 场景 1 / 场景 2 / 场景 3 都有两种触发方式：
+  - **手动模式**：老脚本直接 POST executor 的 ITS HTTP
+    `/api/v1/executor/deploy`（`trigger_*.sh`）；
+  - **决策中心模式**：通过 `http://7.246.78.79:8088` 的
+    `/test/trigger_fault` 与 `/repair/devices` 触发，脚本在
+    `vllm_plugins_hetero_test/decision_center/`，或使用
+    `TRIGGER_MODE=dc`。
+- 另有 **D 单机子场景**（不属于新增 PD 场景编号）：
+  - `decode/run_decode_fault_alone.sh`：场景 2 的 D 节点独立版；
+  - `decode/run_decode_recover_alone.sh`：场景 3 的 D 节点独立版。
+- **hetero_cp 覆盖范围：只适配场景 1**。它直接以异构拓扑
+  `DP4TP(3,4,4,4)` 启动服务，等价于场景 1 的**目标状态**；它不包含：
+  - 场景 1 的运行时触发/重启过程；
+  - 场景 2 的 D 端缩容；
+  - 场景 3 的 RECOVER；
+  - DecisionMakingCenter 控制面。
+  因此 hetero_cp 只能作为场景 1 数据面的 golden reference，不能用于
+  场景 2/3 的对照验证。
+
 ### 已确认状态
 
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | 对称 DP4TP4 正常拉起 + 普通请求推理 | ✅ 已验证 | 输出内容正常；§4.3/§4.4 两类错误均不再出现 |
-| hetero_cp 直接拉起异构服务 + 推理 | ✅ 输出正确 | **golden reference**：vllm_plugins 主模型数据面必须与其语义等价 |
+| hetero_cp 直接拉起异构服务 + 推理 | ✅ 输出正确 | **只覆盖场景 1 的目标拓扑** `DP4TP(3,4,4,4)`；不覆盖场景 2/3 与控制面，仅作场景 1 数据面 golden reference |
 | trigger 下发到 4 个 executor | ✅ 已验证 | 发送侧 4 个 HTTP 200；四个 DP 均进入策略执行 |
 | 全量重启 barrier（P 端 4 executor） | ✅ 已通过 | dp0/dp2 日志均有 `Full-restart barrier passed` |
 | DP2 重启 worker NPU 可见性 | ✅ 已修复 | `ASCEND_RT_VISIBLE_DEVICES` 改为数值排序（§4.5） |
@@ -107,11 +137,20 @@ eb23da3 fix(linear): load Ascend linears with ratio-aware offsets under hetero T
 | `DeepSeek-V4-Flash-w8a8-mtp/` | 模型配置样例 |
 | `error.log` | 最近一次报错节选 |
 
-> **hetero_cp 的定位**：已确认其直接拉起的异构服务（同模型、同拓扑
-> DP4TP(3,4,4,4)）**推理输出正确**，因此它是正确性验证的 golden
-> reference。vllm_plugins 主模型数据面的每个实现都应能在下面的
-> `hetero_cp` 源码 diff 中找到等价逻辑；只有 restart / 策略 / Mooncake
-> 控制面属于插件独有实现。
+> **hetero_cp 的定位与边界（重要）**：已确认其直接拉起的异构服务
+> （同模型、同拓扑 `DP4TP(3,4,4,4)`）**推理输出正确**，因此它是
+> **场景 1 数据面**正确性验证的 golden reference。vllm_plugins 主模型
+> 数据面的每个实现都应能在下面的 `hetero_cp` 源码 diff 中找到等价逻辑；
+> 只有 restart / 策略 / Mooncake 控制面属于插件独有实现。
+>
+> **hetero_cp 目前只适配场景 1，尚未适配后续场景**：
+> - 它覆盖的是“启动即异构”的 P 端 `DP4TP(3,4,4,4)` + D 端 `DP16TP1`，
+>   即场景 1 的目标拓扑，不包含运行时 trigger/restart；
+> - 不覆盖场景 2（D 端 `DP16TP1 -> DP15TP1` 缩容）；
+> - 不覆盖场景 3（P 恢复 `DP4TP4`、D 恢复 `DP16TP1` 的 RECOVER）；
+> - 不包含 DecisionMakingCenter 控制面。
+> 因此场景 2/3 没有 hetero_cp golden 可对照，只能以场景 1 的模型数据面
+> patch 为参考，并通过“恢复后输出与场景 1/2 基线一致”做端到端校验。
 
 关键对比命令：
 
