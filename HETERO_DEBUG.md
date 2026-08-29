@@ -5,7 +5,7 @@
 
 ---
 
-## 0. 当前进度（更新于 2026-08-28）
+## 0. 当前进度（更新于 2026-08-29）
 
 ### 已确认状态
 
@@ -14,18 +14,29 @@
 | 对称 DP4TP4 正常拉起 + 普通请求推理 | ✅ 已验证 | 输出内容正常；§4.3/§4.4 两类错误均不再出现 |
 | hetero_cp 直接拉起异构服务 + 推理 | ✅ 输出正确 | **golden reference**：vllm_plugins 主模型数据面必须与其语义等价 |
 | trigger 下发到 4 个 executor | ✅ 已验证 | 发送侧 4 个 HTTP 200；四个 DP 均进入策略执行 |
-| 全量重启 barrier | ✅ 已通过 | dp0/dp2 日志均有 `Full-restart barrier passed` |
+| 全量重启 barrier（P 端 4 executor） | ✅ 已通过 | dp0/dp2 日志均有 `Full-restart barrier passed` |
 | DP2 重启 worker NPU 可见性 | ✅ 已修复 | `ASCEND_RT_VISIBLE_DEVICES` 改为数值排序（§4.5） |
 | DP0 TP=3 worker 模型加载 | ✅ 已验证（10:21 复测） | `8192 is not divisible by 3` 不再出现（§4.7/§4.8） |
 | 异构重启后 profile_run / KV cache 重建 | ✅ 已验证（10:21 复测） | `available_memory` 为真实数值，KV 重建成功（§4.9） |
 | 异构重启后 MTP draft RoPE 崩溃 | 🔧 修复后不再崩溃 | 该问题只阻塞流程；按 speculative 原理它**不是乱码根因**（§4.10/§4.11） |
 | 重复 trigger 静默丢弃 | ✅ 已修复 | `strategy_sync` 重复策略会转发而非 return（§4.6） |
-| 异构重启后发请求 | 🔧 已定位根因并修复（待 A3 复测） | DP0 v1 linear weight_loader 未按 `[2,1,1]` 取累计 offset；修复见 §4.12 |
+| 异构重启后主模型输出乱码 | 🔧 已定位根因并修复（待 A3 复测） | DP0 v1 linear weight_loader 未按 `[2,1,1]` 取累计 offset；§4.12 |
+| PD 场景 1（P 转异构、D 不变） | 🔧 脚本已建，链路已打通；仍有输出污染/端口问题待复测 | trigger ITS 端口需预检；代理 warmup 需覆盖全部 decoder；§4.15 修复 scheduler KV |
+| PD 场景 2（D 坏 1 卡、P 不变） | 🔧 脚本已建；缩容重启修复已提交，待 A3 复测 | barrier 超时、scale-to-zero、KV extra dp 校验已修；§4.13/§4.14 |
+| D 单机 DP16TP1→DP15TP1 重启 | 🔧 控制面修复已提交，待复测 | active-only barrier 方案卡住已回退，当前用 600s 超时等待故障 executor |
+| 重启后“答非所问” | 🔧 根因已定位并修复（待 A3 复测） | scheduler 端 KVCacheManager 未重建，旧 block pool 污染新请求；§4.15 |
 | PD / Mooncake engine_id 轮换链路 | ✅ P 端已验证；⏳ D 端待验证 | dp0/dp1 均已 `KV connector metadata updated` + recovered 通知 |
 
 ### 本地提交（均已合入 `hetero` 分支）
 
 ```text
+44b3694 fix(kv-cache): rebuild scheduler KVCacheManager after worker restart
+2b3fd6f fix(executor): roll back surviving-executor barrier group
+c089cba fix(executor): exclude scale-to-zero executors from full-restart barrier  # 实装卡住，已由 2b3fd6f 回退
+1710d18 fix(executor): handle scale-to-zero in full restart and extend barrier timeout
+9333668 fix(ascend-config): accept original pool dp/tp during decode degradation
+ee5276d fix(engine): throttle batch-queue request-state logging
+eb23da3 fix(linear): load Ascend linears with ratio-aware offsets under hetero TP
 1314043 fix(attention): LCM-align DSA-CP metadata for MoE drafters
 2fc1432 fix(hetero): refresh imported forward-context aliases after patch
 98b679e fix(linear): replace pre-set output_sizes with divisible scaffold in stock init
@@ -35,16 +46,23 @@
 39484bb fix(deepseek_v4): restore Ascend pluggable linear classes for symmetric inference
 ```
 
+> PD 测试脚本仓 `vllm_plugins_hetero_test` 的相关提交独立于本仓：
+> `b581ffa` / `e8103d1` / `998c4f8` / `412171e` / `c410b32` 等。
+
 ### 下一步顺序（不要跳步）
 
-1. 当前唯一目标：**先让异构重启后的单请求输出与对称推理逐 token 一致**。
-2. 以 **hetero_cp 直接拉起的异构服务（输出正确）** 为 golden reference，
-   按 §4.11 的模块比对清单逐段 diff 主模型数据面；不再以“看起来最可能错”
-   作为首要排查方式。
-3. 先处理与 hetero_cp“实现方式不同”的模块（linear 的 scaffold+rebuild、
-   DSA-CP wrapper、custom-op `__code__` 替换），再核对整段拷贝的模块。
-4. 输出一致后再验证多请求、续推内容和 PD/Mooncake D 端：
-   `heterogeneous producer restart rotates engine_id`。
+1. 在 A3 重新安装 vllm_plugins wheel，完整重启 P/D 服务后复测：
+   - 场景 1：P 转异构、D 不变，确认 `Scheduler KVCacheManager rebuilt`
+     日志出现，交叉 prompt 不再答非所问；
+   - 场景 2 / D 单机：`DP16TP1→DP15TP1` 重启 600s 内完成，故障 executor
+     进入 `Idle mode (dp=0)`。
+2. 场景 1 输出仍需与对称/hetero_cp golden 逐 token 比对；先解决 PD 代理
+   recompute 拼接与 all-decoder warmup 问题。
+3. 验证 D 端 Mooncake engine_id 轮换：P 重启后 D 按新
+   `(engine_id, handshake_port)` 恢复链路。
+4. 遗留：故障 executor **永久不可达**时当前 barrier 仍会在 600s 超时；
+   排除 scale-to-zero rank 的存活组方案因 stateless gloo 端口冲突回退，
+   后续需重构旧 dp_group 拆除顺序后再做。
 
 ---
 
@@ -670,6 +688,13 @@ grep -R "Duplicate deployment strategy" logs/prefill/   # 若重复 trigger 应�
 | 异构重启后 profile_run `shape '[4, 8184, 4096]' is invalid`，KV 重建 `NoneType <= int` | `model_runner_v1` 等模块在 patch 前已 import，`set_ascend_forward_context` 别名仍指向 stock 函数，`_EXTRA_CTX` 无 per-DP 布局 | 已修复（§4.9，刷新已导入模块别名） |
 | 真实请求 MTP draft 前向 `inplace_partial_rotary_mul` `dim0 must be equal` | MoE drafter 实际 FlashComm1=True、隐状态按 LCM 分片；draft builder 被错误地跳过 LCM，只用本地 TP 对齐 | 已修复（§4.10） |
 | 异构重启后单请求返回但输出乱码 | DP0 ratios `[2,1,1]` 下 Ascend Row/Merged 线性层继承 stock v1 loader，`start_idx=tp_rank*shard_size` 取错权重行（rank1/2 错位）；vllm linear.py 未替换，v2 parameter patch 对 Ascend 类不生效 | 代码已修复待 A3 复测（§4.12） |
+| D 缩容重启 worker 报 `KV transfer 'decode' config has a conflicting data parallel size. Expected 15, but got 16` | kv extra config 描述原始池 dp16，校验只认当前 dp15 | 已修复（§4.13，允许 current/strategy 中的 dp/tp） |
+| D 缩容 barrier 120s 超时；dp15 晚 4 分钟才进策略 | 故障卡 worker 卡在 NPU task（约 234s），旧 barrier 超时太短 | 已修复（超时改为 `VLLM_ITS_STRATEGY_TIMEOUT=600s`，§4.14） |
+| dp15 scale-to-zero executor 报 `ZeroDivisionError` | `is_heterogeneous_restart()` 把 `new_tp=0` 当 TP 变化，`get_tp_asymmetric_shardings()` 对 0 做除法 | 已修复（忽略 `new_tp<=0`；zero 返回 `[]`，§4.14） |
+| 尝试“存活 executor 单独 barrier group”后卡住 | 新建 stateless gloo group 与旧 dp_group 端口/store 冲突，日志停在 `Address already in use` | 已回退；仍用旧 16-rank dp_group + 600s 超时（§4.14） |
+| 重启后“输出通顺但答非所问” | EngineCore/scheduler 存活，旧 `KVCacheManager` 未重建，新请求分到旧 block pool 内容 | 已修复（重建 scheduler KVCacheManager 并 rebind connector，§4.15） |
+| 场景1 trigger 全部 `Connection refused` | P 的 ITS HTTP 未监听（缺 fastapi/uvicorn 或未加载 zero_interrupt）；trigger 前应预检 ITS `/health` | 脚本已加预检；环境需装 `fastapi<0.124.0 httpx uvicorn` |
+| 场景1 输出“正常文本 + 无关 JSON 片段” | PD 首次请求 `stop_reason=recomputed`，代理拼接两段 completion；且 warmup 只覆盖一个 decoder | 脚本已修：temperature=0、全 decoder warmup、代理轮转、recomputed 日志 |
 
 ---
 
