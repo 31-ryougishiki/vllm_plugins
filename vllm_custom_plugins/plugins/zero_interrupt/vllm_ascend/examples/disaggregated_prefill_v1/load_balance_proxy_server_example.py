@@ -4,14 +4,13 @@
 #
 # Tutorial: Using the Load Balance Proxy Server Example
 #
-# This proxy server supports two mutually-exclusive deployment modes:
-# 1. PD disaggregated: separate "prefiller" and "decoder" backend servers.
-# 2. PD mixed: each "mixed" backend performs both Prefill and Decode.
+# This proxy server is designed to distribute requests between multiple
+# "prefiller" and "decoder" backend servers for large language model inference.
 # It is useful for scaling out inference workloads and balancing load across
 # multiple backend instances.
 #
 # Features:
-# - Load balances requests in PD disaggregated or PD mixed deployments.
+# - Load balances requests to multiple prefiller and decoder servers.
 # - Supports OpenAI-compatible /v1/completions and /v1/chat/completions endpoints.
 # - Streams responses from backend servers to clients.
 #
@@ -34,25 +33,17 @@
 #
 # Step 2: Start the Proxy Server
 # ------------------------------
-# PD disaggregated example:
+# Run the proxy server, specifying the host/port for each prefiller and decoder:
 #
-#   python load_balance_proxy_server_bracket_group_checked.py \
+#   python load_balance_proxy_server_example.py \
 #     --host 0.0.0.0 --port 9000 \
-#     --prefiller-hosts 127.0.0.1 127.0.0.1 [127.0.0.2 127.0.0.2] \
-#     --prefiller-ports 8100 8101 [8100 8101] \
-#     --decoder-hosts 127.0.0.3 [127.0.0.4 127.0.0.4] \
-#     --decoder-ports 8200 [8200 8201]
+#     --prefiller-hosts 127.0.0.1 127.0.0.1 \
+#     --prefiller-ports 8100 8101 \
+#     --decoder-hosts 127.0.0.1 127.0.0.1 \
+#     --decoder-ports 8200 8201
 #
-# PD mixed example (do not configure prefiller/decoder options at the same time):
-#
-#   python load_balance_proxy_server_bracket_group_checked.py \
-#     --host 0.0.0.0 --port 9000 \
-#     --mixed-hosts 127.0.0.1 127.0.0.1 \
-#     --mixed-ports 8300 8301
-#
-# Each hosts/ports option appears once. Bare host/port pairs are independent
-# one-member groups. Items enclosed by an unquoted [ ... ] pair form one
-# multi-member group. Host and port group boundaries must match exactly.
+# This will start the proxy on port 9000, load balancing between two prefiller
+# and two decoder servers.
 #
 # Step 3: Send a Request to the Proxy
 # -----------------------------------
@@ -174,16 +165,9 @@ class RouterMethod:
     SESSION_AFFINITY: str = "session_affinity"
 
 @dataclass
-class DeploymentMode:
-    DISAGGREGATED: str = "disaggregated"
-    MIXED: str = "mixed"
-
-
-@dataclass
 class InstanceType:
     PREFILL: str = "prefill"
     DECODE: str = "decode"
-    MIXED: str = "mixed"
 
 @dataclass
 class RequestRecoveryState:
@@ -193,8 +177,7 @@ class RequestRecoveryState:
     # 当前准备发送给 P/D 节点的请求。
     current_request: dict[str, Any]
     # 请求目前所处阶段。
-    # created、prefill、decode、decode_generating、mixed、mixed_generating、
-    # waiting_prefill、waiting_decode、waiting_mixed、completed、cancelled、failed
+    # created、prefill、decode、decode_generating、waiting_prefill、waiting_decode、completed、cancelled、failed
     phase: str = "created"
     # 用户是否开启模型思考。
     # 只有明确传入 chat_template_kwargs.enable_thinking=false 才关闭；
@@ -216,8 +199,8 @@ class RequestRecoveryState:
     completion_tokens: int = 0
     # 该请求已经恢复过多少次。
     recovery_count: int = 0
-    # 当前这一轮发送给后端（P/D 或 MIXED）的内部请求 ID。
-    # 故障恢复时会重新生成，但逻辑 request_id 不变。
+    # 当前这一轮发送给 P/D 的内部请求 ID。
+    # Decode 恢复时会重新生成，但逻辑 request_id 不变。
     backend_request_id: str = ""
 
 TAINT_PRIORITY = 1e15
@@ -258,273 +241,90 @@ class ServerState:
         return f"{self.host}:{self.port}"
 
 
-class ServerGroupState:
-    """A logical DP/EP failure domain containing one or more HTTP rank endpoints."""
-
-    def __init__(
-        self,
-        group_id: str,
-        instance_type: str,
-        servers: list[ServerState],
-    ):
-        if not servers:
-            raise ValueError(f"{instance_type} group {group_id} must contain at least one server")
-        self.group_id = group_id
-        self.instance_type = instance_type
-        self.servers = servers
-        self.tainted = False
-        self.pending_removal = False
-        self.failed_member: ServerState | None = None
-
-    def __repr__(self):
-        members = ", ".join(str(server) for server in self.servers)
-        return f"{self.group_id}({members})"
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "group_id": self.group_id,
-            "type": self.instance_type,
-            "members": [str(server) for server in self.servers],
-            "available": not self.tainted and not self.pending_removal,
-            "tainted": self.tainted,
-            "pending_removal": self.pending_removal,
-            "failed_member": str(self.failed_member) if self.failed_member else None,
-        }
-
-
 class ProxyState:
-    def __init__(
-        self,
-        prefiller_instance_groups,
-        decoder_instance_groups,
-        mixed_instance_groups=None,
-        deployment_mode: str = DeploymentMode.DISAGGREGATED,
-    ):
+    def __init__(self, prefiller_instances, decoder_instances):
         self.request_num = 0
-        self.deployment_mode = deployment_mode
         self.tainted_prefillers: list[ServerState] = []
         self.tainted_decoders: list[ServerState] = []
-        self.tainted_mixed: list[ServerState] = []
 
-        self.prefiller_groups: list[ServerGroupState] = []
-        self.decoder_groups: list[ServerGroupState] = []
-        self.mixed_groups: list[ServerGroupState] = []
-        self.prefiller_group_by_server: dict[ServerState, ServerGroupState] = {}
-        self.decoder_group_by_server: dict[ServerState, ServerGroupState] = {}
-        self.mixed_group_by_server: dict[ServerState, ServerGroupState] = {}
-        self._next_prefiller_group_id = 0
-        self._next_decoder_group_id = 0
-        self._next_mixed_group_id = 0
-
-        for instances in prefiller_instance_groups:
-            group = self._new_group(InstanceType.PREFILL, instances)
-            self.prefiller_groups.append(group)
-        for instances in decoder_instance_groups:
-            group = self._new_group(InstanceType.DECODE, instances)
-            self.decoder_groups.append(group)
-        for instances in mixed_instance_groups or []:
-            group = self._new_group(InstanceType.MIXED, instances)
-            self.mixed_groups.append(group)
-
-        self.prefillers: list[ServerState] = []
-        self.decoders: list[ServerState] = []
-        self.mixed_instances: list[ServerState] = []
-        self._rebuild_prefiller_topology()
-        self._rebuild_decoder_topology()
-        self._rebuild_mixed_topology()
-
+        self.prefillers: list[ServerState] = [ServerState(h, p) for h, p in prefiller_instances]
+        self.decoders: list[ServerState] = [ServerState(h, p) for h, p in decoder_instances]
         self.req_to_prefiller = {}
         self.req_id_lock = asyncio.Lock()
-
-        # Selection locks prevent concurrent requests and the health thread from
-        # mutating the same heap at the same time.
+        
+        # Selection locks to prevent race conditions in concurrent async requests
+        # Split into two independent locks so prefiller and decoder paths can run in parallel
         self._prefiller_selection_lock = threading.Lock()
         self._decoder_selection_lock = threading.Lock()
-        self._mixed_selection_lock = threading.Lock()
-
+        
         # 保存所有正在执行或等待恢复的请求。
         self.recovery_requests: dict[str, RequestRecoveryState] = {}
+        # 防止多个线程或请求同时修改字典。
         self.recovery_requests_lock = threading.RLock()
+        # 保存 FastAPI 当前运行的 asyncio 事件循环。
         self.event_loop = asyncio.get_running_loop()
+        # Prefill 可用信号。
         self.prefiller_available_event = asyncio.Event()
+        # Decode 可用信号。
         self.decoder_available_event = asyncio.Event()
-        self.mixed_available_event = asyncio.Event()
-
-        # Each entry is (priority_score, server_index, server_reference).
+        
+        # Removed selection locks - no longer needed for synchronous methods
+        # Initialize priority queues for efficient server selection
+        # Each entry is (priority_score, server_index, server_reference)
+        # Lower priority score = higher priority (less loaded)
         self.prefiller_heap = [(0.0, i, server) for i, server in enumerate(self.prefillers)]
         self.decoder_heap = [(0.0, i, server) for i, server in enumerate(self.decoders)]
-        self.mixed_heap = [(0.0, i, server) for i, server in enumerate(self.mixed_instances)]
         heapq.heapify(self.prefiller_heap)
         heapq.heapify(self.decoder_heap)
-        heapq.heapify(self.mixed_heap)
-
+        
+        # Session affinity mapping for SESSION_AFFINITY strategy
+        # Maps session_id -> instance_idx (using OrderedDict for LRU)
         self.session_prefill_map: OrderedDict = OrderedDict()
         self.session_decoder_map: OrderedDict = OrderedDict()
-        self.session_mixed_map: OrderedDict = OrderedDict()
         self._session_lock = threading.Lock()
-        self.SESSION_MAP_MAX_SIZE = 10000
-
+        self.SESSION_MAP_MAX_SIZE = 10000  # LRU capacity limit
+        
+        # 根据初始节点列表，设置 Prefill 和 Decode 的可用状态。
         self._sync_availability_events()
+        # 所有属性初始化完成后，再启动节点监听线程。
         self.node_listener = NodeListener(self)
 
-    def _new_group(
-        self,
-        instance_type: str,
-        instances: list[tuple[str, int]] | list[ServerState],
-    ) -> ServerGroupState:
-        servers: list[ServerState] = []
-        for instance in instances:
-            if isinstance(instance, ServerState):
-                servers.append(instance)
-            else:
-                host, port = instance
-                servers.append(ServerState(host, port))
-
-        if instance_type == InstanceType.PREFILL:
-            group_id = f"prefill-{self._next_prefiller_group_id}"
-            self._next_prefiller_group_id += 1
-        elif instance_type == InstanceType.DECODE:
-            group_id = f"decode-{self._next_decoder_group_id}"
-            self._next_decoder_group_id += 1
-        elif instance_type == InstanceType.MIXED:
-            group_id = f"mixed-{self._next_mixed_group_id}"
-            self._next_mixed_group_id += 1
-        else:
-            raise ValueError(f"Unknown instance type: {instance_type}")
-
-        return ServerGroupState(group_id, instance_type, servers)
-
-    def _rebuild_prefiller_topology(self) -> None:
-        self.prefillers = [server for group in self.prefiller_groups for server in group.servers]
-        self.prefiller_group_by_server = {
-            server: group for group in self.prefiller_groups for server in group.servers
-        }
-        self.tainted_prefillers = [
-            server
-            for group in self.prefiller_groups
-            if group.tainted or group.pending_removal
-            for server in group.servers
-        ]
-
-    def _rebuild_decoder_topology(self) -> None:
-        self.decoders = [server for group in self.decoder_groups for server in group.servers]
-        self.decoder_group_by_server = {
-            server: group for group in self.decoder_groups for server in group.servers
-        }
-        self.tainted_decoders = [
-            server
-            for group in self.decoder_groups
-            if group.tainted or group.pending_removal
-            for server in group.servers
-        ]
-
-    def _rebuild_mixed_topology(self) -> None:
-        self.mixed_instances = [server for group in self.mixed_groups for server in group.servers]
-        self.mixed_group_by_server = {
-            server: group for group in self.mixed_groups for server in group.servers
-        }
-        self.tainted_mixed = [
-            server
-            for group in self.mixed_groups
-            if group.tainted or group.pending_removal
-            for server in group.servers
-        ]
-
-    def _rebuild_prefiller_heap(self) -> None:
-        self.prefiller_heap = []
-        for idx, server in enumerate(self.prefillers):
-            group = self.prefiller_group_by_server[server]
-            priority = (
-                TAINT_PRIORITY
-                if group.tainted or group.pending_removal
-                else server.active_tokens + server.active_kv_cache * 0.3
-            )
-            self.prefiller_heap.append((priority, idx, server))
-        heapq.heapify(self.prefiller_heap)
-
-    def _rebuild_decoder_heap(self) -> None:
-        self.decoder_heap = []
-        for idx, server in enumerate(self.decoders):
-            group = self.decoder_group_by_server[server]
-            priority = (
-                TAINT_PRIORITY
-                if group.tainted or group.pending_removal
-                else server.active_tokens
-            )
-            self.decoder_heap.append((priority, idx, server))
-        heapq.heapify(self.decoder_heap)
-
-    def _rebuild_mixed_heap(self) -> None:
-        self.mixed_heap = []
-        for idx, server in enumerate(self.mixed_instances):
-            group = self.mixed_group_by_server[server]
-            priority = (
-                TAINT_PRIORITY
-                if group.tainted or group.pending_removal
-                else server.active_tokens
-            )
-            self.mixed_heap.append((priority, idx, server))
-        heapq.heapify(self.mixed_heap)
-
-    def _get_group(self, instance_type: str, server: ServerState) -> ServerGroupState | None:
-        if instance_type == InstanceType.PREFILL:
-            return self.prefiller_group_by_server.get(server)
-        if instance_type == InstanceType.DECODE:
-            return self.decoder_group_by_server.get(server)
-        if instance_type == InstanceType.MIXED:
-            return self.mixed_group_by_server.get(server)
-        raise ValueError(f"Unknown instance type: {instance_type}")
-
-    def _get_groups_for_servers(
-        self,
-        instance_type: str,
-        servers: list[ServerState],
-    ) -> list[ServerGroupState]:
-        groups: list[ServerGroupState] = []
-        seen_group_ids: set[str] = set()
-        for server in servers:
-            group = self._get_group(instance_type, server)
-            if group is not None and group.group_id not in seen_group_ids:
-                groups.append(group)
-                seen_group_ids.add(group.group_id)
-        return groups
-
     def _update_prefiller_priority(self, server_idx: int):
+        """Update the priority of a prefiller server in the heap."""
         server = self.prefillers[server_idx]
-        group = self.prefiller_group_by_server[server]
-        if group.tainted or group.pending_removal:
+        if server in self.tainted_prefillers:
             priority = TAINT_PRIORITY
         else:
-            priority = server.active_tokens + server.active_kv_cache * 0.3
+            priority = (server.active_tokens + server.active_kv_cache * 0.3)
         self.prefiller_heap = [(p, i, s) for p, i, s in self.prefiller_heap if i != server_idx]
         heapq.heappush(self.prefiller_heap, (priority, server_idx, server))
 
     def _update_decoder_priority(self, server_idx: int):
+        """Update the priority of a decoder server in the heap."""
         server = self.decoders[server_idx]
-        group = self.decoder_group_by_server[server]
-        if group.tainted or group.pending_removal:
+        if server in self.tainted_decoders:
             priority = TAINT_PRIORITY
         else:
             priority = server.active_tokens
         self.decoder_heap = [(p, i, s) for p, i, s in self.decoder_heap if i != server_idx]
         heapq.heappush(self.decoder_heap, (priority, server_idx, server))
 
-    def _update_mixed_priority(self, server_idx: int):
-        server = self.mixed_instances[server_idx]
-        group = self.mixed_group_by_server[server]
-        if group.tainted or group.pending_removal:
-            priority = TAINT_PRIORITY
-        else:
-            priority = server.active_tokens
-        self.mixed_heap = [(p, i, s) for p, i, s in self.mixed_heap if i != server_idx]
-        heapq.heappush(self.mixed_heap, (priority, server_idx, server))
-
-    def abort_prefiller_request(self, server_idx: int, request_id):
+    def abort_prefiller_request(self, server_idx: int, request_id):  # Changed to synchronous
+        """
+        Mark a request as aborted. This will helps to release kv cache in
+        prefiller node.
+        """
+        # No lock needed - atomic operation
         if server_idx >= len(self.prefillers):
             return
         self.prefillers[server_idx].aborted_requests.add(request_id)
 
-    def acquire_aborted_prefiller_requests(self, server_idx: int):
+    def acquire_aborted_prefiller_requests(self, server_idx: int):  # Changed to synchronous
+        """
+        Get the set of aborted requests and clear it.
+        This is used to release kv cache in prefiller node.
+        """
+        # No lock needed - atomic operation
         if server_idx >= len(self.prefillers):
             return set()
         aborted_requests = self.prefillers[server_idx].aborted_requests.copy()
@@ -534,548 +334,326 @@ class ProxyState:
     async def next_req_id(self):
         async with self.req_id_lock:
             return str(uuid.uuid4())
-
+        
     def register_recovery_request(self, state: RequestRecoveryState):
         with self.recovery_requests_lock:
             self.recovery_requests[state.request_id] = state
         logger.info("[REQUEST REGISTERED] request_id=%s phase=%s", state.request_id, state.phase)
-
+        
     def get_recovery_request(self, request_id: str) -> RequestRecoveryState | None:
         with self.recovery_requests_lock:
             return self.recovery_requests.get(request_id)
-
+    
     def remove_recovery_request(self, request_id: str) -> RequestRecoveryState | None:
         with self.recovery_requests_lock:
             state = self.recovery_requests.pop(request_id, None)
         if state is not None:
             logger.info("[REQUEST REMOVED] request_id=%s phase=%s", state.request_id, state.phase)
         return state
-
+    
     def has_available_prefiller(self) -> bool:
         return any(priority < TAINT_PRIORITY for priority, _, _ in self.prefiller_heap)
 
     def has_available_decoder(self) -> bool:
         return any(priority < TAINT_PRIORITY for priority, _, _ in self.decoder_heap)
-
-    def has_available_mixed(self) -> bool:
-        return any(priority < TAINT_PRIORITY for priority, _, _ in self.mixed_heap)
-
+        
     async def wait_for_prefiller(self, timeout: float = 5.0) -> bool:
+        """等待 Prefill 可用，超时返回 False。"""
         if self.has_available_prefiller():
             return True
+
+        # 节点刚被隔离时，available_event 可能还保留之前的 set 状态。
+        # 主动清理旧状态，避免 wait() 立即返回并连续刷出 keep-alive。
         self.prefiller_available_event.clear()
+
+        # clear 与节点恢复可能并发发生，因此清理后重新检查一次，
+        # 防止丢失刚刚发生的恢复通知。
         if self.has_available_prefiller():
             self.prefiller_available_event.set()
             return True
+
         try:
             await asyncio.wait_for(self.prefiller_available_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             return False
+
         available = self.has_available_prefiller()
         if not available:
+            # 防止旧事件或虚假唤醒导致下一轮继续立即返回。
             self.prefiller_available_event.clear()
         return available
 
     async def wait_for_decoder(self, timeout: float = 5.0) -> bool:
+        """等待 Decode 可用，超时返回 False。"""
         if self.has_available_decoder():
             return True
+
+        # 清理节点被隔离前遗留的 set 状态，避免恢复等待循环空转，
+        # 从而保证 keep-alive 按 timeout 周期输出，而不是瞬间刷屏。
         self.decoder_available_event.clear()
+
+        # 防止 clear 与节点恢复并发时丢失恢复通知。
         if self.has_available_decoder():
             self.decoder_available_event.set()
             return True
+
         try:
             await asyncio.wait_for(self.decoder_available_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             return False
+
         available = self.has_available_decoder()
         if not available:
             self.decoder_available_event.clear()
         return available
 
-    async def wait_for_mixed(self, timeout: float = 5.0) -> bool:
-        if self.has_available_mixed():
-            return True
-        self.mixed_available_event.clear()
-        if self.has_available_mixed():
-            self.mixed_available_event.set()
-            return True
-        try:
-            await asyncio.wait_for(self.mixed_available_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return False
-        available = self.has_available_mixed()
-        if not available:
-            self.mixed_available_event.clear()
-        return available
-
     def _sync_availability_events(self) -> None:
+        """同步 Prefill/Decode 可用事件，避免事件状态延迟造成空转。"""
+
         def apply_event_states() -> None:
             if self.has_available_prefiller():
                 self.prefiller_available_event.set()
             else:
                 self.prefiller_available_event.clear()
+
             if self.has_available_decoder():
                 self.decoder_available_event.set()
             else:
                 self.decoder_available_event.clear()
-            if self.has_available_mixed():
-                self.mixed_available_event.set()
-            else:
-                self.mixed_available_event.clear()
 
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
+            # NodeListener 后台线程中没有正在运行的 asyncio 事件循环。
             running_loop = None
 
         if running_loop is self.event_loop:
+            # 当前已经在 Proxy 主事件循环中，立即同步，避免 clear/set
+            # 被延迟到后续循环才执行。
             apply_event_states()
         else:
+            # NodeListener 等后台线程通过线程安全方式提交到主事件循环。
             self.event_loop.call_soon_threadsafe(apply_event_states)
-
+    
     def list_recovery_requests(self) -> list[RequestRecoveryState]:
         with self.recovery_requests_lock:
             return list(self.recovery_requests.values())
 
     def select_prefiller(self, token_count):
-        """Select one rank endpoint from all currently healthy Prefill groups."""
+        """Select the least loaded prefiller instance. Thread-safe for concurrent async calls."""
         with self._prefiller_selection_lock:
             if not self.has_available_prefiller():
-                raise RuntimeError("No prefiller groups available")
+                raise RuntimeError("No prefiller servers available")
+
             priority, chosen, server = heapq.heappop(self.prefiller_heap)
-            if priority >= TAINT_PRIORITY:
-                heapq.heappush(self.prefiller_heap, (priority, chosen, server))
-                raise RuntimeError("No prefiller groups available")
+
+            # Update the chosen server
             self.prefillers[chosen].active_tokens += token_count
             self.prefillers[chosen].active_kv_cache += token_count
+
+            # Update priority and re-add to heap
             self._update_prefiller_priority(chosen)
+
             return chosen
 
     def release_prefiller(self, idx, token_count):
+        """Release a prefiller instance. Thread-safe for concurrent async calls."""
         with self._prefiller_selection_lock:
             if idx >= len(self.prefillers):
                 return
-            self.prefillers[idx].active_tokens = max(
-                0, self.prefillers[idx].active_tokens - token_count
-            )
+            self.prefillers[idx].active_tokens -= token_count
+            # Update priority queue after releasing
             self._update_prefiller_priority(idx)
 
     def release_prefiller_kv(self, idx, token_count):
+        """Release prefiller KV cache. Thread-safe for concurrent async calls."""
         with self._prefiller_selection_lock:
             if idx >= len(self.prefillers):
                 return
-            self.prefillers[idx].active_kv_cache = max(
-                0, self.prefillers[idx].active_kv_cache - token_count
-            )
+            if self.prefillers[idx].active_kv_cache > 0:
+                self.prefillers[idx].active_kv_cache -= token_count
+            # Update priority queue after releasing
             self._update_prefiller_priority(idx)
 
     def select_decoder(self, token_count):
-        """Select one rank endpoint from all currently healthy Decode groups."""
+        """Select the least loaded decoder instance. Thread-safe for concurrent async calls."""
         with self._decoder_selection_lock:
             if not self.has_available_decoder():
-                raise RuntimeError("No decoder groups available")
+                raise RuntimeError("No decoder servers available")
+
             priority, chosen, server = heapq.heappop(self.decoder_heap)
-            if priority >= TAINT_PRIORITY:
-                heapq.heappush(self.decoder_heap, (priority, chosen, server))
-                raise RuntimeError("No decoder groups available")
+
+            # Update the chosen server
             self.decoders[chosen].active_tokens += token_count
+
+            # Update priority and re-add to heap
             self._update_decoder_priority(chosen)
+
             return chosen
 
     def release_decoder(self, idx, token_count):
+        """Release a decoder instance. Thread-safe for concurrent async calls."""
         with self._decoder_selection_lock:
             if idx >= len(self.decoders):
                 return
-            self.decoders[idx].active_tokens = max(
-                0, self.decoders[idx].active_tokens - token_count
-            )
+            self.decoders[idx].active_tokens -= token_count
+            # Update priority queue after releasing
             self._update_decoder_priority(idx)
 
-    def select_mixed(self, token_count):
-        """Select one rank endpoint from all currently healthy MIXED groups."""
-        with self._mixed_selection_lock:
-            if not self.has_available_mixed():
-                raise RuntimeError("No mixed groups available")
-            priority, chosen, server = heapq.heappop(self.mixed_heap)
-            if priority >= TAINT_PRIORITY:
-                heapq.heappush(self.mixed_heap, (priority, chosen, server))
-                raise RuntimeError("No mixed groups available")
-            self.mixed_instances[chosen].active_tokens += token_count
-            self._update_mixed_priority(chosen)
-            return chosen
-
-    def release_mixed(self, idx, token_count):
-        with self._mixed_selection_lock:
-            if idx >= len(self.mixed_instances):
-                return
-            self.mixed_instances[idx].active_tokens = max(
-                0, self.mixed_instances[idx].active_tokens - token_count
-            )
-            self._update_mixed_priority(idx)
-
+    # Omni_infer's calculate_input_scores function
     def calculate_prefill_scores(self, request_length: int) -> float:
         length_score = request_length / 4.0
-        return length_score * 0.0345 + 120.0745
+        input_score = length_score * 0.0345 + 120.0745
+        return input_score
 
     def calculate_decode_scores(self, request_length: int) -> float:
         return request_length
 
-    def calculate_mixed_scores(self, request_length: int) -> float:
-        # MIXED 实例同时承担 Prefill + Decode，这里沿用请求长度作为负载近似值。
-        return request_length
-
-    def _append_group(self, group: ServerGroupState) -> None:
-        if group.instance_type == InstanceType.PREFILL:
-            with self._prefiller_selection_lock:
-                self.prefiller_groups.append(group)
-                self._rebuild_prefiller_topology()
-                self._rebuild_prefiller_heap()
-        elif group.instance_type == InstanceType.DECODE:
-            with self._decoder_selection_lock:
-                self.decoder_groups.append(group)
-                self._rebuild_decoder_topology()
-                self._rebuild_decoder_heap()
-        elif group.instance_type == InstanceType.MIXED:
-            with self._mixed_selection_lock:
-                self.mixed_groups.append(group)
-                self._rebuild_mixed_topology()
-                self._rebuild_mixed_heap()
-        else:
-            raise ValueError(f"Unknown instance type: {group.instance_type}")
-        self._sync_availability_events()
-
-    async def add_instance_groups(
-        self,
-        instance_type: str,
-        instance_groups: list[list[ServerState]],
-    ) -> tuple[list[str], list[str]]:
-        added_groups: list[str] = []
-        waiting_groups: list[str] = []
-
-        for servers in instance_groups:
-            existing = [self._get_group(instance_type, server) for server in servers]
-            existing = [group for group in existing if group is not None]
-            if existing:
-                existing_ids = {group.group_id for group in existing}
-                if len(existing_ids) != 1 or set(existing[0].servers) != set(servers):
-                    raise ValueError(
-                        "An endpoint already belongs to another group; group membership cannot overlap"
-                    )
-                group = existing[0]
+    async def add_instances(self, instance_type: str, instances: list[ServerState]) -> tuple[list[str], list[str]]:
+        added_nodes, waiting_nodes = [], []
+        for server in instances:
+            is_valid = self.node_listener.check_instance_status(server)
+            if is_valid and instance_type == InstanceType.PREFILL:
+                self.add_prefillers([server])
+                added_nodes.append(str(server))
+            elif is_valid and instance_type == InstanceType.DECODE:
+                self.add_decoders([server])
+                added_nodes.append(str(server))
             else:
-                group = self._new_group(instance_type, servers)
-                # A newly discovered group starts isolated. It becomes selectable
-                # only after every member passes the initial health check.
-                group.tainted = True
-                self._append_group(group)
-
-            all_healthy = all(
-                self.node_listener.check_instance_status(server) for server in group.servers
-            )
-            if all_healthy:
-                self.restore_group(group)
-                added_groups.append(group.group_id)
-            else:
-                self.taint_group(group)
-                self.node_listener.watch_group(group, failed_server=None)
-                waiting_groups.append(group.group_id)
-
-        return added_groups, waiting_groups
-
-    async def add_instances(
-        self,
-        instance_type: str,
-        instances: list[ServerState],
-    ) -> tuple[list[str], list[str]]:
-        # Backward-compatible dynamic API: each item in "instances" is a
-        # one-member group. Use the optional "groups" API field for a multi-rank group.
-        return await self.add_instance_groups(instance_type, [[server] for server in instances])
+                node = str(server)
+                self.node_listener.waiting_nodes[node] = (instance_type, server, 0)
+                waiting_nodes.append(node)
+        return added_nodes, waiting_nodes
 
     def add_prefillers(self, instances: list[ServerState]) -> None:
         for server in instances:
-            group = self.prefiller_group_by_server.get(server)
-            if group is None:
-                group = self._new_group(InstanceType.PREFILL, [server])
-                self._append_group(group)
-            else:
-                self.restore_group(group)
+            if server in self.tainted_prefillers:
+                self.tainted_prefillers.remove(server)
+                self.prefiller_heap = [
+                    (0, idx, server) if srv == server else (priority, idx, srv)
+                    for priority, idx, srv in self.prefiller_heap
+                ]
+                heapq.heapify(self.prefiller_heap)
+            elif server not in self.prefillers:
+                self.prefillers.append(server)
+                # prefiller_heap: [(priority_0, 0, server_0)] -> [(priority_0, 0, server_0), (0, 1, server_1)]
+                heapq.heappush(self.prefiller_heap, (0, len(self.prefillers) - 1, server))
+        self._sync_availability_events()
         self.print_status(f"Add prefiller instances: {instances}.")
 
     def add_decoders(self, instances: list[ServerState]) -> None:
         for server in instances:
-            group = self.decoder_group_by_server.get(server)
-            if group is None:
-                group = self._new_group(InstanceType.DECODE, [server])
-                self._append_group(group)
-            else:
-                self.restore_group(group)
+            if server in self.tainted_decoders:
+                self.tainted_decoders.remove(server)
+                self.decoder_heap = [
+                    (0, idx, server) if srv == server else (priority, idx, srv)
+                    for priority, idx, srv in self.decoder_heap
+                ]
+                heapq.heapify(self.decoder_heap)
+            elif server not in self.decoders:
+                self.decoders.append(server)
+                # decoder_heap: [(priority_0, 0, server_0)] -> [(priority_0, 0, server_0), (0, 1, server_1)]
+                heapq.heappush(self.decoder_heap, (0, len(self.decoders) - 1, server))
+        self._sync_availability_events()
         self.print_status(f"Add decoder instances: {instances}.")
 
-    def add_mixed_instances(self, instances: list[ServerState]) -> None:
-        for server in instances:
-            group = self.mixed_group_by_server.get(server)
-            if group is None:
-                group = self._new_group(InstanceType.MIXED, [server])
-                self._append_group(group)
-            else:
-                self.restore_group(group)
-        self.print_status(f"Add mixed instances: {instances}.")
-
-    def taint_group(
-        self,
-        group: ServerGroupState,
-        failed_server: ServerState | None = None,
-    ) -> None:
-        if group.pending_removal:
-            return
-
-        if group.instance_type == InstanceType.PREFILL:
-            with self._prefiller_selection_lock:
-                group.tainted = True
-                if failed_server is not None:
-                    group.failed_member = failed_server
-                for server in group.servers:
-                    if server not in self.tainted_prefillers:
-                        self.tainted_prefillers.append(server)
-                self._rebuild_prefiller_heap()
-        elif group.instance_type == InstanceType.DECODE:
-            with self._decoder_selection_lock:
-                group.tainted = True
-                if failed_server is not None:
-                    group.failed_member = failed_server
-                for server in group.servers:
-                    if server not in self.tainted_decoders:
-                        self.tainted_decoders.append(server)
-                self._rebuild_decoder_heap()
-        elif group.instance_type == InstanceType.MIXED:
-            with self._mixed_selection_lock:
-                group.tainted = True
-                if failed_server is not None:
-                    group.failed_member = failed_server
-                for server in group.servers:
-                    if server not in self.tainted_mixed:
-                        self.tainted_mixed.append(server)
-                self._rebuild_mixed_heap()
-        else:
-            raise ValueError(f"Unknown instance type: {group.instance_type}")
-        self._sync_availability_events()
-
-    def restore_group(self, group: ServerGroupState) -> None:
-        if group.pending_removal:
-            return
-
-        if group.instance_type == InstanceType.PREFILL:
-            with self._prefiller_selection_lock:
-                group.tainted = False
-                group.failed_member = None
-                self.tainted_prefillers = [
-                    server for server in self.tainted_prefillers if server not in group.servers
-                ]
-                self._rebuild_prefiller_heap()
-        elif group.instance_type == InstanceType.DECODE:
-            with self._decoder_selection_lock:
-                group.tainted = False
-                group.failed_member = None
-                self.tainted_decoders = [
-                    server for server in self.tainted_decoders if server not in group.servers
-                ]
-                self._rebuild_decoder_heap()
-        elif group.instance_type == InstanceType.MIXED:
-            with self._mixed_selection_lock:
-                group.tainted = False
-                group.failed_member = None
-                self.tainted_mixed = [
-                    server for server in self.tainted_mixed if server not in group.servers
-                ]
-                self._rebuild_mixed_heap()
-        else:
-            raise ValueError(f"Unknown instance type: {group.instance_type}")
-        self._sync_availability_events()
-        logger.info("[GROUP RECOVERED] %s", group)
-
-    def _taint_prefillers(self, instances: list[ServerState]) -> None:
-        for group in self._get_groups_for_servers(InstanceType.PREFILL, instances):
-            self.taint_group(group)
-
-    def _taint_decoders(self, instances: list[ServerState]) -> None:
-        for group in self._get_groups_for_servers(InstanceType.DECODE, instances):
-            self.taint_group(group)
-
-    def _taint_mixed(self, instances: list[ServerState]) -> None:
-        for group in self._get_groups_for_servers(InstanceType.MIXED, instances):
-            self.taint_group(group)
-
-    def mark_prefiller_unavailable(self, server: ServerState) -> None:
-        group = self.prefiller_group_by_server.get(server)
-        if group is None:
-            logger.warning("[PREFILL UNAVAILABLE] unknown instance=%s", server)
-            return
-        self.taint_group(group, failed_server=server)
-        self.node_listener.watch_group(group, failed_server=server)
-        logger.warning(
-            "[PREFILL GROUP UNAVAILABLE] group=%s failed_member=%s members=%s",
-            group.group_id,
-            server,
-            [str(member) for member in group.servers],
-        )
-
-    def mark_decoder_unavailable(self, server: ServerState) -> None:
-        group = self.decoder_group_by_server.get(server)
-        if group is None:
-            logger.warning("[DECODE UNAVAILABLE] unknown instance=%s", server)
-            return
-        self.taint_group(group, failed_server=server)
-        self.node_listener.watch_group(group, failed_server=server)
-        logger.warning(
-            "[DECODE GROUP UNAVAILABLE] group=%s failed_member=%s members=%s",
-            group.group_id,
-            server,
-            [str(member) for member in group.servers],
-        )
-
-    def mark_mixed_unavailable(self, server: ServerState) -> None:
-        group = self.mixed_group_by_server.get(server)
-        if group is None:
-            logger.warning("[MIXED UNAVAILABLE] unknown instance=%s", server)
-            return
-        self.taint_group(group, failed_server=server)
-        self.node_listener.watch_group(group, failed_server=server)
-        logger.warning(
-            "[MIXED GROUP UNAVAILABLE] group=%s failed_member=%s members=%s",
-            group.group_id,
-            server,
-            [str(member) for member in group.servers],
-        )
-
     def remove_prefillers(self, instances: list[ServerState]) -> bool:
-        return self._remove_instance_groups(InstanceType.PREFILL, instances)
-
-    def remove_decoders(self, instances: list[ServerState]) -> bool:
-        return self._remove_instance_groups(InstanceType.DECODE, instances)
-
-    def remove_mixed(self, instances: list[ServerState]) -> bool:
-        return self._remove_instance_groups(InstanceType.MIXED, instances)
-
-    def _remove_instance_groups(
-        self,
-        instance_type: str,
-        instances: list[ServerState],
-    ) -> bool:
-        groups = self._get_groups_for_servers(instance_type, instances)
-        if not groups:
+        if not instances:
             return False
 
         if self.request_num > 0:
-            for group in groups:
-                group.pending_removal = True
-                self.taint_group_for_removal(group)
-                self.node_listener.cancel_group_watch(group)
-            logger.warning(
-                "Groups are isolated and will be removed after active requests finish: %s",
-                [group.group_id for group in groups],
-            )
+            logger.warning("Start to taint prefill instances %s.", instances)
+            self._taint_prefillers(instances)
             return True
 
-        self._remove_groups_now(instance_type, groups)
+        instances_to_remove = set(instances)
+        self.prefillers = [server for server in self.prefillers if server not in instances_to_remove]
+        prefiller_heap_copy = self.prefiller_heap.copy()
+        prefiller_heap_copy.sort(key=lambda x: x[1])  # sorted by key: prefiller_idx
+        prefiller_heap = []
+        idx = 0
+        for priority, _, server in prefiller_heap_copy:
+            if server not in instances_to_remove:
+                prefiller_heap.append((priority, idx, server))
+                idx += 1
+
+        # prefiller_heap: [(priority_0, 0, server_0), (priority_1, 1, server_1)] -> [(priority_1, 0, server_1)]
+        self.prefiller_heap = prefiller_heap
+        heapq.heapify(self.prefiller_heap)
+        self._sync_availability_events()
+        self.print_status(f"Remove prefiller instances: {instances}.")
         return False
 
-    def taint_group_for_removal(self, group: ServerGroupState) -> None:
-        if group.instance_type == InstanceType.PREFILL:
-            with self._prefiller_selection_lock:
-                group.tainted = True
-                group.pending_removal = True
-                for server in group.servers:
-                    if server not in self.tainted_prefillers:
-                        self.tainted_prefillers.append(server)
-                self._rebuild_prefiller_heap()
-        elif group.instance_type == InstanceType.DECODE:
-            with self._decoder_selection_lock:
-                group.tainted = True
-                group.pending_removal = True
-                for server in group.servers:
-                    if server not in self.tainted_decoders:
-                        self.tainted_decoders.append(server)
-                self._rebuild_decoder_heap()
-        elif group.instance_type == InstanceType.MIXED:
-            with self._mixed_selection_lock:
-                group.tainted = True
-                group.pending_removal = True
-                for server in group.servers:
-                    if server not in self.tainted_mixed:
-                        self.tainted_mixed.append(server)
-                self._rebuild_mixed_heap()
-        else:
-            raise ValueError(f"Unknown instance type: {group.instance_type}")
-        self._sync_availability_events()
+    def remove_decoders(self, instances: list[ServerState]) -> bool:
+        if not instances:
+            return False
 
-    def _remove_groups_now(
-        self,
-        instance_type: str,
-        groups: list[ServerGroupState],
-    ) -> None:
-        group_ids = {group.group_id for group in groups}
-        for group in groups:
-            self.node_listener.cancel_group_watch(group)
-
-        if instance_type == InstanceType.PREFILL:
-            with self._prefiller_selection_lock:
-                self.prefiller_groups = [
-                    group for group in self.prefiller_groups if group.group_id not in group_ids
-                ]
-                self._rebuild_prefiller_topology()
-                self._rebuild_prefiller_heap()
-                with self._session_lock:
-                    self.session_prefill_map.clear()
-        elif instance_type == InstanceType.DECODE:
-            with self._decoder_selection_lock:
-                self.decoder_groups = [
-                    group for group in self.decoder_groups if group.group_id not in group_ids
-                ]
-                self._rebuild_decoder_topology()
-                self._rebuild_decoder_heap()
-                with self._session_lock:
-                    self.session_decoder_map.clear()
-        elif instance_type == InstanceType.MIXED:
-            with self._mixed_selection_lock:
-                self.mixed_groups = [
-                    group for group in self.mixed_groups if group.group_id not in group_ids
-                ]
-                self._rebuild_mixed_topology()
-                self._rebuild_mixed_heap()
-                with self._session_lock:
-                    self.session_mixed_map.clear()
-        else:
-            raise ValueError(f"Unknown instance type: {instance_type}")
-
-        self._sync_availability_events()
-        self.print_status(f"Removed {instance_type} groups: {sorted(group_ids)}.")
-
-    def finalize_pending_removals(self) -> None:
         if self.request_num > 0:
-            return
-        prefill_groups = [group for group in self.prefiller_groups if group.pending_removal]
-        decode_groups = [group for group in self.decoder_groups if group.pending_removal]
-        mixed_groups = [group for group in self.mixed_groups if group.pending_removal]
-        if prefill_groups:
-            self._remove_groups_now(InstanceType.PREFILL, prefill_groups)
-        if decode_groups:
-            self._remove_groups_now(InstanceType.DECODE, decode_groups)
-        if mixed_groups:
-            self._remove_groups_now(InstanceType.MIXED, mixed_groups)
+            logger.warning("Start to taint decode instances %s.", instances)
+            self._taint_decoders(instances)
+            return True
 
-    def group_status(self) -> dict[str, list[dict[str, Any]]]:
-        return {
-            "prefill_groups": [group.to_dict() for group in self.prefiller_groups],
-            "decode_groups": [group.to_dict() for group in self.decoder_groups],
-            "mixed_groups": [group.to_dict() for group in self.mixed_groups],
-        }
+        instances_to_remove = set(instances)
+        self.decoders = [server for server in self.decoders if server not in instances_to_remove]
+        decoder_heap_copy = self.decoder_heap.copy()
+        decoder_heap_copy.sort(key=lambda x: x[1])  # sorted by key: decoder_idx
+        decoder_heap = []
+        idx = 0
+        for priority, _, server in decoder_heap_copy:
+            if server not in instances_to_remove:
+                decoder_heap.append((priority, idx, server))
+                idx += 1
+
+        # decoder_heap: [(priority_0, 0, server_0), (priority_1, 1, server_1)] -> [(priority_1, 0, server_1)]
+        self.decoder_heap = decoder_heap
+        heapq.heapify(self.decoder_heap)
+        self._sync_availability_events()
+        self.print_status(f"Remove decoder instances: {instances}.")
+        return False
+
+    def _taint_prefillers(self, instances: list[ServerState]) -> None:
+        instances_to_taint = set(instances)
+        for server in self.prefillers:
+            if server in instances_to_taint and server not in self.tainted_prefillers:
+                self.tainted_prefillers.append(server)
+
+        self.prefiller_heap = [
+            (TAINT_PRIORITY, idx, srv) if srv in instances_to_taint else (priority, idx, srv)
+            for priority, idx, srv in self.prefiller_heap
+        ]
+        heapq.heapify(self.prefiller_heap)
+        self._sync_availability_events()
+
+    def _taint_decoders(self, instances: list[ServerState]) -> None:
+        instances_to_taint = set(instances)
+        for server in self.decoders:
+            if server in instances_to_taint and server not in self.tainted_decoders:
+                self.tainted_decoders.append(server)
+
+        self.decoder_heap = [
+            (TAINT_PRIORITY, idx, srv) if srv in instances_to_taint else (priority, idx, srv)
+            for priority, idx, srv in self.decoder_heap
+        ]
+        heapq.heapify(self.decoder_heap)
+        self._sync_availability_events()
+
+    def mark_prefiller_unavailable(self, server: ServerState) -> None:
+        """立即将一个 Prefill 标记为不可用，并加入恢复监听。"""
+        self._taint_prefillers([server])
+        self.node_listener.waiting_nodes[str(server)] = (InstanceType.PREFILL, server, 0)
+        logger.warning("[PREFILL UNAVAILABLE] instance=%s has been moved to waiting nodes", server)
+
+    def mark_decoder_unavailable(self, server: ServerState) -> None:
+        """立即隔离故障 Decode，并加入恢复监听。"""
+        self._taint_decoders([server])
+        self.node_listener.waiting_nodes[str(server)] = (InstanceType.DECODE, server, 0)
+        logger.warning("[DECODE UNAVAILABLE] instance=%s has been moved to waiting nodes", server)
 
     def print_status(self, msg: str) -> None:
-        status = self.group_status()
-        status["deployment_mode"] = self.deployment_mode
-        status["prefill_instances"] = [str(server) for server in self.prefillers]
-        status["decode_instances"] = [str(server) for server in self.decoders]
-        status["mixed_instances"] = [str(server) for server in self.mixed_instances]
+        status = {
+            "prefill_instances": [str(server) for server in self.prefillers],
+            "decode_instances": [str(server) for server in self.decoders],
+        }
         print(f"{msg} Status: {status}")
 
 
@@ -1085,433 +663,139 @@ proxy_state = None
 class NodeListener:
     def __init__(self, proxy):
         self.proxy_state = proxy
-        # key -> (group, check_times). Recovery is group-scoped: every member
-        # must pass the same recovery cycle before the group is re-enabled.
-        self.waiting_groups: dict[str, tuple[ServerGroupState, int]] = {}
-        self._waiting_groups_lock = threading.RLock()
-        self.check_timeout = 10.0
-        self.max_failures = 3
-        self.failure_counters: dict[str, int] = {}
+        self.waiting_nodes: dict[str, tuple[str, Any, int]] = {}
+        self.check_timeout = 10.0      # 将超时时间延长到 10 秒
+        self.max_failures = 3          # 连续失败 3 次才判定为 DOWN
+        self.failure_counters = {}     # 记录正常节点的连续失败次数: {server_url: count}
 
-        self.listening_thread = threading.Thread(
-            target=self._node_listener,
-            daemon=True,
-        )
+        self.listening_thread = threading.Thread(target=self._node_listener, daemon=True)
         self.listening_thread.start()
+
         logger.info("NodeListener background thread started.")
-
-    @staticmethod
-    def _group_key(group: ServerGroupState) -> str:
-        return f"{group.instance_type}:{group.group_id}"
-
-    @staticmethod
-    def _failure_key(instance_type: str, server: ServerState) -> str:
-        return f"{instance_type}:{server.host}:{server.port}"
-
-    def watch_group(
-        self,
-        group: ServerGroupState,
-        failed_server: ServerState | None,
-    ) -> None:
-        if group.pending_removal:
-            return
-        if failed_server is not None:
-            group.failed_member = failed_server
-        key = self._group_key(group)
-        with self._waiting_groups_lock:
-            previous = self.waiting_groups.get(key)
-            check_times = previous[1] if previous else 0
-            self.waiting_groups[key] = (group, check_times)
-        for member in group.servers:
-            self.failure_counters.pop(
-                self._failure_key(group.instance_type, member),
-                None,
-            )
-
-    def cancel_group_watch(self, group: ServerGroupState) -> None:
-        with self._waiting_groups_lock:
-            self.waiting_groups.pop(self._group_key(group), None)
-
-    def _snapshot_waiting_groups(self) -> list[tuple[str, ServerGroupState, int]]:
-        with self._waiting_groups_lock:
-            return [
-                (key, group, check_times)
-                for key, (group, check_times) in self.waiting_groups.items()
-            ]
-
     def _node_listener(self) -> None:
         while True:
-            try:
-                self._check_waiting_groups()
-                self._check_active_servers(InstanceType.PREFILL)
-                self._check_active_servers(InstanceType.DECODE)
-                self._check_active_servers(InstanceType.MIXED)
-                self.proxy_state.finalize_pending_removals()
-            except Exception:
-                logger.exception("Unexpected error in NodeListener loop")
+            if not hasattr(self.proxy_state, 'prefillers') or not hasattr(self.proxy_state, 'decoders'):
+                logger.debug("ProxyState is not fully initialized yet. Waiting...")
+                time.sleep(1)
+                continue
+
+            if self.waiting_nodes:
+                logger.debug(f"Checking {len(self.waiting_nodes)} nodes in waiting_nodes list.")
+            for node, (instance_type, server, check_times) in list(self.waiting_nodes.items()):
+                is_valid = self.check_instance_status(server)
+                print(f"Checking instance {node}...")
+                check_times += 1
+                if is_valid:
+                    logger.info(f"[RECOVERY] {instance_type} instance {server.host}:{server.port} recovered. Adding back to proxy pool.")
+                    if instance_type == InstanceType.PREFILL:
+                        self.proxy_state.add_prefillers([server])
+                    else:
+                        self.proxy_state.add_decoders([server])
+                    self.waiting_nodes.pop(node)
+                else:
+                    self.waiting_nodes[node] = (instance_type, server, check_times)
+                    if (check_times + 1) % 10 == 0:  # 每失败 10 次打印一次警告，避免日志爆炸
+                        logger.warning(f"[WAITING] {instance_type} instance {server.host}:{server.port} is still down. Checked {check_times} times.")
+            # 2. 检查正常服务中的 Prefill 节点（发现异常则踢出）
+            for server in list(self.proxy_state.prefillers):
+                if server not in self.proxy_state.tainted_prefillers:
+                    self._check_and_handle_active_node(server, InstanceType.PREFILL)
+
+            # 3. 检查正常服务中的 Decode 节点（发现异常则踢出）
+            for server in list(self.proxy_state.decoders):
+                if server not in self.proxy_state.tainted_decoders:
+                    self._check_and_handle_active_node(server, InstanceType.DECODE)
+
+            if self.proxy_state.tainted_prefillers and not self.proxy_state.request_num:
+                need_waiting = self.proxy_state.remove_prefillers(self.proxy_state.tainted_prefillers)
+                if not need_waiting:
+                    self.proxy_state.tainted_prefillers.clear()
+
+            if self.proxy_state.tainted_decoders and not self.proxy_state.request_num:
+                need_waiting = self.proxy_state.remove_decoders(self.proxy_state.tainted_decoders)
+                if not need_waiting:
+                    self.proxy_state.tainted_decoders.clear()
             time.sleep(global_args.waiting_retry_interval)
 
-    def _check_waiting_groups(self) -> None:
-        waiting_snapshot = self._snapshot_waiting_groups()
-        if waiting_snapshot:
-            logger.debug("Checking %s groups waiting for recovery.", len(waiting_snapshot))
-
-        for key, group, check_times in waiting_snapshot:
-            if group.pending_removal:
-                self.cancel_group_watch(group)
-                continue
-
-            unhealthy_members: list[str] = []
-            for server in group.servers:
-                if not self.check_instance_status(server, self.check_timeout):
-                    unhealthy_members.append(str(server))
-
-            check_times += 1
-            if not unhealthy_members:
-                logger.info(
-                    "[GROUP RECOVERY] %s all members recovered; adding the whole group back.",
-                    group,
-                )
-                self.proxy_state.restore_group(group)
-                with self._waiting_groups_lock:
-                    self.waiting_groups.pop(key, None)
-                continue
-
-            with self._waiting_groups_lock:
-                if key in self.waiting_groups:
-                    self.waiting_groups[key] = (group, check_times)
-            if check_times == 1 or check_times % 10 == 0:
-                logger.warning(
-                    "[GROUP WAITING] group=%s checked=%s unhealthy_members=%s",
-                    group.group_id,
-                    check_times,
-                    unhealthy_members,
-                )
-
-    def _check_active_servers(self, instance_type: str) -> None:
-        if instance_type == InstanceType.PREFILL:
-            servers = list(self.proxy_state.prefillers)
-            tainted_servers = self.proxy_state.tainted_prefillers
-        elif instance_type == InstanceType.DECODE:
-            servers = list(self.proxy_state.decoders)
-            tainted_servers = self.proxy_state.tainted_decoders
-        elif instance_type == InstanceType.MIXED:
-            servers = list(self.proxy_state.mixed_instances)
-            tainted_servers = self.proxy_state.tainted_mixed
-        else:
-            raise ValueError(f"Unknown instance type: {instance_type}")
-
-        for server in servers:
-            if server in tainted_servers:
-                continue
-            self._check_and_handle_active_node(server, instance_type)
-
-    def _check_and_handle_active_node(
-        self,
-        server: ServerState,
-        instance_type: str,
-    ) -> None:
-        server_key = self._failure_key(instance_type, server)
+    def _check_and_handle_active_node(self, server: Any, instance_type: str) -> None:
+        """
+        检查活跃节点，加入连续失败容错机制
+        """
+        server_key = f"{server.host}:{server.port}"
         is_valid = self.check_instance_status(server, self.check_timeout)
-
+        
         if is_valid:
-            self.failure_counters.pop(server_key, None)
-            return
-
-        current_failures = self.failure_counters.get(server_key, 0) + 1
-        self.failure_counters[server_key] = current_failures
-
-        if current_failures < self.max_failures:
-            logger.warning(
-                "[WARNING] %s instance %s check failed (%s/%s).",
-                instance_type,
-                server,
-                current_failures,
-                self.max_failures,
-            )
-            return
-
-        logger.error(
-            "[DOWN] %s instance %s failed %s times; isolating its entire group.",
-            instance_type,
-            server,
-            current_failures,
-        )
-        if instance_type == InstanceType.PREFILL:
-            self.proxy_state.mark_prefiller_unavailable(server)
-        elif instance_type == InstanceType.DECODE:
-            self.proxy_state.mark_decoder_unavailable(server)
-        elif instance_type == InstanceType.MIXED:
-            self.proxy_state.mark_mixed_unavailable(server)
+            # 如果健康，清零失败计数
+            if server_key in self.failure_counters:
+                self.failure_counters[server_key] = 0
         else:
-            raise ValueError(f"Unknown instance type: {instance_type}")
+            # 如果不健康，增加失败计数
+            current_failures = self.failure_counters.get(server_key, 0) + 1
+            self.failure_counters[server_key] = current_failures
+            
+            if current_failures >= self.max_failures:
+                logger.error(f"[DOWN] {instance_type} instance {server_key} failed {current_failures} times. Removing from active pool.")
+                if instance_type == InstanceType.PREFILL:
+                    self.proxy_state.remove_prefillers([server])
+                else:
+                    self.proxy_state.remove_decoders([server])
+                self.waiting_nodes[str(server)] = (instance_type, server, 0)
+                # 移出活跃池后，清理计数器
+                self.failure_counters.pop(server_key, None)
+            else:
+                logger.warning(f"[WARNING] {instance_type} instance {server_key} check failed ({current_failures}/{self.max_failures}).")
 
     @staticmethod
     def check_instance_status(server: Any, timeout: float = 10) -> bool:
         """
-        Request /metrics. A connection failure, non-2xx response, or the
-        backend sentinel 999999.0 means the rank endpoint is unhealthy.
+        请求 /metrics。
+        如果包含 999999，表示故障 (返回 False)。
+        如果连不上，表示故障 (返回 False)。
+        正常响应且不包含 999999，表示健康 (返回 True)。
         """
-        host = server.host
-        try:
-            ip = ipaddress.ip_address(host)
-            if isinstance(ip, ipaddress.IPv6Address):
-                host = f"[{host}]"
-        except Exception:
-            pass
-
-        url = f"http://{host}:{server.port}/metrics"
+        url = f"http://{server.host}:{server.port}/metrics"
         try:
             response = requests.get(url, timeout=timeout)
             response.raise_for_status()
+            
             if "999999.0" in response.text:
-                logger.warning(
-                    "[HEALTH CHECK] %s reported failure code '999999'.",
-                    url,
-                )
+                logger.warning(f"[HEALTH CHECK] {url} reported failure code '999999'.")
                 return False
-            return True
-        except Exception as error:
-            logger.warning(
-                "[HEALTH CHECK] Failed to connect to %s. Error: %s - %s",
-                url,
-                type(error).__name__,
-                error,
-            )
+            else:
+                return True
+                
+        except Exception as e:
+            logger.warning(f"[HEALTH CHECK] Failed to connect to {url}. Error: {type(e).__name__} - {str(e)}")
             return False
-
-
-def _normalize_endpoint_key(host: str, port: int) -> tuple[str, int]:
-    normalized_host = host.replace("localhost", "0.0.0.0").replace(
-        "127.0.0.1", "0.0.0.0"
-    )
-    return normalized_host, int(port)
-
-
-def _parse_bracket_groups(values: list[str], option_name: str) -> list[list[str]]:
-    if not values:
-        raise ValueError(f"{option_name} cannot be empty")
-
-    groups: list[list[str]] = []
-    current_group: list[str] | None = None
-
-    for token in values:
-        starts_group = token.startswith("[")
-        ends_group = token.endswith("]")
-
-        if current_group is None:
-            if starts_group:
-                first_value = token[1:]
-                current_group = []
-                if first_value:
-                    current_group.append(first_value)
-                continue
-
-            if ends_group:
-                raise ValueError(f"{option_name}: unexpected closing bracket in {token!r}")
-            if "[" in token or "]" in token:
-                raise ValueError(f"{option_name}: invalid bracket placement in {token!r}")
-
-            groups.append([token])
-            continue
-
-        # Inside an already-open bracket group.
-        if starts_group or "[" in token:
-            raise ValueError(f"{option_name}: nested bracket groups are not supported")
-
-        if ends_group:
-            value = token[:-1]
-            if "]" in value:
-                raise ValueError(f"{option_name}: invalid bracket placement in {token!r}")
-            if value:
-                current_group.append(value)
-            if not current_group:
-                raise ValueError(f"{option_name}: bracket group cannot be empty")
-            groups.append(current_group)
-            current_group = None
-            continue
-
-        if "]" in token:
-            raise ValueError(f"{option_name}: invalid bracket placement in {token!r}")
-        current_group.append(token)
-
-    if current_group is not None:
-        raise ValueError(f"{option_name}: missing closing bracket")
-
-    return groups
-
-
-def _build_instance_groups(
-    hosts: list[str] | None,
-    ports: list[str] | None,
-    instance_type: str,
-    default_host: str,
-    default_port: int,
-) -> list[list[tuple[str, int]]]:
-    if hosts is None and ports is None:
-        hosts = [default_host]
-        ports = [str(default_port)]
-    elif hosts is None or ports is None:
-        raise ValueError(
-            f"--{instance_type}-hosts and --{instance_type}-ports must be configured together"
-        )
-
-    host_groups = _parse_bracket_groups(hosts, f"--{instance_type}-hosts")
-    port_groups_raw = _parse_bracket_groups(ports, f"--{instance_type}-ports")
-
-    if len(host_groups) != len(port_groups_raw):
-        raise ValueError(
-            f"{instance_type}: host group count ({len(host_groups)}) must match "
-            f"port group count ({len(port_groups_raw)})"
-        )
-
-    groups: list[list[tuple[str, int]]] = []
-    seen_endpoints: dict[tuple[str, int], int] = {}
-
-    for group_index, (host_group, port_group_raw) in enumerate(
-        zip(host_groups, port_groups_raw)
-    ):
-        if len(host_group) != len(port_group_raw):
-            raise ValueError(
-                f"{instance_type} group {group_index}: number of hosts "
-                f"({len(host_group)}) must match number of ports "
-                f"({len(port_group_raw)})"
-            )
-
-        port_group: list[int] = []
-        for raw_port in port_group_raw:
-            try:
-                port = int(raw_port)
-            except ValueError as error:
-                raise ValueError(
-                    f"{instance_type} group {group_index}: invalid port {raw_port!r}"
-                ) from error
-            if not 1 <= port <= 65535:
-                raise ValueError(
-                    f"{instance_type} group {group_index}: port {port} must be in 1..65535"
-                )
-            port_group.append(port)
-
-        group: list[tuple[str, int]] = []
-        for host, port in zip(host_group, port_group):
-            endpoint_key = _normalize_endpoint_key(host, port)
-            if endpoint_key in seen_endpoints:
-                previous_group = seen_endpoints[endpoint_key]
-                raise ValueError(
-                    f"Duplicate {instance_type} endpoint {host}:{port} appears in "
-                    f"groups {previous_group} and {group_index}. One endpoint can only "
-                    f"belong to one group."
-                )
-            seen_endpoints[endpoint_key] = group_index
-            group.append((host, port))
-        groups.append(group)
-
-    return groups
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", type=str, default="localhost")
+    parser.add_argument("--prefiller-hosts", type=str, nargs="+", default=["localhost"])
+    parser.add_argument("--prefiller-ports", type=int, nargs="+", default=[8001])
+    parser.add_argument("--decoder-hosts", type=str, nargs="+", default=["localhost"])
+    parser.add_argument("--decoder-ports", type=int, nargs="+", default=[8002])
+    parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
     parser.add_argument(
-        "--prefiller-hosts",
-        type=str,
-        nargs="+",
-        default=None,
-        help=(
-            "Prefill hosts. Bare values are singleton groups; values inside "
-            "an unquoted [ ... ] pair form one multi-rank group."
-        ),
+        "--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
     )
     parser.add_argument(
-        "--prefiller-ports",
-        type=str,
-        nargs="+",
-        default=None,
-        help=(
-            "Prefill ports using the same group boundaries as --prefiller-hosts."
-        ),
-    )
-    parser.add_argument(
-        "--decoder-hosts",
-        type=str,
-        nargs="+",
-        default=None,
-        help=(
-            "Decode hosts. Bare values are singleton groups; values inside "
-            "an unquoted [ ... ] pair form one multi-rank group."
-        ),
-    )
-    parser.add_argument(
-        "--decoder-ports",
-        type=str,
-        nargs="+",
-        default=None,
-        help=(
-            "Decode ports using the same group boundaries as --decoder-hosts."
-        ),
-    )
-    parser.add_argument(
-        "--mixed-hosts",
-        type=str,
-        nargs="+",
-        default=None,
-        help=(
-            "PD-mixed hosts. When configured, --mixed-ports must also be set and "
-            "Prefill/Decode host/port options must not be configured. Bare values "
-            "are singleton groups; [ ... ] forms one multi-rank failure group."
-        ),
-    )
-    parser.add_argument(
-        "--mixed-ports",
-        type=str,
-        nargs="+",
-        default=None,
-        help="PD-mixed ports using the same group boundaries as --mixed-hosts.",
-    )
-    parser.add_argument(
-        "--max-retries",
-        type=int,
-        default=3,
-        help="Maximum number of retries for HTTP requests",
-    )
-    parser.add_argument(
-        "--retry-delay",
-        type=float,
-        default=0.001,
-        help="Base delay (seconds) for exponential backoff retries",
-    )
-    parser.add_argument(
-        "--max-waiting-retries",
-        type=int,
-        default=3,
-        help=(
-            "Deprecated compatibility option. Recovery waiting is time-based; "
-            "use --recovery-wait-timeout instead."
-        ),
-    )
-    parser.add_argument(
-        "--recovery-wait-timeout",
-        type=float,
-        default=1200.0,
-        help=(
-            "Maximum continuous time in seconds that one request may wait/retry "
-            "for healthy Prefill/Decode instances during recovery. Default: 1200 (20 minutes). "
-            "Set <= 0 to disable the timeout."
-        ),
+        "--max-waiting-retries", type=int, default=3, help="Maximum number of retries for waiting nodes to be started"
     )
     parser.add_argument(
         "--waiting-retry-interval",
         type=float,
         default=10,
-        help="Check interval (seconds) for waiting groups to recover",
+        help="Check interval (seconds) for waiting nodes to be started",
     )
     parser.add_argument(
         "--router-method",
         type=str,
         choices=[RouterMethod.LEAST_LOAD, RouterMethod.SESSION_AFFINITY],
         default=RouterMethod.LEAST_LOAD,
-        help="Router method for selecting backend rank endpoints",
+        help="Router method for selecting backend servers",
     )
     parser.add_argument(
         "--custom-session-id-headers",
@@ -1521,97 +805,29 @@ def parse_args():
         help="Custom HTTP header names for session ID extraction (highest priority)",
     )
     args = parser.parse_args()
-
-    mixed_configured = args.mixed_hosts is not None or args.mixed_ports is not None
-    disaggregated_configured = any(
-        value is not None
-        for value in (
-            args.prefiller_hosts,
-            args.prefiller_ports,
-            args.decoder_hosts,
-            args.decoder_ports,
-        )
-    )
-
-    if mixed_configured:
-        if args.mixed_hosts is None or args.mixed_ports is None:
-            raise ValueError("--mixed-hosts and --mixed-ports must be configured together")
-        if disaggregated_configured:
-            raise ValueError(
-                "PD mixed deployment and PD disaggregated deployment cannot be configured "
-                "at the same time. Use either --mixed-hosts/--mixed-ports or the "
-                "--prefiller-*/--decoder-* options."
-            )
-
-        args.deployment_mode = DeploymentMode.MIXED
-        args.prefiller_groups = []
-        args.decoder_groups = []
-        args.mixed_groups = _build_instance_groups(
-            args.mixed_hosts,
-            args.mixed_ports,
-            "mixed",
-            "localhost",
-            8000,
-        )
-    else:
-        args.deployment_mode = DeploymentMode.DISAGGREGATED
-        args.mixed_groups = []
-        args.prefiller_groups = _build_instance_groups(
-            args.prefiller_hosts,
-            args.prefiller_ports,
-            "prefiller",
-            "localhost",
-            8001,
-        )
-        args.decoder_groups = _build_instance_groups(
-            args.decoder_hosts,
-            args.decoder_ports,
-            "decoder",
-            "localhost",
-            8002,
-        )
-
-    args.prefiller_instances = [
-        instance for group in args.prefiller_groups for instance in group
-    ]
-    args.decoder_instances = [
-        instance for group in args.decoder_groups for instance in group
-    ]
-    args.mixed_instances = [
-        instance for group in args.mixed_groups for instance in group
-    ]
+    if len(args.prefiller_hosts) != len(args.prefiller_ports):
+        raise ValueError("Number of prefiller hosts must match number of prefiller ports")
+    if len(args.decoder_hosts) != len(args.decoder_ports):
+        raise ValueError("Number of decoder hosts must match number of decoder ports")
+    args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
+    args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
     return args
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global proxy_state
-    proxy_state = ProxyState(
-        global_args.prefiller_groups,
-        global_args.decoder_groups,
-        global_args.mixed_groups,
-        deployment_mode=global_args.deployment_mode,
-    )
-    print(
-        f"Initialized deployment_mode={proxy_state.deployment_mode}; "
-        f"{len(proxy_state.prefiller_groups)} prefill groups / "
-        f"{len(proxy_state.prefillers)} prefill clients; "
-        f"{len(proxy_state.decoder_groups)} decode groups / "
-        f"{len(proxy_state.decoders)} decode clients; "
-        f"{len(proxy_state.mixed_groups)} mixed groups / "
-        f"{len(proxy_state.mixed_instances)} mixed clients."
-    )
-    proxy_state.print_status("Initial grouped topology.")
+    proxy_state = ProxyState(global_args.prefiller_instances, global_args.decoder_instances)
+    print(f"Initialized {len(proxy_state.prefillers)} prefill clients and {len(proxy_state.decoders)} decode clients.")
     yield
-    closed_servers: set[ServerState] = set()
-    for server in proxy_state.prefillers + proxy_state.decoders + proxy_state.mixed_instances:
-        if server in closed_servers:
-            continue
-        closed_servers.add(server)
-        await server.client.aclose()
+    for p in proxy_state.prefillers:
+        await p.client.aclose()
+    for d in proxy_state.decoders:
+        await d.client.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
+
 
 async def send_request_to_service(
     client: httpx.AsyncClient,
@@ -1681,8 +897,7 @@ async def stream_service_response_with_retry(
     endpoint: str,
     req_data: dict,
     request_id: str,
-    server: ServerState | None = None,
-    instance_type: str = InstanceType.DECODE,
+    decoder: ServerState | None = None,
     max_retries: int = 3,
     base_delay: float = 0.2,
 ):
@@ -1721,18 +936,8 @@ async def stream_service_response_with_retry(
                                 yield chunk
                                 break
 
-                            if server is not None and proxy_state is not None:
-                                if instance_type == InstanceType.DECODE:
-                                    tainted = server in proxy_state.tainted_decoders
-                                elif instance_type == InstanceType.MIXED:
-                                    tainted = server in proxy_state.tainted_mixed
-                                else:
-                                    tainted = False
-                                if tainted:
-                                    raise RuntimeError(
-                                        f"{instance_type} instance {server} was marked unavailable "
-                                        "while its response stream was still open"
-                                    )
+                            if (decoder is not None and proxy_state is not None and decoder in proxy_state.tainted_decoders):
+                                raise RuntimeError(f"decode instance {decoder} was marked unavailable while its response stream was still open")
                     finally:
                         if not next_chunk_task.done():
                             next_chunk_task.cancel()
@@ -1748,12 +953,11 @@ async def stream_service_response_with_retry(
             # 已经向用户输出过内容后，绝对不能原样重试。
             if first_chunk_sent:
                 logger.error(
-                    "[BACKEND STREAM INTERRUPTED] "
-                    "request_id=%s attempt=%s type=%s server=%s error=%s",
+                    "[DECODE STREAM INTERRUPTED] "
+                    "request_id=%s attempt=%s decoder=%s error=%s",
                     request_id,
                     attempt,
-                    instance_type,
-                    server,
+                    decoder,
                     error,
                 )
                 raise DecodeStreamError(original_error=error, partial_response_sent=True) from error
@@ -1761,26 +965,24 @@ async def stream_service_response_with_retry(
             if attempt < max_retries:
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(
-                    "[BACKEND RETRY] request_id=%s "
-                    "attempt=%s/%s delay=%s type=%s server=%s error=%s",
+                    "[DECODE RETRY] request_id=%s "
+                    "attempt=%s/%s delay=%s decoder=%s error=%s",
                     request_id,
                     attempt,
                     max_retries,
                     delay,
-                    instance_type,
-                    server,
+                    decoder,
                     error,
                 )
                 await asyncio.sleep(delay)
                 continue
             # 一个 chunk 都没返回，但重试次数已经耗尽。
             logger.error(
-                "[BACKEND REQUEST FAILED] "
-                "request_id=%s attempts=%s type=%s server=%s error=%s",
+                "[DECODE REQUEST FAILED] "
+                "request_id=%s attempts=%s decoder=%s error=%s",
                 request_id,
                 max_retries,
-                instance_type,
-                server,
+                decoder,
                 error,
             )
             raise DecodeStreamError(original_error=error, partial_response_sent=False) from error
@@ -1837,11 +1039,6 @@ async def get_idx_router(pd_state: Any, req_data: Any, req_header: Any, request_
         elif pd_state == InstanceType.DECODE:
             instance_score = proxy_state.calculate_decode_scores(request_length)
             select_idx = proxy_state.select_decoder(instance_score)
-        elif pd_state == InstanceType.MIXED:
-            instance_score = proxy_state.calculate_mixed_scores(request_length)
-            select_idx = proxy_state.select_mixed(instance_score)
-        else:
-            raise ValueError(f"Unknown pd_state: {pd_state}")
         logger.debug(f"Request length: {request_length}, {pd_state} score: {instance_score}")
         return select_idx, instance_score, True
     elif global_args.router_method == RouterMethod.SESSION_AFFINITY:
@@ -1859,11 +1056,6 @@ async def get_idx_router(pd_state: Any, req_data: Any, req_header: Any, request_
             session_map = proxy_state.session_decoder_map
             instance_list = proxy_state.decoders
             tainted_list = proxy_state.tainted_decoders
-        elif pd_state == InstanceType.MIXED:
-            instance_score = proxy_state.calculate_mixed_scores(request_length)
-            session_map = proxy_state.session_mixed_map
-            instance_list = proxy_state.mixed_instances
-            tainted_list = proxy_state.tainted_mixed
         else:
             raise ValueError(f"Unknown pd_state: {pd_state}")
 
@@ -1894,12 +1086,8 @@ async def get_idx_router(pd_state: Any, req_data: Any, req_header: Any, request_
         # Step 2: New session or no session_id - use Least Load (select_* acquires its own lock internally)
         if pd_state == InstanceType.PREFILL:
             select_idx = proxy_state.select_prefiller(instance_score)
-        elif pd_state == InstanceType.DECODE:
-            select_idx = proxy_state.select_decoder(instance_score)
-        elif pd_state == InstanceType.MIXED:
-            select_idx = proxy_state.select_mixed(instance_score)
         else:
-            raise ValueError(f"Unknown pd_state: {pd_state}")
+            select_idx = proxy_state.select_decoder(instance_score)
 
         # Step 3: Record mapping for new session
         if session_id:
@@ -1950,31 +1138,19 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int, 
 
     except asyncio.CancelledError:
         proxy_state.abort_prefiller_request(prefiller_idx, request_id)
-        if prefill_token_acct:
-            proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
+        proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
         raise
 
-    except httpx.HTTPStatusError as error:
-        # 4xx 表示请求本身有问题，保持原错误语义，不把健康 Prefill 当成故障。
-        # 5xx 则表示服务端当前不可用：立即把请求纳入故障恢复流程，
-        # 不必再等 NodeListener 连续 3 次健康检查失败后才开始切流。
+    except httpx.HTTPStatusError:
+        # 4xx 一般表示请求本身无效；send_request_to_service 已经区分 4xx。
+        # 释放本地计数，但不要隔离健康 Prefill。
         proxy_state.abort_prefiller_request(prefiller_idx, request_id)
-        if prefill_token_acct:
-            proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
-
-        status_code = error.response.status_code
-        if 400 <= status_code < 500:
-            raise
-
-        proxy_state.mark_prefiller_unavailable(prefiller)
-        raise PrefillUnavailableError(prefiller, error) from error
+        proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
+        raise
 
     except Exception as error:
         proxy_state.abort_prefiller_request(prefiller_idx, request_id)
-        if prefill_token_acct:
-            proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
-        # 请求链路已经直接证明该 Prefill 不可用时，立即隔离其 Group。
-        # 后续请求会优先切到其他健康实例；若没有健康实例，则进入等待恢复。
+        proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
         proxy_state.mark_prefiller_unavailable(prefiller)
         raise PrefillUnavailableError(prefiller, error) from error
 
@@ -1993,8 +1169,7 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int, 
         # Prefill 已经成功，但此时 Decode 可能刚好被 NodeListener 隔离。
         # 旧 KV 不能悬挂，下一轮需要使用新的 backend_request_id 重做 Prefill。
         proxy_state.abort_prefiller_request(prefiller_idx, request_id)
-        if prefill_token_acct:
-            proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
+        proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
         raise DecoderUnavailableError(error) from error
 
     decoder = proxy_state.decoders[decoder_idx]
@@ -2012,43 +1187,6 @@ async def _handle_select_instance(api: str, req_data: Any, request_length: int, 
         prefill_start_time=prefill_start_time,
         prefill_end_time=prefill_end_time,
     )
-
-
-async def _handle_select_mixed_instance(
-    req_data: Any,
-    request_length: int,
-    request_id: str,
-    req_header: Any,
-):
-    """选择一个 PD 混部实例。实际请求在后续流式执行阶段发送。"""
-    try:
-        mixed_idx, mixed_score, mixed_token_acct = await get_idx_router(
-            InstanceType.MIXED,
-            req_data,
-            req_header,
-            request_length,
-        )
-    except Exception as error:
-        raise MixedSelectionError(error) from error
-
-    mixed = proxy_state.mixed_instances[mixed_idx]
-    logger.info("Using mixed instance %s", mixed.url)
-    return MixedInstanceInfo(
-        request_id=request_id,
-        mixed_idx=mixed_idx,
-        mixed_score=mixed_score,
-        mixed=mixed,
-        mixed_token_acct=mixed_token_acct,
-    )
-
-
-@dataclass
-class MixedInstanceInfo:
-    request_id: str
-    mixed_idx: int
-    mixed_score: float
-    mixed: ServerState
-    mixed_token_acct: bool
 
 
 @dataclass
@@ -2097,26 +1235,6 @@ class DecoderUnavailableError(RuntimeError):
     def __init__(self, original_error: Exception):
         self.original_error = original_error
         super().__init__(f"No healthy decoder is available: {original_error}")
-
-
-class MixedSelectionError(RuntimeError):
-    """当前没有健康的 PD 混部实例可供选择。"""
-
-    def __init__(self, original_error: Exception):
-        self.original_error = original_error
-        super().__init__(f"No healthy mixed instance is available: {original_error}")
-
-
-class RecoveryWaitTimeoutError(RuntimeError):
-    """等待健康 Prefill/Decode/MIXED 超过请求级恢复等待上限。"""
-
-    def __init__(self, phase: str, timeout_seconds: float):
-        self.phase = phase
-        self.timeout_seconds = timeout_seconds
-        super().__init__(
-            f"No healthy inference instance became available within "
-            f"{timeout_seconds:.1f}s while phase={phase}"
-        )
 
 
 class SSEEventBuffer:
@@ -2263,11 +1381,11 @@ def compose_generated_text(state: RequestRecoveryState) -> str:
     """根据 parser 状态和 thinking 开关构造恢复用 assistant.content。
 
     1. 已检测到 reasoning parser：
-        - content 已有值：丢弃 reasoning，只续写 content；
-        - 只有 reasoning：在前面补 <think> 后继续思考。
+       - content 已有值：丢弃 reasoning，只续写 content；
+       - 只有 reasoning：在前面补 <think> 后继续思考。
     2. 未检测到 reasoning parser：
-        - enable_thinking=false：原样续写累计 content；
-        - enable_thinking=true：始终在完整累计 content 前补 <think>。
+       - enable_thinking=false：原样续写累计 content；
+       - enable_thinking=true：始终在完整累计 content 前补 <think>。
 
     未启用 reasoning parser 时，思考文本、</think> 和正式回答都在
     content 中，因此必须完整保留，不能删除或截取 </think>。
@@ -2303,10 +1421,11 @@ def _extract_visible_answer_content(content: str) -> str:
     return content
 
 
-def _build_resume_assistant_content(state: RequestRecoveryState, original_content: str,) -> str:
+def _build_resume_assistant_content(
+    state: RequestRecoveryState,
+    original_content: str,
+) -> str:
     """将本次已生成内容追加到原始 assistant 前缀。"""
-    
-    # 1. 启用 reasoning parser
     if state.reasoning_parser_detected:
         if state.content_text:
             original_answer = _extract_visible_answer_content(original_content)
@@ -2315,31 +1434,22 @@ def _build_resume_assistant_content(state: RequestRecoveryState, original_conten
         if state.reasoning_text:
             if _has_unclosed_think_marker(original_content):
                 return original_content + state.reasoning_text
-
-            return (original_content + THINK_START_MARKER + state.reasoning_text)
+            return original_content + THINK_START_MARKER + state.reasoning_text
 
         return original_content
 
-    # 2. 未启用 reasoning parser
     raw_content = state.raw_content_text
-
     if not raw_content:
         return original_content
 
-    # 3. enable_thinking=false
     if not state.thinking_enabled:
         return original_content + raw_content
 
-    # 4. enable_thinking=true 已经出现</think>：
-    if "</think>" in raw_content:
-        generated_answer = raw_content.rsplit("</think>", 1)[1].lstrip("\n")
-        original_answer = _extract_visible_answer_content(original_content)
-        return original_answer + generated_answer
-    
-    # 5. 还没有 </think>
+    # 未启用 reasoning parser 时，raw_content 中可能同时包含：
+    # 思考文本、</think> 和正式回答。无论中断发生在哪个阶段，
+    # 都完整保留累计内容，只确保最前面存在一个未由响应返回的 <think>。
     if _has_unclosed_think_marker(original_content):
         return original_content + raw_content
-
     return original_content + THINK_START_MARKER + raw_content
 
 
@@ -2398,117 +1508,29 @@ class CompletionExecutionContext:
     recovery_state: RequestRecoveryState
     stream_flag: bool
     req_header: Any
-    instance_info: InstanceInfo | MixedInstanceInfo | None = None
+    instance_info: InstanceInfo | None = None
     released_kv: bool = True
     completion_tokens: int = 0
     completion_tokens_before_attempt: int = 0
     done_received: bool = False
     normal_finish_received: bool = False
     recompute_requested: bool = False
-    # 当前连续恢复/等待窗口的起点。None 表示当前没有处于恢复等待窗口。
-    recovery_wait_started_at: float | None = None
-    recovery_wait_phase: str | None = None
-
-    def start_recovery_wait(self, phase: str) -> None:
-        """开始或延续一次连续恢复等待窗口。"""
-        if self.recovery_wait_started_at is None:
-            self.recovery_wait_started_at = time.monotonic()
-            logger.info(
-                "[RECOVERY WAIT START] logical_request_id=%s phase=%s timeout=%ss",
-                self.recovery_state.request_id,
-                phase,
-                getattr(global_args, "recovery_wait_timeout", 1200.0),
-            )
-        self.recovery_wait_phase = phase
-
-    def clear_recovery_wait(self) -> None:
-        """成功选到新的 P/D 后结束本次连续恢复等待窗口。"""
-        if self.recovery_wait_started_at is not None:
-            waited = time.monotonic() - self.recovery_wait_started_at
-            logger.info(
-                "[RECOVERY WAIT END] logical_request_id=%s waited=%.3fs",
-                self.recovery_state.request_id,
-                waited,
-            )
-        self.recovery_wait_started_at = None
-        self.recovery_wait_phase = None
-
-    def get_recovery_wait_timeout(self, phase: str, poll_interval: float = 5.0) -> float:
-        """返回本轮 Event.wait 的 timeout，并保证总恢复等待不超过配置上限。"""
-        self.start_recovery_wait(phase)
-        max_wait = float(getattr(global_args, "recovery_wait_timeout", 1200.0))
-        if max_wait <= 0:
-            return poll_interval
-
-        elapsed = time.monotonic() - self.recovery_wait_started_at
-        remaining = max_wait - elapsed
-        if remaining <= 0:
-            raise RecoveryWaitTimeoutError(phase, max_wait)
-        return min(poll_interval, remaining)
-
-    def ensure_recovery_wait_not_timed_out(self) -> None:
-        """在快速重选实例的循环中也检查恢复等待上限。"""
-        if self.recovery_wait_started_at is None:
-            return
-        max_wait = float(getattr(global_args, "recovery_wait_timeout", 1200.0))
-        if max_wait <= 0:
-            return
-        elapsed = time.monotonic() - self.recovery_wait_started_at
-        if elapsed >= max_wait:
-            raise RecoveryWaitTimeoutError(
-                self.recovery_wait_phase or "waiting_instance",
-                max_wait,
-            )
-
-    def is_mixed_mode(self) -> bool:
-        return proxy_state.deployment_mode == DeploymentMode.MIXED
-
-    def current_backend(self) -> ServerState | None:
-        if self.instance_info is None:
-            return None
-        if isinstance(self.instance_info, MixedInstanceInfo):
-            return self.instance_info.mixed
-        return self.instance_info.decoder
-
-    def current_stream_instance_type(self) -> str:
-        return InstanceType.MIXED if self.is_mixed_mode() else InstanceType.DECODE
-
-    def abort_current_prefill_if_needed(self) -> None:
-        if self.instance_info is None or isinstance(self.instance_info, MixedInstanceInfo):
-            return
-        proxy_state.abort_prefiller_request(
-            self.instance_info.prefiller_idx,
-            self.recovery_state.backend_request_id,
-        )
 
     def release_prefiller_kv_once(self) -> None:
         """当前轮次的 Prefill KV 只释放一次。"""
         if self.instance_info is None or self.released_kv:
-            return
-        if isinstance(self.instance_info, MixedInstanceInfo):
             return
         if not self.released_kv and global_args.router_method == RouterMethod.LEAST_LOAD:
             proxy_state.release_prefiller_kv(self.instance_info.prefiller_idx, self.instance_info.prefiller_score)
             self.released_kv = True
 
     def release_current_instance(self) -> None:
-        """释放当前轮次的后端负载；分离模式还需要释放 Prefill KV。"""
+        """释放当前轮次的 Prefill KV 和 Decode 负载。"""
         if self.instance_info is None:
             return
-
-        if isinstance(self.instance_info, MixedInstanceInfo):
-            if proxy_state and self.instance_info.mixed_token_acct:
-                proxy_state.release_mixed(
-                    self.instance_info.mixed_idx,
-                    self.instance_info.mixed_score,
-                )
-        else:
-            self.release_prefiller_kv_once()
-            if proxy_state and self.instance_info.decoder_token_acct:
-                proxy_state.release_decoder(
-                    self.instance_info.decoder_idx,
-                    self.instance_info.decoder_score,
-                )
+        self.release_prefiller_kv_once()
+        if proxy_state and self.instance_info.decoder_token_acct:
+            proxy_state.release_decoder(self.instance_info.decoder_idx,  self.instance_info.decoder_score)
 
         # 无论是否进行过负载计数，都必须清理当前实例引用。
         self.instance_info = None
@@ -2534,92 +1556,25 @@ class CompletionExecutionContext:
         self.recovery_state.current_request = copy.deepcopy(self.req_data)
 
 
-async def _wait_for_mixed_instance(
-    context: CompletionExecutionContext,
-) -> AsyncIterator[bytes]:
-    """等待并选择一个可用 PD 混部实例。"""
-    state = context.recovery_state
-
-    while context.instance_info is None:
-        while not proxy_state.has_available_mixed():
-            state.phase = "waiting_mixed"
-            wait_timeout = context.get_recovery_wait_timeout("waiting_mixed")
-            available = await proxy_state.wait_for_mixed(timeout=wait_timeout)
-            if not available:
-                context.ensure_recovery_wait_not_timed_out()
-                if context.stream_flag:
-                    yield KEEP_ALIVE_CHUNK
-
-        context.ensure_recovery_wait_not_timed_out()
-        state.phase = "mixed"
-        # MIXED 模式不使用 PD KV Transfer，恢复请求也不能携带旧 kv_transfer_params。
-        context.req_data.pop("kv_transfer_params", None)
-        request_length = len(
-            json.dumps(context.req_data, ensure_ascii=False).encode("utf-8")
-        )
-
-        try:
-            context.instance_info = await _handle_select_mixed_instance(
-                context.req_data,
-                request_length,
-                state.backend_request_id,
-                context.req_header,
-            )
-        except MixedSelectionError as error:
-            state.phase = "waiting_mixed"
-            context.start_recovery_wait("waiting_mixed")
-            state.recovery_count += 1
-            state.backend_request_id = await proxy_state.next_req_id()
-            logger.warning(
-                "[WAITING MIXED] logical_request_id=%s "
-                "new_backend_request_id=%s error=%s",
-                state.request_id,
-                state.backend_request_id,
-                error,
-            )
-            if context.stream_flag:
-                yield KEEP_ALIVE_CHUNK
-            continue
-
-        context.clear_recovery_wait()
-        context.released_kv = True
-        state.phase = "mixed"
-        state.current_request = copy.deepcopy(context.req_data)
-
-
 async def _wait_for_completion_instance(
     context: CompletionExecutionContext,
 ) -> AsyncIterator[bytes]:
-    """根据部署模式等待并选择当前轮次的后端实例。"""
-    if proxy_state.deployment_mode == DeploymentMode.MIXED:
-        async for heartbeat in _wait_for_mixed_instance(context):
-            yield heartbeat
-        return
-
+    """等待可用 P/D，并完成当前轮次的 Prefill 与 Decode 选择。"""
     state = context.recovery_state
 
     while context.instance_info is None:
         while not proxy_state.has_available_prefiller():
             state.phase = "waiting_prefill"
-            wait_timeout = context.get_recovery_wait_timeout("waiting_prefill")
-            available = await proxy_state.wait_for_prefiller(timeout=wait_timeout)
-            if not available:
-                context.ensure_recovery_wait_not_timed_out()
-                if context.stream_flag:
-                    yield KEEP_ALIVE_CHUNK
+            available = await proxy_state.wait_for_prefiller(timeout=5.0)
+            if not available and context.stream_flag:
+                yield KEEP_ALIVE_CHUNK
 
         while not proxy_state.has_available_decoder():
             state.phase = "waiting_decode"
-            wait_timeout = context.get_recovery_wait_timeout("waiting_decode")
-            available = await proxy_state.wait_for_decoder(timeout=wait_timeout)
-            if not available:
-                context.ensure_recovery_wait_not_timed_out()
-                if context.stream_flag:
-                    yield KEEP_ALIVE_CHUNK
+            available = await proxy_state.wait_for_decoder(timeout=5.0)
+            if not available and context.stream_flag:
+                yield KEEP_ALIVE_CHUNK
 
-        # 即使当前 heap 中还有“可用”实例，也可能正处于 NodeListener 的 3 次失败确认窗口。
-        # 如果请求实际打过去失败，下面的异常分支会立即隔离该组并继续重选。
-        context.ensure_recovery_wait_not_timed_out()
         state.phase = "prefill"
         # 上一轮的 KV 信息不能带入新的 Prefill。
         context.req_data.pop("kv_transfer_params", None)
@@ -2635,7 +1590,6 @@ async def _wait_for_completion_instance(
             )
         except PrefillSelectionError as error:
             state.phase = "waiting_prefill"
-            context.start_recovery_wait("waiting_prefill")
             state.recovery_count += 1
             state.backend_request_id = await proxy_state.next_req_id()
             logger.warning(
@@ -2652,7 +1606,6 @@ async def _wait_for_completion_instance(
             continue
         except PrefillUnavailableError as error:
             state.phase = "waiting_prefill"
-            context.start_recovery_wait("waiting_prefill")
             state.recovery_count += 1
             state.backend_request_id = await proxy_state.next_req_id()
             logger.warning(
@@ -2669,7 +1622,6 @@ async def _wait_for_completion_instance(
             continue
         except DecoderUnavailableError as error:
             state.phase = "waiting_decode"
-            context.start_recovery_wait("waiting_decode")
             state.recovery_count += 1
             state.backend_request_id = await proxy_state.next_req_id()
             logger.warning(
@@ -2685,8 +1637,6 @@ async def _wait_for_completion_instance(
                 yield KEEP_ALIVE_CHUNK
             continue
 
-        # Prefill + Decode 都成功选定，结束本次连续恢复等待窗口。
-        context.clear_recovery_wait()
         # Prefill 成功，当前轮次持有新的 KV。
         context.released_kv = False
         state.phase = "decode"
@@ -2718,9 +1668,13 @@ def _process_decode_payload(context: CompletionExecutionContext, payload: str) -
     if isinstance(error_info, dict):
         error_detail = get_recoverable_decode_error_detail(chunk_json)
         if error_detail is not None:
-            decoder = context.current_backend()
+            decoder = (
+                context.instance_info.decoder
+                if context.instance_info is not None
+                else None
+            )
             logger.warning(
-                "[INFERENCE ERROR EVENT INTERCEPTED] "
+                "[DECODE ERROR EVENT INTERCEPTED] "
                 "logical_request_id=%s "
                 "backend_request_id=%s "
                 "decoder=%s %s",
@@ -2760,9 +1714,13 @@ def _process_decode_payload(context: CompletionExecutionContext, payload: str) -
             context.normal_finish_received = True
         else:
             abnormal_detail = (f"finish_reason={finish_reason!r}, stop_reason={stop_reason!r}")
-            decoder = context.current_backend()
+            decoder = (
+                context.instance_info.decoder
+                if context.instance_info is not None
+                else None
+            )
             logger.warning(
-                "[INFERENCE ABNORMAL FINISH INTERCEPTED] "
+                "[DECODE ABNORMAL FINISH INTERCEPTED] "
                 "logical_request_id=%s "
                 "backend_request_id=%s "
                 "decoder=%s %s",
@@ -2794,11 +1752,7 @@ def _process_decode_payload(context: CompletionExecutionContext, payload: str) -
 
     if generated_piece:
         state.generated_text = compose_generated_text(state)
-        state.phase = (
-            "mixed_generating"
-            if context.is_mixed_mode()
-            else "decode_generating"
-        )
+        state.phase = "decode_generating"
 
     usage = chunk_json.get("usage") or {}
     reported_completion_tokens = usage.get("completion_tokens")
@@ -2823,21 +1777,16 @@ async def _stream_decode_attempt(context: CompletionExecutionContext) -> AsyncIt
     context.reset_decode_attempt()
     sse_buffer = SSEEventBuffer()
 
-    backend = context.current_backend()
-    if backend is None:
-        raise RuntimeError("Inference backend is not selected")
-
     async for chunk in stream_service_response_with_retry(
-        backend.client,
+        context.instance_info.decoder.client,
         context.api,
         context.req_data,
         request_id=context.recovery_state.backend_request_id,
-        server=backend,
-        instance_type=context.current_stream_instance_type(),
+        decoder=context.instance_info.decoder,
         max_retries=global_args.max_retries,
         base_delay=global_args.retry_delay,
     ):
-        if not context.is_mixed_mode() and not context.released_kv and chunk:
+        if not context.released_kv and chunk:
             context.release_prefiller_kv_once()
 
         if context.stream_flag:
@@ -2882,16 +1831,12 @@ async def _stream_decode_attempt(context: CompletionExecutionContext) -> AsyncIt
 
 
 async def _recover_decode_failure(context: CompletionExecutionContext, error: DecodeStreamError) -> bool:
-    """处理 Decode/MIXED 生成阶段故障；返回 False 表示响应已完成。"""
+    """处理 Decode 故障；返回 False 表示响应已在 [DONE] 后完成。"""
     state = context.recovery_state
 
     # 某些连接可能在结束帧后再出现协议层关闭异常，此时不能续推。
     if context.done_received:
-        logger.warning(
-            "[POST-DONE ERROR IGNORED] logical_request_id=%s error=%s",
-            state.request_id,
-            error,
-        )
+        logger.warning("[DECODE POST-DONE ERROR IGNORED] logical_request_id=%s error=%s", state.request_id, error)
         state.phase = "completed"
         return False
 
@@ -2899,59 +1844,35 @@ async def _recover_decode_failure(context: CompletionExecutionContext, error: De
     if failed_instance_info is None:
         raise error
 
-    failed_backend = context.current_backend()
-    if failed_backend is None:
-        raise error
-
+    failed_decoder = failed_instance_info.decoder
     logger.error(
-        "[INFERENCE RECOVERY START] logical_request_id=%s "
-        "backend_request_id=%s mode=%s backend=%s "
-        "partial_response_sent=%s generated_text_length=%s",
+        "[DECODE RECOVERY START] "
+        "logical_request_id=%s "
+        "backend_request_id=%s "
+        "decoder=%s "
+        "partial_response_sent=%s "
+        "generated_text_length=%s",
         state.request_id,
         state.backend_request_id,
-        proxy_state.deployment_mode,
-        failed_backend,
+        failed_decoder,
         error.partial_response_sent,
         len(state.generated_text),
     )
 
-    if isinstance(failed_instance_info, MixedInstanceInfo):
-        # MIXED 模式下当前实例同时承担 Prefill + Decode。请求侧已经确认它不可用时，
-        # 立即隔离整个 MIXED Group，不必等待 NodeListener 的 3 次失败确认。
-        proxy_state.mark_mixed_unavailable(failed_backend)
-        context.release_current_instance()
-        state.recovery_count += 1
-        state.phase = "waiting_mixed"
-        context.start_recovery_wait("waiting_mixed")
-        state.backend_request_id = await proxy_state.next_req_id()
-        context.apply_next_request()
-
-        logger.info(
-            "[MIXED WAITING] logical_request_id=%s "
-            "new_backend_request_id=%s recovery_count=%s",
-            state.request_id,
-            state.backend_request_id,
-            state.recovery_count,
-        )
-        return True
-
-    # PD 分离模式保持原有恢复逻辑：隔离故障 Decode，重新 Prefill 后再选 Decode。
-    proxy_state.abort_prefiller_request(
-        failed_instance_info.prefiller_idx,
-        state.backend_request_id,
-    )
-    proxy_state.mark_decoder_unavailable(failed_backend)
+    proxy_state.abort_prefiller_request(failed_instance_info.prefiller_idx, state.backend_request_id)
+    proxy_state.mark_decoder_unavailable(failed_decoder)
     context.release_current_instance()
 
     state.recovery_count += 1
     state.phase = "waiting_decode"
-    context.start_recovery_wait("waiting_decode")
     state.backend_request_id = await proxy_state.next_req_id()
     context.apply_next_request()
 
     logger.info(
-        "[DECODE WAITING] logical_request_id=%s "
-        "new_backend_request_id=%s recovery_count=%s",
+        "[DECODE WAITING] "
+        "logical_request_id=%s "
+        "new_backend_request_id=%s "
+        "recovery_count=%s",
         state.request_id,
         state.backend_request_id,
         state.recovery_count,
@@ -2962,11 +1883,8 @@ async def _prepare_recompute(context: CompletionExecutionContext,) -> None:
     """处理后端 recomputed 信号，不隔离 Decode，重新执行当前请求。"""
     state = context.recovery_state
     current_instance_info = context.instance_info
-    if current_instance_info is not None and isinstance(current_instance_info, InstanceInfo):
-        proxy_state.abort_prefiller_request(
-            current_instance_info.prefiller_idx,
-            state.backend_request_id,
-        )
+    if current_instance_info is not None:
+        proxy_state.abort_prefiller_request(current_instance_info.prefiller_idx, state.backend_request_id)
 
     context.release_current_instance()
     state.recovery_count += 1
@@ -2983,7 +1901,7 @@ async def _prepare_recompute(context: CompletionExecutionContext,) -> None:
 
 
 async def _generate_completion_stream(context: CompletionExecutionContext) -> AsyncIterator[bytes]:
-    """运行 PD 分离或 PD 混部模式下的选择、生成、故障恢复和续推循环。"""
+    """运行完整的 P/D 选择、Decode、故障恢复和续推循环。"""
     state = context.recovery_state
 
     try:
@@ -3009,36 +1927,6 @@ async def _generate_completion_stream(context: CompletionExecutionContext) -> As
             state.phase = "completed"
             break
 
-    except RecoveryWaitTimeoutError as error:
-        # 当前架构使用 StreamingResponse，响应头在等待结束前已经发出，
-        # 因此超时后无法再把 HTTP 状态码改成 503/504；这里以 OpenAI 风格
-        # error payload 结束流，避免由未捕获异常转成服务端 500。
-        state.phase = "failed"
-        logger.error(
-            "[RECOVERY WAIT TIMEOUT] logical_request_id=%s phase=%s timeout=%ss recovery_count=%s",
-            state.request_id,
-            error.phase,
-            error.timeout_seconds,
-            state.recovery_count,
-        )
-        error_payload = {
-            "error": {
-                "message": str(error),
-                "type": "service_unavailable",
-                "code": "recovery_wait_timeout",
-            }
-        }
-        serialized_error = json.dumps(
-            error_payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if context.stream_flag:
-            yield b"data: " + serialized_error + b"\n\n"
-            yield b"data: [DONE]\n\n"
-        else:
-            yield serialized_error
-
     except asyncio.CancelledError:
         # StreamingResponse 在客户端主动断开时会取消当前生成器。
         state.phase = "cancelled"
@@ -3048,7 +1936,8 @@ async def _generate_completion_stream(context: CompletionExecutionContext) -> As
             state.request_id,
             state.backend_request_id,
         )
-        context.abort_current_prefill_if_needed()
+        if context.instance_info is not None:
+            proxy_state.abort_prefiller_request(context.instance_info.prefiller_idx, state.backend_request_id)
         raise
     except Exception as error:
         failed_phase = state.phase
@@ -3060,7 +1949,8 @@ async def _generate_completion_stream(context: CompletionExecutionContext) -> As
             failed_phase,
             error,
         )
-        context.abort_current_prefill_if_needed()
+        if context.instance_info is not None:
+            proxy_state.abort_prefiller_request(context.instance_info.prefiller_idx, state.backend_request_id)
         raise
     finally:
         context.release_current_instance()
@@ -3125,107 +2015,49 @@ async def _handle_adjust_instances(adjust_mode: str, request: Request):
     try:
         req_data = await request.json()
         instance_type = req_data.get("type", "")
-        supported_types = [InstanceType.PREFILL, InstanceType.DECODE, InstanceType.MIXED]
-        if instance_type not in supported_types:
+        instances = req_data.get("instances", [])
+        if isinstance(instances, str):
+            instances = [instances]
+        instances = trans_instances(instances)
+        all_msg = f"{adjust_mode} {instance_type} instances: {[str(server) for server in instances]}."
+
+        if instance_type not in [InstanceType.PREFILL, InstanceType.DECODE]:
             return {
                 "error": f"Instance type {instance_type} is not supported. "
-                f"Only support {supported_types}."
+                f"Only support '{InstanceType.PREFILL}' and '{InstanceType.DECODE}'."
             }
 
-        if proxy_state.deployment_mode == DeploymentMode.MIXED and instance_type != InstanceType.MIXED:
-            return {"error": "Current deployment mode is mixed; only mixed instances can be adjusted."}
-        if proxy_state.deployment_mode == DeploymentMode.DISAGGREGATED and instance_type == InstanceType.MIXED:
-            return {"error": "Current deployment mode is disaggregated; mixed instances cannot be adjusted."}
-
-        groups_payload = req_data.get("groups")
-        if groups_payload is not None:
-            instance_groups = trans_instance_groups(groups_payload)
-        else:
-            instances = req_data.get("instances", [])
-            if isinstance(instances, str):
-                instances = [instances]
-            # Backward-compatible behavior: each item is one singleton group.
-            instance_groups = [[server] for server in trans_instances(instances)]
-
-        flat_instances = [server for group in instance_groups for server in group]
-        all_msg = (
-            f"{adjust_mode} {instance_type} groups: "
-            f"{[[str(server) for server in group] for group in instance_groups]}."
-        )
-
         if adjust_mode == "add":
-            added_groups, waiting_groups = await proxy_state.add_instance_groups(
-                instance_type,
-                instance_groups,
-            )
-            all_msg = (
-                f"Added {instance_type} groups: {added_groups}. "
-                f"Waiting for recovery: {waiting_groups}."
-            )
+            added_nodes, waiting_nodes = await proxy_state.add_instances(instance_type, instances)
+            if waiting_nodes:
+                all_msg = (
+                    f"{adjust_mode} {instance_type} instances: {added_nodes}. "
+                    f"Instances {waiting_nodes} are waiting to be added."
+                )
         elif adjust_mode == "remove":
             if instance_type == InstanceType.PREFILL:
-                need_waiting = proxy_state.remove_prefillers(flat_instances)
-            elif instance_type == InstanceType.DECODE:
-                need_waiting = proxy_state.remove_decoders(flat_instances)
+                need_waiting = proxy_state.remove_prefillers(instances)
             else:
-                need_waiting = proxy_state.remove_mixed(flat_instances)
+                need_waiting = proxy_state.remove_decoders(instances)
+
             if need_waiting:
-                all_msg = (
-                    "The containing groups are isolated and will be removed "
-                    "after active requests finish."
-                )
-            else:
-                all_msg = "The containing groups were removed."
-
-        result = {
+                all_msg = f"Instances {instances} are isolated and waiting to be removed."
+        return {
             "message": all_msg,
-            "current_prefill_instances": [
-                str(prefiller) for prefiller in proxy_state.prefillers
-            ],
-            "current_decode_instances": [
-                str(decoder) for decoder in proxy_state.decoders
-            ],
-            "current_mixed_instances": [
-                str(server) for server in proxy_state.mixed_instances
-            ],
-            "deployment_mode": proxy_state.deployment_mode,
+            "current_prefill_instances": [str(prefiller) for prefiller in proxy_state.prefillers],
+            "current_decode_instances": [str(decoder) for decoder in proxy_state.decoders],
         }
-        result.update(proxy_state.group_status())
-        return result
-    except Exception as error:
-        logger.error("Failed to %s instances/groups: %s", adjust_mode, error)
-        raise
-
-
-def _split_instance_endpoint(instance: str) -> tuple[str, int]:
-    instance = instance.strip()
-    if instance.startswith("["):
-        closing = instance.find("]")
-        if closing == -1 or closing + 1 >= len(instance) or instance[closing + 1] != ":":
-            raise ValueError(f"Invalid IPv6 endpoint: {instance}")
-        return instance[1:closing], int(instance[closing + 2:])
-    host, separator, port = instance.rpartition(":")
-    if not separator or not host or not port:
-        raise ValueError(f"Invalid endpoint: {instance}; expected host:port")
-    return host, int(port)
+    except Exception as e:
+        logger.error("Failed to %s instances: %s", adjust_mode, e)
+        raise e
 
 
 def trans_instances(instances: list[str]) -> list[ServerState]:
-    return [ServerState(*_split_instance_endpoint(instance)) for instance in instances]
-
-
-def trans_instance_groups(groups: Any) -> list[list[ServerState]]:
-    if not isinstance(groups, list) or not groups:
-        raise ValueError("groups must be a non-empty list of endpoint lists")
-    result: list[list[ServerState]] = []
-    for group_index, group in enumerate(groups):
-        if isinstance(group, str):
-            group = [group]
-        if not isinstance(group, list) or not group:
-            raise ValueError(f"groups[{group_index}] must be a non-empty endpoint list")
-        result.append(trans_instances(group))
-    return result
-
+    server_list = []
+    for instance in instances:
+        h, p = instance.split(":")
+        server_list.append(ServerState(h, int(p)))
+    return server_list
 
 
 @app.post("/v1/completions")
@@ -3240,24 +2072,11 @@ async def handle_chat_completions(request: Request):
 
 @app.get("/healthcheck")
 async def healthcheck():
-    status = {
+    return {
         "status": "ok",
-        "deployment_mode": proxy_state.deployment_mode,
         "prefill_instances": len(proxy_state.prefillers),
-        "available_prefill_instances": sum(
-            server not in proxy_state.tainted_prefillers for server in proxy_state.prefillers
-        ),
         "decode_instances": len(proxy_state.decoders),
-        "available_decode_instances": sum(
-            server not in proxy_state.tainted_decoders for server in proxy_state.decoders
-        ),
-        "mixed_instances": len(proxy_state.mixed_instances),
-        "available_mixed_instances": sum(
-            server not in proxy_state.tainted_mixed for server in proxy_state.mixed_instances
-        ),
     }
-    status.update(proxy_state.group_status())
-    return status
 
 
 @app.post("/instances/add")

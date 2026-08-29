@@ -23,7 +23,8 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
-from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5GatedDeltaNet
+from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -34,6 +35,12 @@ from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.ops.triton.fla.sigmoid_gating import fused_sigmoid_gating_delta_rule_update
 from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
 from vllm_ascend.utils import vllm_version_is
+# [0.23.0] The 0.23.0-correct core attention lives in vllm_ascend.ops.gdn.
+# We delegate _forward_core to the real AscendGatedDeltaNetAttention impl
+# (correct conv_state layout + structured GDN metadata) instead of the stale
+# 0.18.0-derived custom _forward_core, which produced garbled output because
+# the conv_state transpose and metadata data-flow changed in 0.23.0.
+from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 
 
 def to_int64_tuple(t):
@@ -43,11 +50,13 @@ def to_int64_tuple(t):
     return tuple(t.tolist())
 
 
-class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
+class AscendQwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
+    """v0.23.0 compatible: Inherits from QwenGatedDeltaNetAttention."""
+
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        output: torch.Tensor,
+            self,
+            hidden_states: torch.Tensor,
+            output: torch.Tensor,
     ):
         """
         Forward pass with three parts:
@@ -65,7 +74,8 @@ class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         # For asymmetric TP (TP=3 with shardings [1,1,2]):
         # - TP0/1: split_size=1, world_split_size=4 -> local_qkv_size, local_z_size
         # - TP2: split_size=2, world_split_size=4 -> local_qkv_size, local_z_size
-        if hasattr(self, 'asym') and self.asym and hasattr(self, 'tp_asymmetric_shardings') and self.tp_asymmetric_shardings is not None:
+        if hasattr(self, 'asym') and self.asym and hasattr(self,
+                                                           'tp_asymmetric_shardings') and self.tp_asymmetric_shardings is not None:
             world_split_size = sum(self.tp_asymmetric_shardings)
             split_size = self.tp_asymmetric_shardings[self.tp_rank]
             local_qkv_size = (self.key_dim * 2 + self.value_dim) * split_size // world_split_size
@@ -96,15 +106,17 @@ class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             device=hidden_states.device,
         )
 
-        torch.ops.vllm.gdn_attention_core(
+        # [0.23.0] op renamed: gdn_attention_core -> qwen_gdn_attention_core
+        # (registered in vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn)
+        # 6th arg use_aiter=False selects the non-ROCm _forward_core dispatch path.
+        torch.ops.vllm.qwen_gdn_attention_core(
             mixed_qkv,
             b,
             a,
             core_attn_out,
             self.prefix,
+            False,
         )
-
-
 
         # ============================================================
         # Part 3: Output Projection
@@ -121,11 +133,11 @@ class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         output[:actual_num_tokens] = o_out
 
     def _forward_core(
-        self,
-        mixed_qkv: torch.Tensor,
-        b: torch.Tensor,
-        a: torch.Tensor,
-        core_attn_out: torch.Tensor,
+            self,
+            mixed_qkv: torch.Tensor,
+            b: torch.Tensor,
+            a: torch.Tensor,
+            core_attn_out: torch.Tensor,
     ):
         # Core attention computation (called by custom op).
 
@@ -153,7 +165,9 @@ class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
-        self_kv_cache = self.kv_cache[forward_context.virtual_engine if vllm_version_is("0.18.0") else 0]
+        # [0.23.0] self.kv_cache is the (conv_state, ssm_state) tuple directly
+        # (no per-virtual-engine indexing; matches vllm_ascend/ops/gdn.py)
+        self_kv_cache = self.kv_cache
         conv_state = self_kv_cache[0].transpose(-1, -2)
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -337,7 +351,7 @@ class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
-            
+
         maybe_save_kv_layer_to_connector("", [])
 
     def rearrange_mixed_qkv(self, mixed_qkv):
@@ -351,7 +365,8 @@ class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             return None, None, None
 
         # Calculate local dimensions for asymmetric TP
-        if hasattr(self, 'asym') and self.asym and hasattr(self, 'tp_asymmetric_shardings') and self.tp_asymmetric_shardings is not None:
+        if hasattr(self, 'asym') and self.asym and hasattr(self,
+                                                           'tp_asymmetric_shardings') and self.tp_asymmetric_shardings is not None:
             world_split_size = sum(self.tp_asymmetric_shardings)
             split_size = self.tp_asymmetric_shardings[self.tp_rank]
             local_key_size = self.key_dim * split_size // world_split_size
@@ -427,11 +442,11 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
 
 class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-        positions: torch.Tensor = None,
-        **kwargs: object,
+            self,
+            hidden_states: torch.Tensor,
+            residual: torch.Tensor | None,
+            positions: torch.Tensor = None,
+            **kwargs: object,
     ):
         if residual is None:
             residual = hidden_states
@@ -486,8 +501,22 @@ class AscendQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
         return hidden_states, residual
 
 
-Qwen3_5GatedDeltaNet.forward = AscendQwen3_5GatedDeltaNet.forward
-Qwen3_5GatedDeltaNet._forward_core = AscendQwen3_5GatedDeltaNet._forward_core
-Qwen3_5GatedDeltaNet.rearrange_mixed_qkv = AscendQwen3_5GatedDeltaNet.rearrange_mixed_qkv
+# v0.23.0: Patch QwenGatedDeltaNetAttention instead of Qwen3_5GatedDeltaNet
+# forward: keep the asymmetric-aware custom forward (computes local qkv/z/v-head
+# sizes from tp_asymmetric_shardings). At symmetric TP it reduces to the same
+# split as the real forward, so it is correct for both TP=4 and TP=3.
+QwenGatedDeltaNetAttention.forward = AscendQwen3_5GatedDeltaNet.forward
+# _forward_core: delegate to the REAL 0.23.0 AscendGatedDeltaNetAttention impl
+# (correct conv_state layout without transpose + structured GDN metadata).
+# The 0.18.0-derived custom _forward_core produced garbled recurrent state.
+QwenGatedDeltaNetAttention._forward_core = AscendGatedDeltaNetAttention._forward_core
+# get_attn_backend: route QwenGatedDeltaNetAttention to the Ascend GDN backend
+# (AscendGDNAttentionBackend) so the Ascend metadata builder attaches the
+# structured sub-metadata (non_spec_prefill_metadata / spec_decode_metadata /
+# non_spec_decode_metadata) that the real _forward_core reads. Without this,
+# the base GDNAttentionBackend is used and _forward_core crashes at decode with
+# AttributeError: no attribute 'non_spec_decode_metadata'.
+QwenGatedDeltaNetAttention.get_attn_backend = AscendGatedDeltaNetAttention.get_attn_backend
+QwenGatedDeltaNetAttention.rearrange_mixed_qkv = AscendQwen3_5GatedDeltaNet.rearrange_mixed_qkv
 Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
 Qwen3_5DecoderLayer.forward = AscendQwen3_5DecoderLayer.forward

@@ -183,28 +183,24 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     # patched: 其它异常也不直接抛出，否则主进程会退出
                     # 目前写法，如果发生TimeoutError也会导致抛出异常导致程序退出
                     # 但目前开发自验过程没有出现类似问题，故目前暂不处理
-                    logger.warning(f"[executor-collective_rpc] when calling method={method}, capture error but not raise. error={exp}")
+                    logger.warning(
+                        f"[executor-collective_rpc] when calling method={method}, capture error but not raise. error={exp}")
                     status = WorkerProc.ResponseStatus.FAILURE
-
                 if status != WorkerProc.ResponseStatus.SUCCESS:
                     # patched: 不直接抛RuntimeError，否则主进程会退出
                     logger.warning("[executor-collective_rpc] request fail, return with None in collective_rpc()")
-                    responses.append(None) # 发生故障时暂时返回None，交由上层处理故障
+                    responses.append(None)  # 发生故障时暂时返回None，交由上层处理故障
                 else:
                     responses.append(result)
             return responses[0] if output_rank is not None else responses
 
-        if non_block:
-            future = FutureWrapper(self.futures_queue, aggregate=aggregate)
-            self.futures_queue.appendleft((future, get_response))
-            return future
+        future = FutureWrapper(
+            self.futures_queue,
+            get_response=get_response,
+            aggregate=aggregate,
+        )
 
-        # First drain any pending futures in the queue.
-        while self.futures_queue:
-            future, get_fut_response = self.futures_queue.pop()
-            future.wait_for_response(get_fut_response)
-
-        return aggregate(get_response())
+        return future if non_block else future.result()
 
 
     def _init_executor(self) -> None:

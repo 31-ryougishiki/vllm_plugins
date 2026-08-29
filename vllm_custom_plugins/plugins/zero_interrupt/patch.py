@@ -116,7 +116,6 @@ def apply():
         Qwen3_5DecoderLayerAsymmetric,
         Qwen3_5ForCausalLMAsymmetric,
         Qwen3_5ForConditionalGenerationAsymmetric,
-        Qwen3_5GatedDeltaNetAsymmetric,
         Qwen3_5ModelAsymmetric,
     )
     # Patch all Qwen3.5 classes for asymmetric TP
@@ -125,8 +124,9 @@ def apply():
     qwen3_5_model.Qwen3_5ForConditionalGeneration = Qwen3_5ForConditionalGenerationAsymmetric
     qwen3_5_model.Qwen3_5Model = Qwen3_5ModelAsymmetric
     qwen3_5_model.Qwen3_5DecoderLayer = Qwen3_5DecoderLayerAsymmetric
-    qwen3_5_model.Qwen3_5GatedDeltaNet = Qwen3_5GatedDeltaNetAsymmetric
-    logger.info("Replaced qwen3_5 classes with asymmetric variants: ForCausalLM, ForConditionalGeneration, Model, DecoderLayer, GatedDeltaNet")
+    # Qwen3_5GatedDeltaNet is not patched directly - v0.23.0 uses QwenGatedDeltaNetAttention
+    # which is instantiated by Qwen3_5DecoderLayerAsymmetric internally
+    logger.info("Replaced qwen3_5 classes with asymmetric variants: ForCausalLM, ForConditionalGeneration, Model, DecoderLayer")
 
     # Qwen3-VL multimodal vision module asymmetric TP support
     import vllm.model_executor.models.qwen3_vl as qwen3_vl_model
@@ -147,8 +147,8 @@ def apply():
     from .vllm.model_executor.models.patch_qwen2_moe import Qwen2MoeMLPAsymmetric
     qwen2_moe_model.Qwen2MoeMLP=Qwen2MoeMLPAsymmetric
     logger.info("Replaced Qwen2MoeMLP with Qwen2MoeMLPAsymmetric")
-
-
+    #
+    #
     # 变长allgather 1
     import vllm_ascend.ops.vocab_parallel_embedding
     from .vllm.model_executor.layers.patch_logits_processor import LogitsProcessorVarlen
@@ -160,29 +160,28 @@ def apply():
     import vllm.distributed
     vllm.distributed.tensor_model_parallel_all_gather_varlen = tensor_model_parallel_all_gather_varlen
     logger.info("Replaced vllm.distributed.tensor_model_parallel_all_gather_varlen with tensor_model_parallel_all_gather_varlen")
-    
+
     # 变长allgather 3
     import vllm_ascend.distributed.device_communicators.npu_communicator
     from .vllm.distributed.device_communicators.patch_base_device_communicator import all_gather_varlen
     vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator.all_gather_varlen = all_gather_varlen
     logger.info("Add vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator.all_gather_varlen")
-    
+
     import vllm.config.model
     from .vllm.config.patch_model import verify_with_parallel_config
     vllm.config.model.ModelConfig.verify_with_parallel_config = verify_with_parallel_config
     logger.info("Replaced verify_with_parallel_config with patched version")
-    
+    #
     # TP非对称权重加载和头数分配
     # 此方法被EngineCore使用, 需要提前patch
-    # import vllm.v1.core
     from vllm.v1.core import kv_cache_utils
     from .vllm.v1.core.patch_kv_cache_utils import get_kv_cache_configs
 
     kv_cache_utils.get_kv_cache_configs = get_kv_cache_configs
     logger.info("Replaced vllm.v1.core.kv_cache_utils.get_kv_cache_configs with patched version")
-    # end
-
-    # Mamba layer asymmetric TP support
+    # # end
+    #
+    # # Mamba layer asymmetric TP support
     try:
         import vllm.model_executor.layers.mamba.mamba_mixer2 as mamba_module
         from .vllm.model_executor.layers.mamba.patch_mamba_mixer2 import mamba_v2_sharded_weight_loader_asymmetric

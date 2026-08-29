@@ -41,7 +41,7 @@ from vllm.model_executor.models.qwen3_vl import (
     Qwen3_VisionTransformer as OrigQwen3_VisionTransformer,
     is_vit_use_data_parallel,
 )
-from vllm.model_executor.models.vision import get_vit_attn_backend
+from vllm.model_executor.models.vision import get_vit_attn_backend, get_fp8_padded_hidden_size
 
 from vllm_custom_plugins.plugins.zero_interrupt.vllm.model_executor.layers.patch_linear import (
     ColumnParallelLinearAsymmetric,
@@ -72,7 +72,7 @@ class Qwen3_VisionMLPAsymmetric(OrigQwen3_VisionMLP):
         additional_config = getattr(vllm_config, "additional_config", None)
         zero_interrupt_config = additional_config.get("zero_interrupt_config", None)
         asym = zero_interrupt_config is not None and not is_vit_use_data_parallel()
-
+        use_data_parallel = is_vit_use_data_parallel()
         if not asym:
             # For symmetric TP, call parent's __init__
             OrigQwen3_VisionMLP.__init__(
@@ -98,6 +98,7 @@ class Qwen3_VisionMLPAsymmetric(OrigQwen3_VisionMLP):
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.linear_fc1",
+            disable_tp=use_data_parallel,
             tp_asymmetric_shardings=tp_asymmetric_shardings,
         )
         self.linear_fc2 = RowParallelLinearAsymmetric(
@@ -107,6 +108,7 @@ class Qwen3_VisionMLPAsymmetric(OrigQwen3_VisionMLP):
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.linear_fc2",
+            disable_tp=use_data_parallel,
             tp_asymmetric_shardings=tp_asymmetric_shardings,
         )
         self.act_fn = act_fn
@@ -378,7 +380,7 @@ class Qwen3_VisionPatchMergerAsymmetric(OrigQwen3_VisionPatchMerger):
         self.spatial_merge_size = spatial_merge_size
         self.quant_config = quant_config
         self.use_data_parallel = False
-
+        use_data_parallel = is_vit_use_data_parallel()
         # Create norm layers - 注意：原始实现使用 context_dim，不是 merger_hidden_size
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
@@ -399,6 +401,7 @@ class Qwen3_VisionPatchMergerAsymmetric(OrigQwen3_VisionPatchMerger):
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.linear_fc1",
+            disable_tp=use_data_parallel,
             tp_asymmetric_shardings=tp_asymmetric_shardings,
         )
         self.linear_fc2 = RowParallelLinearAsymmetric(
@@ -408,6 +411,7 @@ class Qwen3_VisionPatchMergerAsymmetric(OrigQwen3_VisionPatchMerger):
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.linear_fc2",
+            disable_tp=use_data_parallel,
             tp_asymmetric_shardings=tp_asymmetric_shardings,
         )
         self.act_fn = nn.GELU()
@@ -478,6 +482,11 @@ class Qwen3_VisionTransformerAsymmetric(OrigQwen3_VisionTransformer):
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
+
+        # FP8 padded hidden size for ViT attention (added in vLLM 0.23.0)
+        self.fp8_padded_hidden_size = get_fp8_padded_hidden_size(
+            self.num_heads, head_dim
+        )
 
         # Create additional components needed by parent's forward
         from vllm.model_executor.models.qwen3_vl import Qwen3_VisionPatchEmbed
