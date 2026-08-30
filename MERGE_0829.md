@@ -14,10 +14,11 @@
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `VLLM_ITS_DEEPSEEK_V4` | `0` | `1/true/yes/on` 时，运行时 patch 与 `setup.py` 整文件替换都切换到 `deepseekv4/` 目录下的 DeepSeek-V4 实现；否则使用主目录的 0829 实现 |
+| `VLLM_ITS_DEEPSEEK_V4` | `0` | `1/true/yes/on` 时选择 DeepSeek-V4 patch 族；否则使用 0829 patch 族。**安装阶段不再读取该变量**，只影响运行期 patch 分发与统一替换文件内部的分支选择。 |
 
-`setup.py` 在安装/替换阶段读取该变量，`zero_interrupt/patch.py` 在运行时
-读取同一变量，因此安装与运行需保持一致的值。
+`zero_interrupt/patch.py` 在运行时分发 A/B 的 runtime monkey-patch；
+已安装到 vllm/vllm_ascend 的统一替换文件在调用时自行判断配置形态或
+运行期环境变量，因此 `setup.py` 无需关心该变量。
 
 ## 目录结构
 
@@ -37,19 +38,11 @@ plugins/zero_interrupt/
 
 ## 模块合并结论
 
-### 双版本（按 `VLLM_ITS_DEEPSEEK_V4` 选择）
+### 运行期双版本（按 `VLLM_ITS_DEEPSEEK_V4` 选择）
 
 | 模块 | 默认（B） | `VLLM_ITS_DEEPSEEK_V4=1`（A） |
 |------|-----------|-------------------------------|
 | `zero_interrupt/patch.py` 运行时分发 | B 主逻辑 | A `deepseekv4/patch.py` |
-| `setup.py` 整文件替换源目录 | 主目录 | `deepseekv4/` |
-| `vllm/config/parallel.py` | B | A |
-| `vllm/distributed/parallel_state.py` | B | A |
-| `vllm/model_executor/layers/fused_moe/config.py` | B | A |
-| `vllm/v1/core/patch_kv_cache_utils.py` | B | A |
-| `vllm_ascend/distributed/parallel_state.py` | B | A |
-| `vllm_ascend/worker/worker.py` | B | A |
-| `vllm_ascend/patch/worker/patch_qwen3_5.py` | B | A |
 | Qwen 系列模型 patch（qwen2/3_5/3_moe/3_next/3_vl） | B | A |
 | `vllm/model_executor/layers/patch_linear.py` | B | A |
 | executor / engine-core / utils 等共同文件 | B | A |
@@ -57,6 +50,22 @@ plugins/zero_interrupt/
 
 A 独有的 DeepSeek-V4 hetero 模块（`patch_hetero_*`、`patch_deepseek_v4*`
 等）只存在于 `deepseekv4/` 中，不会在默认路径加载。
+
+### 安装期统一文件（setup.py 不再按环境变量选目录）
+
+以下整文件替换源已经合并成单文件，安装时固定从主目录拷贝；运行期由
+文件内部逻辑选择分支：
+
+| 安装目标 | 统一方式 |
+|---|---|
+| `vllm/config/parallel.py` | A 的 `HeterogeneousDPConfig` + B 的 `world_size_across_dp` override |
+| `vllm/distributed/parallel_state.py` | A v0.23 原实现 + B 的 `asym_world_size/get_global_rank_asym/init_distributed_environment_asym/asym=True 组网/patch_tensor_parallel_group` |
+| `vllm/model_executor/layers/fused_moe/config.py` | hetero TP / 0829 `zero_interrupt_config` / 对称公式三分支 |
+| `vllm/v1/core/kv_cache_utils.py` | A v0.23 原实现 + B 的 mixed-page_size / 非对称投影与归一化，运行期按 `VLLM_ITS_DEEPSEEK_V4` 分流 |
+| `vllm_ascend/distributed/parallel_state.py` | 直接采用 A（严格超集，含 `init_ascend_model_parallel_asym`） |
+| `vllm_ascend/worker/worker.py` | A hetero 路径 + B 旧 asym 路径 + mamba KV 重算修复 |
+| `vllm_ascend/patch/worker/patch_qwen3_5.py` | 安装运行时分发器 + `*_deepseek_v4.py` / `*_0829.py` 两份实现 |
+| `vllm_ascend/ops/rotary_embedding.py` | A 为底 + B `its_rotary` 开关 |
 
 ### 共享（不分版本）
 
@@ -79,22 +88,25 @@ A 独有的 DeepSeek-V4 hetero 模块（`patch_hetero_*`、`patch_deepseek_v4*`
 ## 安装与运行
 
 ```bash
-# 默认 0829 实现
-VLLM_ITS_DEEPSEEK_V4=0 python3 setup.py          # 或构建安装
+# 安装：不需要设置 VLLM_ITS_DEEPSEEK_V4
+python3 setup.py          # 或构建安装
 export VLLM_CUSTOM_PATCHES=zero_interrupt
 
-# DeepSeek-V4 实现
-VLLM_ITS_DEEPSEEK_V4=1 python3 setup.py
+# 默认 0829 场景
+python3 -m vllm.entrypoints.openai.api_server ...
+
+# DeepSeek-V4 场景（只需运行期设置）
 export VLLM_ITS_DEEPSEEK_V4=1
-export VLLM_CUSTOM_PATCHES=zero_interrupt
+python3 -m vllm.entrypoints.openai.api_server ...
 ```
 
 ## 验证记录
 
 - `python -m compileall` 通过（主目录与 `deepseekv4/` 全量语法编译）。
-- 用假 `vllm` / `vllm_ascend` 包验证 `setup.py` 在两种环境变量取值下，
-  替换目标文件字节级等于对应 patch 源文件。
-- 用 stub 验证 `zero_interrupt/patch.py` 在
+- 用假 `vllm` / `vllm_ascend` 包验证 `setup.py` 在
+  `VLLM_ITS_DEEPSEEK_V4=0` 与 `=1` 两种环境下安装的文件字节级一致
+  （安装结果不再依赖该变量）。
+- 用 stub 验证 `zero_interrupt/patch.py` 与 `patch_qwen3_5.py` 分发器在
   `VLLM_ITS_DEEPSEEK_V4=1/0` 下分别路由到 A/B 实现。
 - 校验主目录与 B 仓文件一致性（仅预期的共享合并文件有差异），
   `deepseekv4/` 与 A 仓文件一致性（仅绝对导入前缀有预期改写）。
@@ -103,5 +115,7 @@ export VLLM_CUSTOM_PATCHES=zero_interrupt
 
 - B 主目录按 0829 仓原样保留，其中少数文件基于 v0.18.0 派生；在
   origin_0.23.0 上的可用性以 0829 仓原有验证结论为准。
-- `VLLM_ITS_DEEPSEEK_V4` 必须在 `setup.py` 执行期和 vLLM 运行期保持同一
-  取值，否则整文件替换与运行时 patch 可能来自不同实现。
+- 安装阶段不再依赖 `VLLM_ITS_DEEPSEEK_V4`；该变量只需在 vLLM 运行期
+  设置，用于选择 runtime monkey-patch 族与统一替换文件的内部分支。
+- `patch_qwen3_5.py` 在安装时会同时安装两份实现；切换场景只需修改
+  运行期环境变量并重启服务。

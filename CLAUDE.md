@@ -87,16 +87,20 @@ class MyPatch(VLLMPatch[TargetClass]):
 
 ### Dual patch-family layout (merge-0829)
 
-`plugins/zero_interrupt/` contains two self-contained families:
+`plugins/zero_interrupt/` contains two self-contained runtime families:
 
 - Main directory: the `vllm_plugins_0829` implementation (default when
   `VLLM_ITS_DEEPSEEK_V4` is unset/0).
 - `deepseekv4/` subdirectory: the `vllm_plugins` DeepSeek-V4 heterogeneous-TP
   implementation (used when `VLLM_ITS_DEEPSEEK_V4=1`).
 
-`zero_interrupt/patch.py` selects the runtime patch family and `setup.py`
-selects the whole-file replacement sources using the same environment
-variable, so both paths stay consistent.
+`zero_interrupt/patch.py` selects the runtime patch family. Whole-file
+replacement sources (parallel.py, parallel_state.py, fused_moe config,
+kv_cache_utils, ascend worker/parallel_state, rotary, patch_qwen3_5) are
+unified files installed by `setup.py` without consulting the environment;
+they branch internally at runtime. `patch_qwen3_5.py` is installed as a
+runtime dispatcher plus `*_deepseek_v4.py` / `*_0829.py` implementations.
+
 
 
 ## Adding a New Plugin

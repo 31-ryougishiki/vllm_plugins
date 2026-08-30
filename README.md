@@ -88,7 +88,7 @@ export VLLM_CUSTOM_PATCHES="MyPatch"
 |---------------------|-------------|
 | `VLLM_CUSTOM_PATCHES` | Comma-separated patch names to apply (e.g., `"PriorityScheduler"`) |
 | `VLLM_PATCH_LOG_LEVEL` | Log level (DEBUG, INFO, WARNING, ERROR). Default: DEBUG |
-| `VLLM_ITS_DEEPSEEK_V4` | `1` selects the DeepSeek-V4 patch family (`plugins/zero_interrupt/deepseekv4/`); default `0` uses the main 0829 family |
+| `VLLM_ITS_DEEPSEEK_V4` | `1` selects the DeepSeek-V4 runtime patch family (`plugins/zero_interrupt/deepseekv4/`); default `0` uses the main 0829 family. Installation no longer depends on this variable |
 
 ## Available Plugins
 

@@ -19,21 +19,39 @@
 
 import copy
 import gc
+import logging
+import os
 from types import NoneType
 
 import torch
 import torch.nn as nn
 import torch_npu
-import vllm.envs as envs_vllm
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
-from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment,get_pcp_group, init_distributed_environment_asym
+from vllm.distributed import (
+    ensure_model_parallel_initialized,
+    get_pcp_group,
+    init_distributed_environment,
+)
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group,ensure_kv_transfer_shutdown
-from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group, asym_world_size, get_engine_parallel_config
+from vllm.distributed.kv_transfer import (
+    ensure_kv_transfer_initialized,
+    ensure_kv_transfer_shutdown,
+    get_kv_transfer_group,
+    has_kv_transfer_group,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
+from vllm.distributed.parallel_state import (
+    Handle,
+    asym_world_size,
+    get_pp_group,
+    get_tp_group,
+    init_distributed_environment_asym,
+)
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_constants import GiB_bytes
@@ -42,6 +60,7 @@ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -51,8 +70,13 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
-from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel, init_ascend_model_parallel_asym
+from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
+from vllm_ascend.distributed.parallel_state import (
+    init_ascend_model_parallel,
+    init_ascend_model_parallel_asym,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
     AscendDeviceType,
     check_ascend_device_type,
@@ -60,25 +84,30 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     register_ascend_customop,
     setup_ascend_local_comm_res,
-    vllm_version_is
+    vllm_version_is,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
-from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
-from vllm.platforms import current_platform
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
-import logging
+
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
-from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
-from vllm.v1.utils import report_usage_stats
+
 torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
     ["torch.npu.current_stream"],
     TorchInGraphFunctionVariable,
 )  # noqa: E402
 torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
 torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+
+
+def _is_deepseek_v4_worker_mode() -> bool:
+    """Runtime patch-family switch, mirrors zero_interrupt dispatcher."""
+    return os.environ.get("VLLM_ITS_DEEPSEEK_V4", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 class NPUWorker(WorkerBase):
@@ -113,6 +142,9 @@ class NPUWorker(WorkerBase):
         register_ascend_customop(vllm_config)
         # init ascend config and soc version
         init_ascend_config(vllm_config)
+        from vllm_ascend.logger import configure_ascend_file_logging
+
+        configure_ascend_file_logging()
         check_ascend_device_type()
 
         super().__init__(
@@ -142,6 +174,7 @@ class NPUWorker(WorkerBase):
         self.weight_transfer_engine = None
         self._weight_update_active = False
         self._is_checkpoint_format = True
+
         # FixMe: this is a patch to fix the issue cause by https://github.com/vllm-project/vllm/commit/de94289a98d7ec52a5ef02719e01a1db8b505170
         from vllm.model_executor.layers.linear import WEIGHT_LOADER_V2_SUPPORTED
 
@@ -210,21 +243,25 @@ class NPUWorker(WorkerBase):
         if level == 2:
             model = self.model_runner.model
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
+
         cleanup_enabled = getattr(get_ascend_config(), "enable_sleep_mode_extra_cleanup", False)
         if cleanup_enabled:
             self.sleep_wakeup_manager.sleep()
+
         allocator = CaMemAllocator.get_instance()
         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
         free_bytes_after_sleep, total = torch.npu.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
         assert freed_bytes >= 0, "Memory usage increased after sleeping."
+
         logger.info(
             "Sleep mode (level=%s) freed %.2f GiB memory, %.2f GiB memory is still in use.",
             level,
             freed_bytes / GiB_bytes,
             used_bytes / GiB_bytes,
         )
+
     def wake_up(self, tags: list[str] | None = None) -> None:
         nz_mode = get_ascend_config().weight_nz_mode
         if nz_mode:
@@ -375,8 +412,6 @@ class NPUWorker(WorkerBase):
             if callable(shutdown_fn):
                 shutdown_fn()
 
-
-
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
@@ -389,16 +424,16 @@ class NPUWorker(WorkerBase):
             # that each DP group binds to a distinct set of NPUs.
             parallel_config = self.parallel_config
             if (
-                    parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
-                    and parallel_config.data_parallel_backend != "ray"
-                    and parallel_config.nnodes_within_dp == 1
-                    # vllm-ascend: when the user pre-shards devices via
-                    # --device-ids (which becomes assigned_physical_gpu_ids),
-                    # each child process already binds to its own NPU(s); the
-                    # DP local_rank shift below would push local_rank past the
-                    # length of the per-rank device list and trip the assert
-                    # in this same method. Skip the shift in that case.
-                    and parallel_config.assigned_physical_gpu_ids is None
+                parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
+                and parallel_config.data_parallel_backend != "ray"
+                and parallel_config.nnodes_within_dp == 1
+                # vllm-ascend: when the user pre-shards devices via
+                # --device-ids (which becomes assigned_physical_gpu_ids),
+                # each child process already binds to its own NPU(s); the
+                # DP local_rank shift below would push local_rank past the
+                # length of the per-rank device list and trip the assert
+                # in this same method. Skip the shift in that case.
+                and parallel_config.assigned_physical_gpu_ids is None
             ):
                 dp_local_rank = parallel_config.data_parallel_rank_local
                 if dp_local_rank is None:
@@ -469,11 +504,11 @@ class NPUWorker(WorkerBase):
             )
 
         if (
-                self.parallel_config.data_parallel_size > 1
-                and self.parallel_config.data_parallel_size_local > 0
-                and self.parallel_config.distributed_executor_backend not in ["ray", "external_launcher"]
-                and self.vllm_config.parallel_config.data_parallel_backend != "ray"
-                and self.vllm_config.parallel_config.nnodes_within_dp == 1
+            self.parallel_config.data_parallel_size > 1
+            and self.parallel_config.data_parallel_size_local > 0
+            and self.parallel_config.distributed_executor_backend not in ["ray", "external_launcher"]
+            and self.vllm_config.parallel_config.data_parallel_backend != "ray"
+            and self.vllm_config.parallel_config.nnodes_within_dp == 1
         ):
             visible_device_count = torch.npu.device_count() if torch.npu.is_available() else 0
             assert self.parallel_config.local_world_size <= visible_device_count, (
@@ -502,7 +537,7 @@ class NPUWorker(WorkerBase):
         # Init ModelRunner here, so that we have access to self.device.
         if self.use_v2_model_runner:
             logger.warning("npu model runner v2 is in developing, some features doesn't work for now.")
-
+            from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
             self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
         else:
@@ -587,8 +622,6 @@ class NPUWorker(WorkerBase):
 
     def log_memory_stats(self) -> None:
         """Profiles the torch reserved memory, torch allocated memory in execute_model()."""
-
-
         if not logger.isEnabledFor(logging.DEBUG):
             return
         self.torch_reserved = torch.npu.memory_reserved()
@@ -880,23 +913,19 @@ class NPUWorker(WorkerBase):
         return {(pp_rank, tp_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        # [mzm] CRITICAL FIX: Recalculate mamba_page_size_padded for current TP
-        # After TP shrink, the mamba state shape changes but mamba_page_size_padded
-        # may still have the old value from initial model load, causing AssertionError
-        # Reset to None first, then call verify_and_update_config to recalculate
-        # This ensures page size alignment is maintained correctly
+        # [merge-0829] 0829 mamba 修复：TP 缩容后 mamba 状态形状变化，
+        # mamba_page_size_padded 可能仍保留旧值；先重置并重新计算。
         if self.vllm_config.cache_config.mamba_page_size_padded is not None:
             self.vllm_config.cache_config.mamba_page_size_padded = None
-            # Recalculate mamba_page_size_padded for current TP size
-            from vllm.model_executor.models.config import HybridAttentionMambaModelConfig
-            HybridAttentionMambaModelConfig.verify_and_update_config(self.vllm_config)
+            from vllm.model_executor.models.config import (
+                HybridAttentionMambaModelConfig,
+            )
 
-        spec = self.model_runner.get_kv_cache_spec()
-        if spec:
-            for layer_name, layer_spec in spec.items():
-                shapes = getattr(layer_spec, 'shapes', 'N/A')
-                page_size = getattr(layer_spec, 'page_size_bytes', 'N/A')
-        return spec
+            HybridAttentionMambaModelConfig.verify_and_update_config(
+                self.vllm_config
+            )
+
+        return self.model_runner.get_kv_cache_spec()
 
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to NPU memory.
@@ -913,7 +942,6 @@ class NPUWorker(WorkerBase):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
-
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
@@ -924,6 +952,7 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
+
             # Restrict to mamba and full attn hybrid models (e.g. Qwen3.x).
             #
             # When eagle3 is enabled with num_speculative_tokens>1, mamba blocks may be reallocated to full blocks if
@@ -935,12 +964,12 @@ class NPUWorker(WorkerBase):
             # If an uncleared mamba block is later reused, the stale state combined with the incorrect seq_lens_cpu may
             # lead to NaNs and reduced acceptance rate.
             if (
-                    kv_cache_config.needs_kv_cache_zeroing
-                    and hasattr(self.model_runner, "_init_kv_zero_meta")
-                    and self.vllm_config is not None
-                    and self.vllm_config.speculative_config is not None
-                    and self.vllm_config.speculative_config.method == "eagle3"
-                    and self.vllm_config.speculative_config.num_speculative_tokens > 1
+                kv_cache_config.needs_kv_cache_zeroing
+                and hasattr(self.model_runner, "_init_kv_zero_meta")
+                and self.vllm_config is not None
+                and self.vllm_config.speculative_config is not None
+                and self.vllm_config.speculative_config.method == "eagle3"
+                and self.vllm_config.speculative_config.num_speculative_tokens > 1
             ):
                 self.model_runner._init_kv_zero_meta()
 
@@ -995,40 +1024,123 @@ class NPUWorker(WorkerBase):
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
-        init_batch_invariance() # TODO: [lqf] not sure what's this
+        init_batch_invariance()
 
-        # NOTE:[lqf] 非对称
+        # zero_interrupt 非对称/异构 TP 分支。
         additional_config = getattr(self.vllm_config, "additional_config", None)
-        zero_interrupt_config = additional_config.get("zero_interrupt_config", None)
-        #self.parallel_config.world_size_across_dp = self.parallel_config.world_size * self.parallel_config.data_parallel_size
+        zero_interrupt_config = (
+            additional_config.get("zero_interrupt_config", None)
+            if additional_config else None
+        )
         is_asym = False
         if zero_interrupt_config:
-            for conf in zero_interrupt_config['engine_parallel_config']:
-                if conf['tp']>1 and conf['dp']>1:
+            for conf in zero_interrupt_config.get(
+                "engine_parallel_config", []
+            ):
+                if conf.get("tp", 0) > 1 and conf.get("dp", 0) > 1:
                     is_asym = True
                     break
 
         if is_asym:
             import copy
+
             asym_parallel_config = copy.deepcopy(self.parallel_config)
-            cur_engine_parallel_conf = get_engine_parallel_config(zero_interrupt_config)
-            asym_parallel_config.tensor_parallel_size = cur_engine_parallel_conf['new_tp']
-            asym_parallel_config.data_parallel_size = cur_engine_parallel_conf['new_dp']
-            asym_parallel_config.world_size = asym_parallel_config.tensor_parallel_size # TODO: [lqf] world_size_inner_dp
-            asym_parallel_config.world_size_across_dp = asym_world_size(zero_interrupt_config)
-            self.vllm_config.parallel_config = asym_parallel_config # NOTE: [lqf] rewrite parallel_config to avoid patching too much util function
-            init_distributed_environment_asym(
-                asym_parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
-            ) # NOTE:[lqf] init pg from vllm, rank && local_rank already modified by its-executor
+            cur_engine_parallel_conf = zero_interrupt_config[
+                "engine_parallel_config"
+            ][0]
+            # 找到当前 executor 对应的配置。
+            for conf in zero_interrupt_config["engine_parallel_config"]:
+                if str(conf.get("executor_id")) == str(
+                    zero_interrupt_config.get("executor_id", "0")
+                ):
+                    cur_engine_parallel_conf = conf
+                    break
+
+            heterogeneous_dp_config = zero_interrupt_config.get(
+                "heterogeneous_dp_config", None
+            )
+            deepseek_v4_mode = _is_deepseek_v4_worker_mode()
+            legacy_asym_path = not (
+                deepseek_v4_mode or heterogeneous_dp_config
+            )
+
+            if legacy_asym_path:
+                # [merge-0829] 0829 旧非对称路径：由
+                # init_distributed_environment_asym 按
+                # zero_interrupt_config 计算全局 rank/world_size，
+                # initialize_model_parallel(asym=True) 建 TP/DP/EP 组。
+                asym_parallel_config.tensor_parallel_size = (
+                    cur_engine_parallel_conf["new_tp"]
+                )
+                asym_parallel_config.data_parallel_size = (
+                    cur_engine_parallel_conf["new_dp"]
+                )
+                asym_parallel_config.world_size = (
+                    asym_parallel_config.tensor_parallel_size
+                )
+                asym_parallel_config.world_size_across_dp = asym_world_size(
+                    zero_interrupt_config
+                )
+                self.vllm_config.parallel_config = asym_parallel_config
+                init_distributed_environment_asym(
+                    asym_parallel_config.world_size,
+                    self.rank,
+                    self.distributed_init_method,
+                    self.local_rank,
+                    "hccl",
+                )
+                ensure_model_parallel_initialized(
+                    asym_parallel_config.tensor_parallel_size,
+                    asym_parallel_config.pipeline_parallel_size,
+                    asym_parallel_config.prefill_context_parallel_size,
+                    asym_parallel_config.decode_context_parallel_size,
+                    asym=True,
+                )
+                init_ascend_model_parallel_asym(asym_parallel_config)
+                ensure_ec_transfer_initialized(self.vllm_config)
+                return
+
+            asym_parallel_config.tensor_parallel_size = (
+                cur_engine_parallel_conf.get(
+                    "new_tp", cur_engine_parallel_conf.get("tp", 1)
+                )
+            )
+            asym_parallel_config.data_parallel_size = (
+                cur_engine_parallel_conf.get(
+                    "new_dp", cur_engine_parallel_conf.get("dp", 1)
+                )
+            )
+            asym_parallel_config.world_size = (
+                asym_parallel_config.tensor_parallel_size
+            )
+
+            if heterogeneous_dp_config:
+                from vllm.config.parallel import HeterogeneousDPConfig
+
+                asym_parallel_config.heterogeneous_dp_config = [
+                    HeterogeneousDPConfig(**cfg)
+                    for cfg in heterogeneous_dp_config
+                ]
+
+            self.vllm_config.parallel_config = asym_parallel_config
+            # v0.23 hetero parallel_state 根据
+            # heterogeneous_dp_config/is_heterogeneous_tp 自动计算
+            # 全局 rank 和 15-rank world_size。
+            init_distributed_environment(
+                asym_parallel_config.world_size,
+                self.rank,
+                self.distributed_init_method,
+                self.local_rank,
+                "hccl",
+            )
             ensure_model_parallel_initialized(
                 asym_parallel_config.tensor_parallel_size,
-                asym_parallel_config.pipeline_parallel_size, # TODO: [lqf] not support asym pp yet
-                asym_parallel_config.prefill_context_parallel_size, # TODO: [lqf] not support asym pcp yet
-                asym_parallel_config.decode_context_parallel_size, # TODO: [lqf] not support asym dcp yet
-                asym=True,
+                asym_parallel_config.pipeline_parallel_size,
+                asym_parallel_config.prefill_context_parallel_size,
+                asym_parallel_config.decode_context_parallel_size,
             )
-            init_ascend_model_parallel_asym(asym_parallel_config) # NOTE:[lqf] init pg from vllm-ascend
-            ensure_ec_transfer_initialized(self.vllm_config) # TODO:[lqf] not sure what's going on
+            init_ascend_model_parallel_asym(asym_parallel_config)
+            ensure_ec_transfer_initialized(self.vllm_config)
             return
 
         init_distributed_environment(
@@ -1042,7 +1154,6 @@ class NPUWorker(WorkerBase):
         )
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
-
 
     def get_supported_pooling_tasks(self):
         return self.model_runner.get_supported_pooling_tasks()

@@ -31,10 +31,6 @@ def replace_file_content(new_path, old_path):
         print(f"WARNING: source patch file not found, skip: {new_path}")
 
 
-def env_flag(name, default="0"):
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
-
-
 def find_package_dir(pip_name, import_name, package_subdir, import_env=None):
     """查找已安装包路径。
 
@@ -88,16 +84,13 @@ def find_package_dir(pip_name, import_name, package_subdir, import_env=None):
 
 
 # =============================================================================
-# DeepSeek-V4 分流开关
+# 整文件替换源目录。
 #
-# VLLM_ITS_DEEPSEEK_V4=1 时，整文件替换源切到
-# vllm_custom_plugins/plugins/zero_interrupt/deepseekv4/ 下的 v0.23+DeepSeek-V4
-# 实现；未设置/为 0 时，默认使用主目录（vllm_plugins_0829 合并实现）。
-# 运行时 patch 分发在 zero_interrupt/patch.py 中使用同一环境变量。
+# 合并后的仓库把 A/B 两个场景的实现统一到了主目录的单个替换文件里；
+# 运行期由 VLLM_ITS_DEEPSEEK_V4（以及配置形态）在文件内部选择分支，
+# 因此 setup.py 安装阶段不再依赖该环境变量。
 # =============================================================================
-USE_DEEPSEEK_V4 = env_flag("VLLM_ITS_DEEPSEEK_V4")
-print(f"VLLM_ITS_DEEPSEEK_V4={int(USE_DEEPSEEK_V4)} "
-      f"(patch source: {'deepseekv4' if USE_DEEPSEEK_V4 else 'main/0829'})")
+print("vllm_custom_plugins setup.py: unified runtime-dispatched replacements")
 
 _env = os.environ.copy()
 _env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
@@ -105,15 +98,13 @@ _env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 vllm_ascend_path = find_package_dir("vllm-ascend", "vllm_ascend", "vllm_ascend")
 vllm_path = find_package_dir("vllm", "vllm", "vllm", import_env=_env)
 
-# 选择 zero_interrupt patch 源目录
+# 统一后的替换源都在 zero_interrupt 主目录。
 zero_interrupt_root = os.path.join(
     os.path.dirname(__file__),
     'vllm_custom_plugins',
     'plugins',
     'zero_interrupt',
 )
-if USE_DEEPSEEK_V4:
-    zero_interrupt_root = os.path.join(zero_interrupt_root, 'deepseekv4')
 
 print("executing vllm_custom_plugins setup.py")
 # 替换算子相关patch文件
@@ -141,10 +132,25 @@ if vllm_ascend_path and os.path.exists(vllm_ascend_path):
     replace_file_content(worker_src_path, worker_dest_path)
 
     print(f"Start replacing patch_qwen3_5.py in vllm_ascend...")
-    patch_qwen_3_5_dest_path = os.path.join(vllm_ascend_path, 'patch', 'worker', 'patch_qwen3_5.py')
-    patch_qwen_3_5_src_path = os.path.join(zero_interrupt_root, 'vllm_ascend',
-                                           'patch', 'worker', 'patch_qwen3_5.py')
-    replace_file_content(patch_qwen_3_5_src_path, patch_qwen_3_5_dest_path)
+    patch_qwen_3_5_src_root = os.path.join(
+        zero_interrupt_root, 'vllm_ascend', 'patch', 'worker'
+    )
+    patch_qwen_3_5_dest_dir = os.path.join(
+        vllm_ascend_path, 'patch', 'worker'
+    )
+    # 安装运行时分发器 + 两份实现，import 时按环境变量选择。
+    for src_name, dest_name in (
+        ("patch_qwen3_5.py", "patch_qwen3_5.py"),
+        (
+            "patch_qwen3_5_deepseek_v4.py",
+            "patch_qwen3_5_deepseek_v4.py",
+        ),
+        ("patch_qwen3_5_0829.py", "patch_qwen3_5_0829.py"),
+    ):
+        replace_file_content(
+            os.path.join(patch_qwen_3_5_src_root, src_name),
+            os.path.join(patch_qwen_3_5_dest_dir, dest_name),
+        )
 else:
     print(f"Fail to find vllm_ascend path")
 
