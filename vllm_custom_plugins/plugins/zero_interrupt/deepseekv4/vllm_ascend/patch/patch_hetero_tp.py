@@ -233,7 +233,26 @@ def _patched_set_mc2_tokens_capacity(
 ):
     import vllm_ascend.ascend_forward_context as afc
 
-    if afc._mc2_tokens_capacity is not None:
+    pc = vllm_config.parallel_config
+    if getattr(pc, "is_heterogeneous_tp", False):
+        tp_sizes = tuple(
+            pc.get_tp_size_for_dp(i) for i in range(pc.data_parallel_size)
+        )
+        align = math.lcm(*tp_sizes)
+    else:
+        tp_sizes = None
+        align = pc.tensor_parallel_size
+
+    # The module-level cache is process-global.  A worker process is normally
+    # recreated for every restart, but keep the cache topology-keyed anyway:
+    # if a process survives a topology transition (or the patch is exercised
+    # in-process), a symmetric DP4TP4 run must not reuse the capacity aligned
+    # to lcm(3,4)=12 from the preceding heterogeneous run.
+    capacity_key = (align, tp_sizes)
+    if (
+        afc._mc2_tokens_capacity is not None
+        and getattr(afc, "_mc2_capacity_key", None) == capacity_key
+    ):
         return
     if afc.get_ascend_config().enable_prefill_mc2:
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -244,22 +263,13 @@ def _patched_set_mc2_tokens_capacity(
     else:
         max_num_tokens = max_num_reqs * uniform_decode_query_len
 
-    pc = vllm_config.parallel_config
-    if getattr(pc, "is_heterogeneous_tp", False):
-        tp_sizes = [
-            pc.get_tp_size_for_dp(i) for i in range(pc.data_parallel_size)
-        ]
-        align = math.lcm(*tp_sizes)
-    else:
-        tp_sizes = None
-        align = pc.tensor_parallel_size
-
     num_tokens_per_tp_rank = (max_num_tokens + align - 1) // align
     if tp_sizes is not None:
         max_safe_units = min((tp_i * 512) // align for tp_i in tp_sizes)
         num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, max_safe_units)
     else:
         num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, 512)
+    afc._mc2_capacity_key = capacity_key
     afc._mc2_tokens_capacity = num_tokens_per_tp_rank * align
 
 

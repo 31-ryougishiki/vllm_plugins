@@ -895,10 +895,14 @@ def patch_engine_core() -> None:
         # world_size 变为 0，都必须向 coordinator/client 发送空转通知。
         # 否则 DPLB 客户端不知道该 engine 已 idle，继续向其路由 ADD，
         # 而 idle engine 会丢弃这些请求导致客户端永久等待。
-        if success and getattr(executor, "world_size", 1) == 0:
+        if success and (
+            getattr(executor, "world_size", 1) == 0
+            or executor.current_strategy.deploy_type == DeployType.STOP
+        ):
             logger.debug(
-                "++++[mzm]++++Strategy deploy type: %s, world_size: 0",
+                "++++[mzm]++++Strategy deploy type: %s, world_size: %s",
                 executor.current_strategy.deploy_type,
+                getattr(executor, "world_size", "unknown"),
             )
             logger.info("Strategy resulted in world_size=0, entering idle mode")
             _send_idle_notification(engine_core)
