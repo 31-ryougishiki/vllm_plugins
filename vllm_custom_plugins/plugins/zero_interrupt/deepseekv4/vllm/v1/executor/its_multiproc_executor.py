@@ -1460,6 +1460,31 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         logger.info("Updating KV connector metadata after worker restart")
 
         try:
+            # A scale-to-zero executor (world_size == 0, no workers and no
+            # rpc_broadcast_mq) cannot collect worker handshake metadata.
+            # Calling collective_rpc here would only raise a caught
+            # AssertionError and leave the pre-shrink metadata mapping in the
+            # scheduler connector.  Drop the stale mapping instead: it refers
+            # to workers that no longer exist, and the RECOVER restart will
+            # repopulate it from the restored worker.
+            if getattr(self, "world_size", 0) == 0 or not getattr(
+                self, "workers", None
+            ):
+                kv_connector = engine_core.scheduler.get_kv_connector()
+                connector_scheduler = getattr(
+                    kv_connector, "connector_scheduler", None
+                ) if kv_connector is not None else None
+                if connector_scheduler is not None and hasattr(
+                    connector_scheduler, "multi_nodes_meta_mapping"
+                ):
+                    connector_scheduler.multi_nodes_meta_mapping.clear()
+                logger.info(
+                    "No workers after restart; cleared stale scheduler KV "
+                    "connector metadata instead of collecting handshake "
+                    "metadata."
+                )
+                return
+
             # Get KV connector from scheduler
             kv_connector = engine_core.scheduler.get_kv_connector()
             if kv_connector is None:
@@ -2997,8 +3022,18 @@ class ITSNPUWorker(AscendWorkerProc):
                 self._apply_parallel_config(vllm_config, new_tp, new_dp)
                 return
 
-            # Note: PD_REBUILD is handled via RPC call to update_kv_connector_for_pd
-            # instead of at worker startup, to ensure all instances coordinate properly
+            # PD_REBUILD full-restart strategies are already applied by the
+            # executor before this worker process was spawned (parallel config
+            # was updated before pickling).  The RPC-based healthy-instance
+            # KV connector update is installed separately on NPUWorker, so
+            # there is nothing for worker startup to do here.
+            if deploy_type == DeployType.PD_REBUILD.value:
+                logger.info(
+                    "Worker %s: PD_REBUILD restart handled by executor; "
+                    "no worker-side parallel config update needed.",
+                    self.rank,
+                )
+                return
 
             logger.warning(f"Worker {self.rank}: Unknown deploy_type={deploy_type}")
 

@@ -354,8 +354,20 @@ def recover_requires_full_restart(
     while the recovered executor is still waiting on the old 16-rank
     barrier, and the new 16-rank ``init_process_group`` would wait forever.
     """
+    backup = backup or {}
     backup_tp = backup.get("tensor_parallel_size")
     backup_dp = backup.get("data_parallel_size")
+    if not backup:
+        # An executor without a degrade backup may have missed the preceding
+        # DEGRADE/PD_REBUILD entirely.  Its current tp/dp can look identical
+        # to the RECOVER target while its worker world and dp_group are stale
+        # (or its workers are already dead).  The peers that DID degrade
+        # build a fresh target barrier for RECOVER; this executor must join
+        # that same full-restart barrier instead of being classified as
+        # unchanged.  Restarting it without the barrier would either skip the
+        # rendezvous (peers wait forever) or kill workers while peers are
+        # still serving the old world.
+        return True
     return bool(
         current_is_heterogeneous
         or (

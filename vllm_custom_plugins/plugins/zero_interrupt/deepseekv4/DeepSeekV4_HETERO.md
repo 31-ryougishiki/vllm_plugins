@@ -103,7 +103,10 @@
 - **重复策略幂等**：DEGRADE / PD_REBUILD 全量重启若目标拓扑与当前
   `heterogeneous_dp_config`/tp/dp 完全一致，执行器只上报成功、不再杀
   worker；RECOVER 只有在本 executor 持有非空 `backup_parallel_config`
-  且拓扑一致时才跳过，否则按全量重启处理。
+  且拓扑一致时才跳过，否则按全量重启处理。没有 DEGRADE 备份的 executor
+  （例如故障卡缩容时 POST 失败、RECOVER 时才恢复可达）即使本地 dp/tp
+  已经等于 RECOVER 目标，也强制走全量重启 barrier：健康 executor 已经
+  重建了目标 dp_group，跳过 rendezvous 会让对端永久等待。
 - **PD 元数据只在真实重启后刷新**：幂等跳过的策略不会轮换
   `engine_id`、清空/刷新 scheduler connector 元数据，避免 scheduler 侧
   新 engine_id 与未重启 worker 的旧 engine_id 不一致。

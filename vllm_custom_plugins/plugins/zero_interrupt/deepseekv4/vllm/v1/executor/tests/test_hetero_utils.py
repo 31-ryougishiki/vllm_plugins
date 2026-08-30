@@ -430,6 +430,33 @@ class TestHeteroUtils(unittest.TestCase):
             )
         )
 
+    def test_recover_without_degrade_backup_requires_full_restart(self):
+        # The fault executor may have missed the preceding DEGRADE POST
+        # (trigger_decode_fault.sh treats it as best-effort).  Its local
+        # topology can then still be DP16TP1 -- exactly the RECOVER target --
+        # but the healthy executors already replaced the old 16-rank group
+        # and will rendezvous on a fresh target group.  Skipping the barrier
+        # here would make the 15 healthy executors time out waiting for this
+        # executor, so an empty backup must fail closed to full restart.
+        self.assertTrue(
+            recover_requires_full_restart(
+                backup={},
+                current_tp=1,
+                current_dp=16,
+                current_is_heterogeneous=False,
+                target_dp=16,
+            )
+        )
+        self.assertTrue(
+            recover_requires_full_restart(
+                backup=None,
+                current_tp=1,
+                current_dp=16,
+                current_is_heterogeneous=False,
+                target_dp=16,
+            )
+        )
+
     def test_pd_scheduler_topology_uses_cumulative_offset_for_hetero(self):
         pc = _HeteroParallelConfig(dp_rank=2)
         self.assertEqual(
