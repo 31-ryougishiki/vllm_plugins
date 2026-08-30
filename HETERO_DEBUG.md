@@ -4,7 +4,12 @@
 > 后续开发方向、关键控制面结论与操作入口。如需历史根因，见 `git log` 与
 > 对应 commit message。
 >
-> 适用对象：vllm_plugins 仓 `hetero` 分支，vLLM / vllm-ascend v0.23.0。
+> 适用对象：vllm_plugins 仓 `merge-unified-install` 分支（当前推荐调试分支，
+> 已合并 vllm_plugins_0829），vLLM / vllm-ascend v0.23.0。
+> 相关测试仓使用 `vllm_plugins_hetero_test` 的 `merge-0829-adapt` 分支。
+>
+> `hetero` 分支仍是原始 DeepSeek-V4-only 实现；合并说明见
+> `vllm_plugins/MERGE_0829.md`。
 
 ---
 
@@ -25,6 +30,48 @@
   场景 1 的**目标拓扑**。它**尚未适配**场景 2、场景 3 和
   DecisionMakingCenter 控制面，因此只能作为场景 1 数据面的 golden
   reference；场景 2/3 只能以“恢复后输出与场景 1/2 基线一致”做端到端校验。
+
+---
+
+## 0.1 0829 合并后的关键约定（必读）
+
+本次合并把 `vllm_plugins`（DeepSeek-V4）与 `vllm_plugins_0829`
+（Qwen 非对称 / zero-interrupt）合并进同一仓，并按以下方式分流：
+
+| 项 | 结论 |
+|---|---|
+| 推荐代码分支 | `vllm_plugins` → `merge-unified-install`；测试脚本仓 → `merge-0829-adapt` |
+| 运行期开关 | `VLLM_ITS_DEEPSEEK_V4=1` 走 DeepSeek-V4 patch 族；未设置/`0` 走 0829 patch 族 |
+| 安装阶段 | `setup.py` 安装**统一替换文件**，**不再读取** `VLLM_ITS_DEEPSEEK_V4`；该变量只影响运行期 |
+| DeepSeek-V4 runtime 文件 | `plugins/zero_interrupt/deepseekv4/`（A 完整镜像，绝对导入已改为 `...zero_interrupt.deepseekv4.*`） |
+| 0829 runtime 文件 | `plugins/zero_interrupt/` 主目录（默认） |
+| 整文件替换源 | 统一文件位于 `plugins/zero_interrupt/vllm/...` 与 `plugins/zero_interrupt/vllm_ascend/...` 主目录，内部按配置/运行期环境分支 |
+| `patch_qwen3_5.py` | 已合并为单文件：对称 TP 走 v0.23 原实现，非对称 TP 走 0829 shardings 切分，310P 保持原路径 |
+
+Debug 场景 1/2/3 的 launch 脚本默认导出 `VLLM_ITS_DEEPSEEK_V4=1`；
+**手工启动 vllm 时必须自己导出**，否则会静默落到 0829 runtime patch，
+DeepSeek-V4 hetero 逻辑不加载。
+
+启动日志中应能看到：
+
+```text
+VLLM_ITS_DEEPSEEK_V4=1: applying DeepSeek-V4 patch family
+```
+
+如未出现该行，先检查运行期环境变量，而不是查控制面逻辑。
+
+合并分支关系：
+
+```text
+vllm_plugins:
+  hetero                # 原始 A（DeepSeek-V4-only）
+  merge-0829            # 第一步合并：B 主目录 + deepseekv4 子目录
+  merge-unified-install # 当前推荐：整文件替换统一 + 运行期分流
+
+vllm_plugins_hetero_test:
+  main                  # 原测试脚本
+  merge-0829-adapt      # 适配合并后的 launch/install/文档
+```
 
 ---
 
@@ -94,6 +141,7 @@
 
 | 项目 | 状态 |
 |---|---|
+| 0829 合并 + 统一整文件替换 + 运行期 patch 族开关 | ✅ 已提交（`merge-unified-install` / `merge-0829-adapt`），待 A3 双路径复测 |
 | 对称 DP4TP4 正常拉起 + 普通请求 | ✅ 已验证 |
 | hetero_cp 直接拉起场景 1 异构拓扑 + 推理 | ✅ 输出正确；**仅覆盖场景 1** |
 | 场景 1 控制面（P 全量重启、KV 重建、Mooncake 恢复） | 🔧 代码已提交，待 A3 最终复测 |
@@ -116,12 +164,13 @@ git -C vllm_plugins_hetero_test log --oneline --all
 
 | 路径 | 作用 |
 |---|---|
-| `vllm_plugins/` | 当前适配仓（`hetero` 分支），运行时插件 + setup.py 源码替换 |
+| `vllm_plugins/` | 当前适配仓。推荐分支 `merge-unified-install`；原始 A 分支 `hetero`；中间合并分支 `merge-0829` |
+| `vllm_plugins_0829/` | 0829 并行开发仓（已合并，保留作对照） |
 | `vllm_plugins_origin/` | 老代码基线 |
 | `hetero_cp/` | 参考 demo；**只覆盖场景 1** 目标拓扑，直接改 vllm/vllm-ascend 源码 |
 | `origin_0.23.0/` | vllm/vllm-ascend v0.23.0 官方基线 |
 | `origin_0.18.0/` | v0.18.0 基线 |
-| `vllm_plugins_hetero_test/` | A3 安装 / 拉起 / 触发 / 校验脚本 |
+| `vllm_plugins_hetero_test/` | A3 安装 / 拉起 / 触发 / 校验脚本；推荐分支 `merge-0829-adapt` |
 | `DecisionMakingCenter/` | 决策中心参考代码（本次适配**未修改**） |
 | `DeepSeek-V4-Flash-w8a8-mtp/` | 模型配置样例 |
 
@@ -130,7 +179,8 @@ git -C vllm_plugins_hetero_test log --oneline --all
 ```bash
 git -C hetero_cp/vllm diff 0fc695fc6d..HEAD
 git -C hetero_cp/vllm-ascend diff 5cb98caaa..HEAD
-git -C vllm_plugins log --oneline
+git -C vllm_plugins log --oneline --all --decorate -20
+git -C vllm_plugins_hetero_test log --oneline --all --decorate -10
 ```
 
 ---
@@ -161,6 +211,12 @@ git -C vllm_plugins log --oneline
    - 部署状态优先上报 `exe-...` id；
    - 上报 role 使用 `P_ROLE` / `D_ROLE`（不是 `kv_producer/consumer`）；
    - 同一服务的所有 executor 必须使用同一个 `VLLM_SERVICE_ID`。
+9. **0829 合并后的 patch 族选择**：
+   - 安装阶段不选族；`VLLM_ITS_DEEPSEEK_V4` 只影响运行期。
+   - DeepSeek-V4 场景必须 `VLLM_ITS_DEEPSEEK_V4=1`，并在启动日志确认
+     `applying DeepSeek-V4 patch family`。
+   - 整文件替换已统一，切换 0829/DeepSeek-V4 不需要重装，只需改环境变量
+     重启服务。
 
 ---
 
@@ -169,15 +225,23 @@ git -C vllm_plugins log --oneline
 ### 5.1 安装与拉起（手动模式）
 
 ```bash
-# 安装
+# 安装：不再需要 VLLM_ITS_DEEPSEEK_V4（setup.py 安装统一替换文件）
 cd /opt/its/z30055003/vllm_plugins_hetero_test
 bash install_vllm_plugins.sh
 
-# P 节点：对称 DP4TP4
+# P 节点：对称 DP4TP4（脚本默认运行期 VLLM_ITS_DEEPSEEK_V4=1）
 bash launch_prefill_hetero_test.sh
 
-# D 节点：DP16TP1
+# D 节点：DP16TP1（脚本默认运行期 VLLM_ITS_DEEPSEEK_V4=1）
 bash pd_hetero/decode/launch_decode_pd.sh
+```
+
+手工启动时（不经 launch 脚本）必须显式导出：
+
+```bash
+export VLLM_ITS_DEEPSEEK_V4=1
+export VLLM_CUSTOM_PATCHES=zero_interrupt
+python3 -m vllm.entrypoints.openai.api_server ...
 ```
 
 ### 5.2 决策中心模式
@@ -215,6 +279,9 @@ bash decision_center/repair_devices.sh <node_ip>:<npu_id> ...
 ### 5.3 关键日志检查
 
 ```bash
+# patch 族路由（每个进程都应出现；没出现说明环境变量未设置）
+grep -R "applying DeepSeek-V4 patch family" logs/prefill/ logs/decode/
+
 # 决策中心分配 executor id（P/D 每个进程都应出现）
 grep -R "assigned executor_id" logs/prefill/ logs/decode/
 
@@ -244,18 +311,35 @@ bash pd_hetero/decode/trigger_decode_recover.sh # 场景 3 D 恢复手动
 
 ## 6. 关键实现文件
 
+路径均相对 `vllm_plugins/vllm_custom_plugins/plugins/zero_interrupt/`。
+
+### 6.1 DeepSeek-V4 runtime patch（`deepseekv4/` 镜像）
+
 | 文件 | 作用 |
 |---|---|
-| `vllm/v1/executor/its_multiproc_executor.py` | worker 重启、策略执行、存活组 barrier、dp_group 替换 |
-| `vllm/v1/engine/engine_core_patch.py` | busy loop 消费策略、DP 同步、engine_id 轮换 |
-| `vllm/v1/executor/http_server.py` | 策略 HTTP，接受数字/`exe-...` executor id |
-| `common/communication/decision_center_client.py` | 注册、状态上报、executor id 解析 |
-| `vllm/v1/executor/utils.py` | barrier geometry、RECOVER 判定、sharding fallback |
-| `vllm_ascend/ops/patch_hetero_ascend_linear.py` | 非对称 TP 权重 scaffolding 与 ratio-aware loader |
-| `vllm_ascend/attention/patch_deepseek_v4_attention_hetero.py` | DSA-CP 非对称 head / o_proj 恢复 |
-| `vllm_ascend/ops/fused_moe/patch_hetero_moe.py` | MoE Prepare/Finalize、256 experts 余数分布 |
-| `vllm_ascend/distributed/kv_transfer/patch_hetero_mooncake.py` | Mooncake 异构端口映射、engine_id 轮换 |
-| `vllm_ascend/patch/patch_hetero_tp.py` | forward context 别名刷新、per-DP 布局 |
+| `deepseekv4/vllm/v1/executor/its_multiproc_executor.py` | worker 重启、策略执行、存活组 barrier、dp_group 替换 |
+| `deepseekv4/vllm/v1/engine/engine_core_patch.py` | busy loop 消费策略、DP 同步、engine_id 轮换 |
+| `deepseekv4/vllm/v1/executor/http_server.py` | 策略 HTTP，接受数字/`exe-...` executor id |
+| `deepseekv4/common/communication/decision_center_client.py` | 注册、状态上报、executor id 解析 |
+| `deepseekv4/vllm/v1/executor/utils.py` | barrier geometry、RECOVER 判定、sharding fallback |
+| `deepseekv4/vllm_ascend/ops/patch_hetero_ascend_linear.py` | 非对称 TP 权重 scaffolding 与 ratio-aware loader |
+| `deepseekv4/vllm_ascend/attention/patch_deepseek_v4_attention_hetero.py` | DSA-CP 非对称 head / o_proj 恢复 |
+| `deepseekv4/vllm_ascend/ops/fused_moe/patch_hetero_moe.py` | MoE Prepare/Finalize、256 experts 余数分布 |
+| `deepseekv4/vllm_ascend/distributed/kv_transfer/patch_hetero_mooncake.py` | Mooncake 异构端口映射、engine_id 轮换 |
+| `deepseekv4/vllm_ascend/patch/patch_hetero_tp.py` | forward context 别名刷新、per-DP 布局 |
+
+### 6.2 setup.py 统一整文件替换源（主目录，安装期不选族）
+
+| 文件 | 作用 |
+|---|---|
+| `vllm/config/parallel.py` | `HeterogeneousDPConfig`（A）+ `world_size_across_dp` override（B） |
+| `vllm/distributed/parallel_state.py` | v0.23 组网 + 0829 `asym_world_size/get_global_rank_asym/init_distributed_environment_asym/asym=True` 组网 |
+| `vllm/model_executor/layers/fused_moe/config.py` | hetero TP / 0829 `zero_interrupt_config` / 对称公式三分支 |
+| `vllm/v1/core/patch_kv_cache_utils.py` | v0.23 KV cache + 0829 mixed-page_size / 非对称投影 |
+| `vllm_ascend/distributed/parallel_state.py` | A 严格超集，含 `init_ascend_model_parallel_asym` |
+| `vllm_ascend/worker/worker.py` | DeepSeek-V4 hetero 路径 + 0829 legacy asym 路径 + mamba KV 修复 |
+| `vllm_ascend/patch/worker/patch_qwen3_5.py` | 单文件：对称走 v0.23，非对称走 0829 shardings |
+| `vllm_ascend/ops/triton/rotary_embedding.py` | v0.23 同源 + 0829 `its_rotary` 开关 |
 
 ---
 
@@ -274,3 +358,6 @@ bash pd_hetero/decode/trigger_decode_recover.sh # 场景 3 D 恢复手动
    在无 barrier 保护下重复杀 worker。
 7. **改动任何场景后，旧手动触发脚本也要回归**：数字 executor_id 路径
    必须仍然可用。
+8. **合并仓调试 DeepSeek-V4 前，先确认运行期 patch 族**：`VLLM_ITS_DEEPSEEK_V4`
+   必须是 `1`，且日志出现 `applying DeepSeek-V4 patch family`；安装阶段
+   不再设置该变量。
