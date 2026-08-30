@@ -28,7 +28,7 @@ try:
         get_tp_partition_size,
     )
 except ImportError:  # stock v0.23 tree without the hetero utils patch
-    from vllm_custom_plugins.plugins.zero_interrupt.vllm.distributed.patch_hetero_utils import (
+    from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm.distributed.patch_hetero_utils import (
         get_tp_partition_offset,
         get_tp_partition_size,
     )

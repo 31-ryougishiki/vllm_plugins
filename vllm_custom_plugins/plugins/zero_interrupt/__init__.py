@@ -27,6 +27,15 @@ def init_zero_interrupt():
     This function should be called during vLLM startup to enable
     ITS functionality.
     """
+    from .common.constants import is_deepseek_v4_enabled
+
+    if is_deepseek_v4_enabled():
+        from .deepseekv4 import (
+            init_zero_interrupt as deepseek_v4_init_zero_interrupt,
+        )
+
+        return deepseek_v4_init_zero_interrupt()
+
     # Apply EngineCore patch
     from vllm_custom_plugins.plugins.zero_interrupt.vllm.v1.engine.engine_core_patch import patch_engine_core
     patch_engine_core()

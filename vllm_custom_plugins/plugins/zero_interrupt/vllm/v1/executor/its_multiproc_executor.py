@@ -11,31 +11,23 @@ from __future__ import annotations
 import json
 import os
 import re
-import socket
 import subprocess
 import threading
 import time
 import traceback
 from collections import deque
 from dataclasses import asdict
-from datetime import timedelta
 from typing import Any, Callable
 import pickle
 import cloudpickle
 from functools import partial
 from collections.abc import Sequence
 
-import torch
-
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.distributed.parallel_state import model_parallel_is_initialized
-from vllm.distributed.utils import (
-    stateless_destroy_torch_distributed_process_group,
-    stateless_init_torch_distributed_process_group,
-)
 from vllm.utils.network_utils import get_ip, get_loopback_ip, get_open_port, get_distributed_init_method
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.core.kv_cache_utils import get_kv_cache_configs, generate_scheduler_kv_cache_config
@@ -54,15 +46,6 @@ from vllm_custom_plugins.plugins.zero_interrupt.common.types import DeployState,
     InitExecutorStateRequest, ModelInfo
 
 from vllm_custom_plugins.plugins.zero_interrupt.common.communication.decision_center_client import DecisionCenterClient
-from vllm_custom_plugins.plugins.zero_interrupt.vllm.v1.executor.utils import (
-    BarrierPortPool,
-    get_global_start_rank,
-    get_heterogeneous_dp_config,
-    get_surviving_dp_barrier_geometry,
-    get_tp_asymmetric_shardings,
-    is_heterogeneous_restart,
-    recover_requires_full_restart,
-)
 from .health_monitor import ITSHealthMonitor, ITSFailureCallback
 from .http_server import ITSHttpServer
 from .strategy_sync import StrategySyncThread
@@ -132,37 +115,9 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         # Initialize ITS-specific components
         self._its_enabled = True
 
-        # Executor id assigned by DecisionMakingCenter during
-        # /init_executor_state. The center-generated id
-        # (exe-<service>-<engine>-<n>) is used in every strategy payload and
-        # deploy-status report; the local numeric data_parallel_rank remains
-        # valid only for the old manual trigger scripts.
-        self._decision_center_executor_id: str | None = None
-
         # Configuration
         self._fault_keep_enabled = VLLM_ITS_ENABLE_FAULT_KEEP
         self._http_port = VLLM_ITS_HTTP_SERVER_PORT_START
-
-        # Full-restart barriers create a new stateless gloo group while the
-        # current engine-core dp_group (and its TCPStore port) must stay
-        # alive.  Reserve two ports from the shared DP port pool *before* the
-        # parent class spawns workers: worker processes get a copy of
-        # ``vllm_config`` and their ``get_next_dp_init_port()`` calls do not
-        # propagate back, so popping the barrier ports here is the only point
-        # where all DP executors can deterministically agree on the same
-        # ports.  The pool rotates, so the port used by the previous barrier
-        # is only reused after that group has been destroyed.
-        self._its_barrier_port_pool = BarrierPortPool()
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.data_parallel_size > 1:
-            barrier_ports = [
-                parallel_config.get_next_dp_init_port() for _ in range(2)
-            ]
-            self._its_barrier_port_pool = BarrierPortPool(barrier_ports)
-            logger.info(
-                "Reserved ITS full-restart barrier ports: %s",
-                barrier_ports,
-            )
 
         # Components (initialized in _init_executor)
         self._http_server: ITSHttpServer | None = None
@@ -228,26 +183,23 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     # patched: 其它异常也不直接抛出，否则主进程会退出
                     # 目前写法，如果发生TimeoutError也会导致抛出异常导致程序退出
                     # 但目前开发自验过程没有出现类似问题，故目前暂不处理
-                    logger.warning(f"[executor-collective_rpc] when calling method={method}, capture error but not raise. error={exp}")
+                    logger.warning(
+                        f"[executor-collective_rpc] when calling method={method}, capture error but not raise. error={exp}")
                     status = WorkerProc.ResponseStatus.FAILURE
-
                 if status != WorkerProc.ResponseStatus.SUCCESS:
                     # patched: 不直接抛RuntimeError，否则主进程会退出
                     logger.warning("[executor-collective_rpc] request fail, return with None in collective_rpc()")
-                    responses.append(None) # 发生故障时暂时返回None，交由上层处理故障
+                    responses.append(None)  # 发生故障时暂时返回None，交由上层处理故障
                 else:
                     responses.append(result)
             return responses[0] if output_rank is not None else responses
 
-        # v0.23 FutureWrapper semantics: __init__ takes (futures_queue,
-        # get_response, aggregate), appends itself to the queue and drains
-        # earlier futures inside result().  The v0.18 (future, get_response)
-        # tuple queue no longer exists.
         future = FutureWrapper(
             self.futures_queue,
             get_response=get_response,
             aggregate=aggregate,
         )
+
         return future if non_block else future.result()
 
 
@@ -270,13 +222,10 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         )
         self._strategy_sync_thread.start()
 
-        # NOTE: AscendMultiprocExecutor._init_executor() already called
-        # self.start_worker_monitor() through dynamic dispatch (the ITS
-        # override).  Do NOT start a second ITSHealthMonitor thread here:
-        # two monitors on the same worker list would both react to worker
-        # death during restarts, and _cleanup_message_queues_and_workers
-        # only stops the one stored in self._health_monitor.
-
+        # Override health monitor with ITS-specific implementation
+        if self.monitor_workers:
+            self.start_worker_monitor()
+        
         if is_mm_scene():
             # MM场景所有挂载卡visible
             _, mounted_npu_id_list = self.get_davinci_devices()
@@ -312,7 +261,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         self._http_server = ITSHttpServer(
             port=self._http_port,
             strategy_sync_thread=self._strategy_sync_thread,
-            expected_executor_id=str(self.parallel_config.data_parallel_rank),
         )
         self._http_server.start()
         logger.info(f"Waiting for deployment strategy via HTTP POST to port {self._http_port}")
@@ -390,21 +338,11 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                          f"enable_expert_parallel={engine_parallel_config.enable_expert_parallel}")
 
             # 2. 获取 PD 角色
-            # DecisionMakingCenter 的 StrategyOptimizer 只把
-            # EXECUTOR_PD_ROLE_MAP == "P_ROLE" 的 executor 纳入 P-Engine 寻优，
-            # 而 vLLM kv_transfer_config 里的值是 kv_producer/kv_consumer。
-            # 这里转换为决策中心约定的 P_ROLE/D_ROLE，避免上报后寻优把
-            # prefill executor 全部过滤掉。
-            engine_pd_role = ""
+            # 从 kv_transfer_config.kv_role 获取，默认为 None
+            engine_pd_role = None
             kv_transfer_config = getattr(self.vllm_config, "kv_transfer_config", None)
             if kv_transfer_config and hasattr(kv_transfer_config, "kv_role"):
-                kv_role = kv_transfer_config.kv_role
-                if kv_role == "kv_producer":
-                    engine_pd_role = "P_ROLE"
-                elif kv_role == "kv_consumer":
-                    engine_pd_role = "D_ROLE"
-                else:
-                    engine_pd_role = kv_role
+                engine_pd_role = kv_transfer_config.kv_role
             logger.debug(f"Instance PD role: {engine_pd_role}")
 
             # 3. 构建执行器地址
@@ -475,30 +413,14 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             logger.info(f"##########vllm_config: {self.vllm_config}")
 
             logger.info("Reporting init state to decision center...")
-            assigned_executor_id = (
-                self._decision_center_client.report_init_state_with_executor_id(
-                    self.init_executor_state_request
-                )
-            )
+            success = self._decision_center_client.report_init_state(self.init_executor_state_request)
 
-            if assigned_executor_id:
-                self._decision_center_executor_id = assigned_executor_id
-                if self._http_server is not None:
-                    self._http_server.add_expected_executor_id(
-                        assigned_executor_id
-                    )
+            if success:
                 logger.info(
-                    "Successfully reported init state to decision center: "
-                    "assigned executor_id=%s; payload=%s",
-                    assigned_executor_id,
-                    asdict(self.init_executor_state_request),
-                )
+                    f"Successfully reported init state to decision center: {asdict(self.init_executor_state_request)}")
             else:
                 logger.warning(
-                    "Failed to report init state to decision center (no "
-                    "executor_id returned): %s",
-                    asdict(self.init_executor_state_request),
-                )
+                    f"Failed to report init state to decision center: {asdict(self.init_executor_state_request)}")
 
         except Exception as e:
             logger.error(f"Error reporting init state: {e}", exc_info=True)
@@ -810,374 +732,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             logger.error(f"Error restarting workers: {e}")
             return False
 
-    def _destroy_stateless_dp_group(self, dp_group) -> None:
-        """Best-effort destroy of a stateless gloo DP group."""
-        if dp_group is None:
-            return
-        try:
-            stateless_destroy_torch_distributed_process_group(dp_group)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to destroy stateless DP group: %s", exc
-            )
-
-    def _next_barrier_master_port(self) -> int:
-        """Advance the barrier-port generation and return the port to use.
-
-        All DP executors (including scale-to-zero executors that skip the
-        barrier) must call this exactly once per full-restart generation so
-        that a later RECOVER strategy picks the same port on every executor.
-        """
-        port = self._its_barrier_port_pool.next_port()
-        logger.info(
-            "Full-restart barrier: using reserved barrier master port %d.",
-            port,
-        )
-        return port
-
-    def _build_surviving_dp_group(
-        self,
-        surviving_dp_size: int,
-        surviving_dp_rank: int,
-        barrier_master_port: int,
-    ):
-        """Create a stateless gloo group over the surviving DP executors.
-
-        The barrier port is taken from a pool reserved before the first
-        worker was spawned.  The pre-restart ``parallel_config`` is not
-        mutated, so it is still available to
-        ``_try_backup_origin_parallel_config_when_degrade`` for a later
-        RECOVER strategy.
-
-        ``stateless_init_dp_group()`` pops a port from the shared DP port
-        list itself, but that list is stale in the EngineCore process:
-        workers pop ports on their private ``VllmConfig`` copies, so the
-        parent's next entry is the port still bound by the live worker
-        distributed group.  On top of that only rank 0 sees EADDRINUSE and
-        retries, while ranks > 0 stay on the old port.  Using an explicit
-        reserved port with a pre-bound listen socket avoids both problems.
-        """
-        host = self.parallel_config.data_parallel_master_ip
-        listen_socket: socket.socket | None = None
-        if int(surviving_dp_rank) == 0:
-            listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                listen_socket.bind((host, int(barrier_master_port)))
-                listen_socket.listen()
-            except Exception:
-                listen_socket.close()
-                raise
-        logger.info(
-            "Full-restart barrier: building target dp_group "
-            "world_size=%d rank=%d port=%d.",
-            surviving_dp_size,
-            surviving_dp_rank,
-            barrier_master_port,
-        )
-        return stateless_init_torch_distributed_process_group(
-            host,
-            int(barrier_master_port),
-            int(surviving_dp_rank),
-            int(surviving_dp_size),
-            backend="gloo",
-            return_store=True,
-            listen_socket=listen_socket,
-        )
-
-    def _mark_scale_to_zero_dp_excluded(self) -> None:
-        """Stop the idle (scale-to-zero) EngineCore from using the old dp_group.
-
-        Once the surviving executors have replaced the pre-restart dp_group
-        with a renumbered group, the old group has no peers left for this
-        executor. Returning from ``_has_global_unfinished_reqs`` without an
-        all_reduce prevents the idle loop from blocking on a 10s timeout at
-        every DP sync.
-        """
-        engine_core = getattr(self, "_engine_core_ref", None)
-        if engine_core is None:
-            return
-        setattr(engine_core, "_its_dp_sync_excluded", True)
-        logger.info(
-            "Executor marked as scale-to-zero; EngineCore will skip the "
-            "cross-executor DP state sync."
-        )
-
-    def _adopt_surviving_dp_group(
-        self,
-        engine_core,
-        barrier_group,
-        barrier_store,
-        surviving_dp_size: int,
-        surviving_dp_rank: int,
-    ) -> None:
-        """Swap the EngineCore dp_group to the surviving-rank group.
-
-        The barrier guarantees that every surviving executor has left the old
-        dp_group collectives, so the old 16-rank group can be destroyed
-        locally without waiting for the faulty executor. Future
-        ``sync_dp_state`` calls then run on the new 15-rank group and no
-        longer depend on the scale-to-zero executor at all.
-        """
-        old_group = getattr(engine_core, "dp_group", None)
-        old_size = None
-        if old_group is not None and old_group is not barrier_group:
-            try:
-                old_size = int(old_group.size())
-            except Exception:  # noqa: BLE001
-                old_size = "?"
-        engine_core.dp_group = barrier_group
-        engine_core.dp_store = barrier_store
-        engine_core.dp_size = int(surviving_dp_size)
-        engine_core.dp_rank = int(surviving_dp_rank)
-        setattr(engine_core, "_its_dp_sync_excluded", False)
-        if old_group is not None and old_group is not barrier_group:
-            self._destroy_stateless_dp_group(old_group)
-            logger.info(
-                "Adopted surviving dp_group world_size=%d rank=%d and "
-                "destroyed the pre-restart dp_group (old world_size=%s).",
-                surviving_dp_size,
-                surviving_dp_rank,
-                old_size,
-            )
-
-    def _barrier_for_full_restart(
-        self, timeout_seconds: int = VLLM_ITS_STRATEGY_TIMEOUT
-    ) -> None:
-        """Barrier across DP executor processes before a full restart.
-
-        DP4TP4 -> DP4TP(3,4,4,4) changes the global worker world from 16 to
-        15 ranks and rebuilds every MoE/HCCL communication group.  If one
-        executor killed its workers while the others were still serving from
-        the old 16-rank world, the old collectives on the healthy executors
-        can fail in an uncontrolled way and the new 15-rank
-        ``init_process_group`` can hang forever waiting for ranks that never
-        join.
-
-        For a decode DP16TP1 -> DP15TP1 restart, the executor whose only NPU
-        failed can be stuck in a long NPU task timeout.  Instead of waiting
-        for it to reach the rendezvous, the surviving executors build a new
-        stateless gloo group with the renumbered topology (world_size=15,
-        ranks 0..14) and barrier among themselves. The scale-to-zero
-        executor skips the barrier and cleans up independently; the new group
-        then replaces ``engine_core.dp_group`` so post-restart DP state sync
-        no longer depends on the faulty executor either.
-        """
-        strategy = getattr(self, "current_strategy", None)
-        surviving_dp_size = None
-        surviving_dp_rank = None
-        scale_to_zero_ranks: set[int] = set()
-        if strategy is not None:
-            try:
-                strategy_dict = self._convert_enums_to_values(
-                    asdict(strategy)
-                )
-                (
-                    surviving_dp_size,
-                    surviving_dp_rank,
-                    scale_to_zero_ranks,
-                ) = get_surviving_dp_barrier_geometry(strategy_dict)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "Failed to compute surviving-DP barrier geometry for "
-                    "full restart: %s",
-                    exc,
-                )
-                raise
-
-            if surviving_dp_size == 0:
-                # Advance the barrier port generation even though this
-                # executor does not join the rendezvous.  Healthy executors
-                # advance once when they build the survivor group; if this
-                # executor skipped that advance, a later RECOVER would pick
-                # a different barrier port and deadlock.
-                self._next_barrier_master_port()
-                logger.info(
-                    "Full-restart barrier skipped: executor_id=%s is "
-                    "scale-to-zero and cleans up independently.",
-                    strategy.executor_id,
-                )
-                self._mark_scale_to_zero_dp_excluded()
-                return
-
-        engine_core = getattr(self, "_engine_core_ref", None)
-        barrier_group = (
-            getattr(engine_core, "dp_group", None) if engine_core else None
-        )
-        barrier_store = (
-            getattr(engine_core, "dp_store", None) if engine_core else None
-        )
-        temporary_group = False
-
-        # The engine-core dp_group must cover exactly the target topology.
-        # - DP16 -> DP15: the old group still contains the faulty executor.
-        # - DP15 -> DP16 (RECOVER): healthy executors only have a 15-rank
-        #   group, while the previously scale-to-zero executor has a stale
-        #   16-rank group (and is marked _its_dp_sync_excluded). A new group
-        #   including all 16 target ranks must be created before any executor
-        #   kills its workers.
-        # - Heterogeneous TP recovery (DP4TP(3,4,4,4) -> DP4TP4) keeps the
-        #   same four engine-core processes, so the existing 4-rank group is
-        #   reused.
-        current_dp_size = getattr(
-            self.parallel_config, "data_parallel_size", None
-        )
-        old_dp_group_size = None
-        if barrier_group is not None:
-            try:
-                old_dp_group_size = int(barrier_group.size())
-            except Exception:  # noqa: BLE001
-                old_dp_group_size = None
-        dp_sync_excluded = bool(
-            getattr(engine_core, "_its_dp_sync_excluded", False)
-            if engine_core is not None else False
-        )
-        needs_target_dp_group = bool(scale_to_zero_ranks)
-        if surviving_dp_size is not None and (
-            dp_sync_excluded
-            or int(current_dp_size or 0) != int(surviving_dp_size)
-            or (
-                old_dp_group_size is not None
-                and int(old_dp_group_size) != int(surviving_dp_size)
-            )
-        ):
-            needs_target_dp_group = True
-
-        if needs_target_dp_group:
-            if scale_to_zero_ranks:
-                logger.info(
-                    "Full-restart barrier: excluding scale-to-zero executor "
-                    "ranks %s.",
-                    sorted(scale_to_zero_ranks),
-                )
-            else:
-                logger.info(
-                    "Full-restart barrier: current dp_group topology "
-                    "(current_dp=%s, group_size=%s) differs from target "
-                    "dp=%s, rebuilding.",
-                    current_dp_size,
-                    old_dp_group_size,
-                    surviving_dp_size,
-                )
-            # This must happen before `_get_engine_parallel_config` mutates
-            # parallel_config.  The reserved port rotates once per barrier
-            # generation, so the previous barrier's still-live dp_group never
-            # occupies the port selected here.
-            barrier_master_port = self._next_barrier_master_port()
-            barrier_group, barrier_store = self._build_surviving_dp_group(
-                surviving_dp_size,
-                surviving_dp_rank,
-                barrier_master_port,
-            )
-            temporary_group = True
-
-        if barrier_group is None:
-            logger.info(
-                "Full-restart barrier skipped: no cross-executor DP group."
-            )
-            return
-
-        def _discard_temporary_group() -> None:
-            if temporary_group and barrier_group is not None:
-                self._destroy_stateless_dp_group(barrier_group)
-
-        try:
-            world_size = int(barrier_group.size())
-            rank_in_dp = int(barrier_group.rank())
-        except Exception as exc:  # defensive: non-torch/stateless group
-            logger.warning(
-                "Full-restart barrier skipped: cannot query barrier group "
-                "size/rank: %s",
-                exc,
-            )
-            _discard_temporary_group()
-            return
-
-        if world_size < 2:
-            # A single surviving executor has no rendezvous to wait for, but
-            # its EngineCore dp_group still has to be replaced so the idle
-            # scale-to-zero executors are no longer referenced.
-            if temporary_group and engine_core is not None:
-                self._adopt_surviving_dp_group(
-                    engine_core,
-                    barrier_group,
-                    barrier_store,
-                    surviving_dp_size,
-                    surviving_dp_rank,
-                )
-            else:
-                _discard_temporary_group()
-            logger.info(
-                "Full-restart barrier skipped: cross-executor DP group "
-                "world_size=%d.",
-                world_size,
-            )
-            return
-
-        logger.info(
-            "Full-restart barrier: waiting for %d/%d DP executors to receive "
-            "the strategy before worker cleanup.",
-            rank_in_dp + 1,
-            world_size,
-        )
-        # Use the exact same collective shape/op as
-        # ParallelConfig.sync_dp_state (two int32 SUM). On the old group this
-        # makes the barrier interchangeable with peers still inside
-        # `_has_global_unfinished_reqs`; on the temporary survivor group it
-        # is a plain deterministic rendezvous.
-        tensor = torch.tensor([0, 0], dtype=torch.int32)
-        work = torch.distributed.all_reduce(
-            tensor,
-            op=torch.distributed.ReduceOp.SUM,
-            group=barrier_group,
-            async_op=True,
-        )
-        completed = False
-        try:
-            completed = bool(
-                work.wait(timeout=timedelta(seconds=timeout_seconds))
-            )
-        except Exception as exc:  # defensive: older torch raises on timeout
-            logger.warning(
-                "Full-restart barrier wait raised: %s", exc
-            )
-        if not completed:
-            try:
-                work.abort()
-            except Exception as abort_exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to abort timed-out barrier all_reduce: %s",
-                    abort_exc,
-                )
-            _discard_temporary_group()
-            raise RuntimeError(
-                "Heterogeneous full restart barrier timed out after "
-                f"{timeout_seconds}s waiting for all {world_size} DP "
-                "executors. The decision center must push the same "
-                "engine_parallel_config to EVERY surviving DP executor "
-                "(topology changes rebuild MoE weights and global "
-                "communication groups, so restarting only the faulty DP is "
-                "invalid)."
-            )
-
-        # Every surviving executor has now left the old dp_group. Adopt the
-        # temporary survivor group as the new EngineCore dp_group and retire
-        # the old one, so neither the restart nor post-restart DP sync needs
-        # the scale-to-zero executor.
-        if temporary_group and engine_core is not None:
-            self._adopt_surviving_dp_group(
-                engine_core,
-                barrier_group,
-                barrier_store,
-                surviving_dp_size,
-                surviving_dp_rank,
-            )
-        logger.info(
-            "Full-restart barrier passed: all %d DP executors will now "
-            "restart their workers together.",
-            world_size,
-        )
-
     def _cleanup_and_restart_workers(self) -> None:
         """Restart all workers with current VllmConfig.
 
@@ -1187,23 +741,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         logger.info("Restarting all workers with current VllmConfig")
 
         try:
-            # Heterogeneous TP (e.g. DP4TP4 -> DP4TP(3,4,4,4)) rebuilds the
-            # global worker world and all MoE communication groups.  Before
-            # killing any worker, rendezvous with the other DP executors:
-            # restarting only the faulty DP would leave the healthy DPs in the
-            # old 16-rank world and the new 15-rank init_process_group would
-            # wait forever.
-            if (
-                self.current_strategy is not None
-                and not getattr(self, "shutting_down", False)
-                and self._strategy_requires_full_restart(self.current_strategy)
-            ):
-                self._barrier_for_full_restart()
-                logger.info(
-                    "Heterogeneous TP restart: restarting workers of EVERY "
-                    "DP instance."
-                )
-
             # Step 1: Clean up all requests in scheduler before worker restart
             self._cleanup_scheduler_requests()
 
@@ -1287,21 +824,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             available_memory = self.determine_available_memory()
             logger.info(f"Determined available_memory: {available_memory}")
 
-            # collective_rpc is fault-tolerant and returns None for failed
-            # workers (typically profile_run raised on the worker side).
-            # Passing None into get_kv_cache_configs produces a misleading
-            # ``NoneType <= int`` TypeError deep inside kv_cache_utils, so
-            # fail here with the worker logs as the actionable error source.
-            if available_memory is None or (
-                isinstance(available_memory, (list, tuple))
-                and any(memory is None for memory in available_memory)
-            ):
-                raise RuntimeError(
-                    "determine_available_memory returned "
-                    f"{available_memory!r}; one or more workers failed "
-                    "profile_run. Check the worker tracebacks above."
-                )
-
             # Step 3: Get KV cache configs
             kv_cache_configs = get_kv_cache_configs(
                 self.vllm_config,
@@ -1320,14 +842,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 )
             self.vllm_config.validate_block_size()
 
-            # Step 4.5: Rebuild the scheduler-side KVCacheManager from the
-            # fresh config.  The scheduler was created before the restart and
-            # still holds the old block pool / prefix-cache mappings; reusing
-            # it after a worker restart can allocate stale block ids whose
-            # contents belong to earlier requests ("coherent but unrelated"
-            # completions).
-            self._rebuild_scheduler_kv_cache_manager(scheduler_kv_cache_config)
-
             # Step 5: Initialize workers with KV cache config
             self.initialize_from_config(kv_cache_configs)
             logger.info("KV cache re-initialized successfully")
@@ -1335,72 +849,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         except Exception as e:
             logger.error(f"Failed to re-initialize KV cache: {e}")
             raise Exception(f"KV cache re-initialization failed: {e}")
-
-    def _rebuild_scheduler_kv_cache_manager(self, kv_cache_config) -> None:
-        """Replace the scheduler KVCacheManager after a worker restart.
-
-        The scheduler process survives a worker restart, so its
-        ``kv_cache_manager`` still references the pre-restart block pool.
-        Rebuild it from the freshly profiled ``KVCacheConfig`` and rebind the
-        scheduler-side KV connector to the new block pool.  Without this step,
-        a request scheduled after restart can receive block ids whose memory
-        was last written by a different request.
-        """
-        engine_core = getattr(self, "_engine_core_ref", None)
-        scheduler = getattr(engine_core, "scheduler", None)
-        if scheduler is None:
-            logger.warning(
-                "Scheduler KVCacheManager not rebuilt: engine_core scheduler "
-                "is unavailable."
-            )
-            return
-
-        from vllm.v1.core.kv_cache_manager import KVCacheManager
-
-        old_manager = getattr(scheduler, "kv_cache_manager", None)
-        hash_block_size = getattr(scheduler, "block_size", None)
-        new_manager = KVCacheManager(
-            kv_cache_config=kv_cache_config,
-            max_model_len=scheduler.max_model_len,
-            scheduler_block_size=scheduler.block_size,
-            hash_block_size=hash_block_size or scheduler.block_size,
-            max_num_batched_tokens=(
-                scheduler.scheduler_config.max_num_batched_tokens
-            ),
-            enable_caching=scheduler.cache_config.enable_prefix_caching,
-            use_eagle=scheduler.use_eagle,
-            log_stats=scheduler.log_stats,
-            enable_kv_cache_events=scheduler.enable_kv_cache_events,
-            dcp_world_size=scheduler.dcp_world_size,
-            pcp_world_size=scheduler.pcp_world_size,
-            metrics_collector=scheduler.kv_metrics_collector,
-        )
-        scheduler.kv_cache_config = kv_cache_config
-        scheduler.kv_cache_manager = new_manager
-        scheduler.has_mamba_layers = bool(
-            getattr(kv_cache_config, "has_mamba_layers", False)
-        )
-        scheduler.needs_kv_cache_zeroing = bool(
-            getattr(kv_cache_config, "needs_kv_cache_zeroing", False)
-        )
-
-        connector = getattr(scheduler, "connector", None)
-        if connector is not None:
-            try:
-                connector.bind_gpu_block_pool(new_manager.block_pool)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Failed to rebind scheduler KV connector block pool: %s",
-                    exc,
-                )
-
-        logger.info(
-            "Scheduler KVCacheManager rebuilt: num_blocks=%s groups=%s "
-            "(old manager was %s)",
-            getattr(kv_cache_config, "num_blocks", None),
-            len(getattr(kv_cache_config, "kv_cache_groups", []) or []),
-            type(old_manager).__name__ if old_manager is not None else None,
-        )
 
     def update_kv_connector_metadata(self, engine_core) -> None:
         """Update KV connector handshake metadata after worker restart.
@@ -1432,16 +880,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             for worker_dict in xfer_handshake_metadata:
                 if worker_dict is not None:
                     content.update(worker_dict)
-
-            # 重启后旧 worker 的端口/engine_id 全部失效，先清掉 scheduler
-            # connector 里缓存的旧条目，避免脏 mapping 残留。
-            connector_scheduler = getattr(
-                kv_connector, "connector_scheduler", None
-            )
-            if connector_scheduler is not None and hasattr(
-                connector_scheduler, "multi_nodes_meta_mapping"
-            ):
-                connector_scheduler.multi_nodes_meta_mapping.clear()
 
             # Set metadata to KV connector
             kv_connector.set_xfer_handshake_metadata(content)
@@ -1614,16 +1052,14 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     cur_healthy_npu_ids = set([str(i) for i in self.init_executor_state_request.npu_id])
 
                     # 从物理npu-id映射到从0开始的连续逻辑id
-                    sorted_mounted_npu_id_list_str = sorted(
-                        mounted_npu_id_list_str, key=int
-                    )
+                    sorted_mounted_npu_id_list_str = sorted(list(mounted_npu_id_list_str))
                     new_npu_id_list = []
                     for npu_id in cur_healthy_npu_ids:
                         new_npu_id_list.append(str(sorted_mounted_npu_id_list_str.index(npu_id)))
                 else:
                     # 独立部署：--privilege + RT_VISIBLE
                     new_npu_id_list = [str(i) for i in self.init_executor_state_request.npu_id]
-                healthy_npu_str = ",".join(sorted(new_npu_id_list, key=int))
+                healthy_npu_str = ",".join(sorted(new_npu_id_list))
                 logger.info(f"Setting ASCEND_RT_VISIBLE_DEVICES to healthy NPUs: {healthy_npu_str}")
                 os.environ["ASCEND_RT_VISIBLE_DEVICES"] = healthy_npu_str
             else:
@@ -1647,15 +1083,11 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     cur_healthy_npu_ids = set([str(i) for i in self.init_executor_state_request.npu_id]) & set(visible_health_npu_ids)
 
                     # 从物理npu-id映射到从0开始的连续逻辑id
-                    sorted_mounted_npu_id_list_str = sorted(
-                        mounted_npu_id_list_str, key=int
-                    )
+                    sorted_mounted_npu_id_list_str = sorted(list(mounted_npu_id_list_str))
                     new_npu_id_list = []
                     for npu_id in cur_healthy_npu_ids:
                         new_npu_id_list.append(str(sorted_mounted_npu_id_list_str.index(npu_id)))
-                    healthy_npu_str = ",".join(
-                        sorted(new_npu_id_list, key=int)
-                    )
+                    healthy_npu_str = ",".join(sorted(new_npu_id_list))
                     logger.info(f"Setting ASCEND_RT_VISIBLE_DEVICES to healthy NPUs: {healthy_npu_str}")
                     logger.debug(f"self.init_executor_state_request.npu_id={self.init_executor_state_request.npu_id}, {type(self.init_executor_state_request.npu_id[0])},healthy_npu_list={healthy_npu_list}, cur_healthy_npu_ids: {cur_healthy_npu_ids}, visible_health_npu_ids={visible_health_npu_ids}, sorted_mounted_npu_id_list_str={sorted_mounted_npu_id_list_str}, mounted_health_npu_ids={mounted_health_npu_ids}, ")
                     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = healthy_npu_str
@@ -1667,23 +1099,16 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                         for npu_id in npu_id_list:
                             if npu_id in healthy_npu_list:
                                 new_npu_id_list.append(npu_id)
-                        healthy_npu_str = ",".join(
-                            sorted(new_npu_id_list, key=int)
-                        )
+                        healthy_npu_str = ",".join(sorted(new_npu_id_list))
                         logger.info(f"Setting ASCEND_RT_VISIBLE_DEVICES to healthy NPUs: {healthy_npu_str}")
                         os.environ["ASCEND_RT_VISIBLE_DEVICES"] = healthy_npu_str
 
             self._get_engine_parallel_config(self.current_strategy)
-        # WorkerProc.rank/local_rank 仍是节点内（DP 内）的本地 rank，全局
-        # torch.distributed rank 偏移由 v0.23 hetero
-        # init_distributed_environment 按 get_rank_offset_for_dp 计算
-        # （DP4TP(3,4,4,4) 时 0/3/7/11）。不要把全局偏移传给
-        # WorkerProc，否则 _is_driver_worker(rank % local_tp_size == 0)
-        # 会在 DP1..3 失效。
-        global_start_rank = (
-            self.parallel_config.local_world_size
-            * self.parallel_config.node_rank_within_dp
-        )
+        # global_start_rank 和 node_rank_within_dp 使用节点级别的 rank，不是 active_count
+        # 这样可以确保每个 executor 的 rank 是基于其物理位置的全局 rank
+        # 注意：必须使用更新后的 parallel_config.local_world_size，不能用 self.local_world_size
+        # 因为 _get_engine_parallel_config 可能已更改了 world_size 等参数
+        global_start_rank = self.parallel_config.local_world_size * self.parallel_config.node_rank_within_dp
         # 从 parallel_config 获取并行配置（已在 _get_engine_parallel_config 中更新）
         new_tp = self.parallel_config.tensor_parallel_size
         new_dp = self.parallel_config.data_parallel_size
@@ -1706,7 +1131,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             self.world_size = 0
             self.local_world_size = 0
             self.response_mqs = []
-            self.futures_queue = deque[FutureWrapper]()
+            self.futures_queue = deque[tuple[FutureWrapper, Callable]]()
             # 停止健康监控，避免检测到 worker 死亡后重复触发
             # stop() 设置 _running=False 和 _failure_handled=True
             # update_workers([]) 清空 workers 列表
@@ -1717,11 +1142,11 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 self._health_monitor._failure_handled = True  # 再次设置确保阻止 callback
             logger.info("Executor idle mode: no workers running, waiting for recovery strategy")
             return
-        # Check if this is the leader node of the DP group.
-        # 与 vllm 0.23 / vllm-ascend 一致使用 node_rank_within_dp：
-        # 多节点 DP 时每个 DP 组都需要一个 leader 创建 rpc_broadcast_mq，
-        # 只有全局 node_rank==0 建队列会让其它节点 worker 收不到调度。
-        is_leader = self.parallel_config.node_rank_within_dp == 0
+        # Check if this is the leader node
+        # 注意：node_rank_within_dp 在单机多实例场景下对所有实例都是 0
+        # 因为 nnodes_within_dp = 1（nnodes=1 时硬编码为 1）
+        # 所以需要使用 node_rank 来区分实例，node_rank=0 为 leader
+        is_leader = self.parallel_config.node_rank == 0
         logger.info(f"Starting workers: world_size={world_size}, local_world_size={local_world_size}, "
                     f"global_start_rank={global_start_rank}, tp={new_tp}, dp={new_dp}，is_leader：{is_leader}")
         # Create MessageQueue for leader node
@@ -1798,7 +1223,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             response_mq.wait_until_ready()
 
         # Reset futures queue
-        self.futures_queue = deque[FutureWrapper]()
+        self.futures_queue = deque[tuple[FutureWrapper, Callable]]()
         logger.info("Message queues setup complete")
 
     def _update_vllm_config_for_restart(self) -> None:
@@ -1821,43 +1246,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         strategy_dict = asdict(self.current_strategy)
         # Convert enum values to strings
         strategy_dict = self._convert_enums_to_values(strategy_dict)
-
-        # 注入异构重启所需的完整拓扑信息。所有 DP executor 都使用同一份
-        # heterogeneous_dp_config，worker 启动时据此建立 15-rank 的
-        # torch.distributed 世界和各 DP 的 TP/DP/EP 通信组。
-        engine_parallel_config_list = strategy_dict.get(
-            "engine_parallel_config", []
-        )
-        if engine_parallel_config_list and is_heterogeneous_restart(
-            strategy_dict
-        ):
-            heterogeneous_dp_config = get_heterogeneous_dp_config(strategy_dict)
-            strategy_dict["heterogeneous_dp_config"] = heterogeneous_dp_config
-            strategy_dict["global_world_size"] = sum(
-                cfg["tp_size"] for cfg in heterogeneous_dp_config
-            )
-            strategy_dict["global_start_rank"] = get_global_start_rank(
-                strategy_dict
-            )
-            # 保留 vllm_plugins 原生配置名，worker/model patch 直接读取。
-            current_config = next(
-                (
-                    cfg
-                    for cfg in engine_parallel_config_list
-                    if str(cfg.get("executor_id", None))
-                    == str(strategy_dict.get("executor_id", "0"))
-                ),
-                None,
-            )
-            if current_config is not None:
-                shardings = current_config.get("tp_asymmetric_shardings")
-                if shardings is None and (
-                    current_config.get("new_tp") is not None
-                    and current_config.get("new_tp") != current_config.get("tp")
-                ):
-                    shardings = get_tp_asymmetric_shardings(strategy_dict)
-                strategy_dict["tp_asymmetric_shardings"] = shardings
-
         self.vllm_config.additional_config["zero_interrupt_config"] = strategy_dict
         logger.info(f"Updated VllmConfig.additional_config with strategy: {self.current_strategy.deploy_type.value}")
 
@@ -1923,27 +1311,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
         try:
             self.executor_state = ExecutorState.RECOVERING
-
-            # 决策中心可能重放同一份 RECOVER（strategy_sync 会转发重复策略）。
-            # DP>1 且当前拓扑已经等于目标拓扑时不需要重启：各 executor 的
-            # dp_group / worker world 都是目标布局，重复全量重启反而会在没有
-            # barrier 保护的情况下异步杀 worker。DP=1 没有跨 executor 通信域，
-            # 保留原来的无条件重启语义。
-            if self.parallel_config.data_parallel_size > 1 and (
-                not self._strategy_requires_full_restart(strategy)
-            ):
-                logger.info(
-                    "RECOVER strategy matches current topology "
-                    "(dp=%s, tp=%s); skipping redundant worker restart.",
-                    self.parallel_config.data_parallel_size,
-                    self.parallel_config.tensor_parallel_size,
-                )
-                self.executor_state = ExecutorState.RUNNING
-                self._report_deploy_status(
-                    strategy, DeployState.EXECUTOR_DEPLOY_SUCCESS
-                )
-                return True
-
             self._cleanup_and_restart_workers()
 
             # dp=0 场景：空转状态
@@ -1977,47 +1344,20 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         logger.info("Executing PD_REBUILD strategy")
 
         try:
-            # DeepSeek-V4 DP4TP4 -> DP4TP(3,4,4,4) 属于异构 TP 切换：
-            # MoE 权重、EP 通信组和全局 rank 布局全部发生变化，因此
-            # **所有 DP**（包括没有故障卡的 DP）都必须重启 worker，
-            # 不能只重启故障卡所在的 DP。
-            if self._strategy_requires_full_restart(strategy):
+            # 判断是否是故障实例
+            is_fault_instance = self._is_fault_instance_for_pd(strategy)
+
+            if is_fault_instance:
+                # 获取当前实例的新 TP/DP 配置
                 current_config = self._get_current_engine_config(strategy)
-                new_tp = (
-                    current_config.new_tp
-                    if current_config.new_tp is not None
-                    else current_config.tp
-                )
-                new_dp = (
-                    current_config.new_dp
-                    if current_config.new_dp is not None
-                    else current_config.dp
-                )
-                logger.info(
-                    "Heterogeneous TP PD_REBUILD: restarting workers of EVERY "
-                    "DP instance with new config: TP=%s, DP=%s, shardings=%s",
-                    new_tp, new_dp,
-                    getattr(current_config, "tp_asymmetric_shardings", None),
-                )
-                # _init_workers 会从 strategy 中提取并应用完整异构配置。
-                self._cleanup_and_restart_workers()
-            elif self._is_fault_instance_for_pd(strategy):
-                # 兼容原有非异构故障恢复：只有故障实例重启。
-                current_config = self._get_current_engine_config(strategy)
-                new_tp = (
-                    current_config.new_tp
-                    if current_config.new_tp is not None
-                    else current_config.tp
-                )
-                new_dp = (
-                    current_config.new_dp
-                    if current_config.new_dp is not None
-                    else current_config.dp
-                )
+                new_tp = current_config.new_tp if current_config.new_tp else current_config.tp
+                new_dp = current_config.new_dp if current_config.new_dp else current_config.dp
                 logger.info(
                     f"This instance is fault (has unhealthy NPUs), "
                     f"restarting workers with new config: TP={new_tp}, DP={new_dp}"
                 )
+                # 故障实例：使用 new_tp/new_dp 重启 Workers
+                # 注意：new_tp/new_dp 会通过 _init_workers 从 strategy 中提取并应用
                 self._cleanup_and_restart_workers()
             else:
                 logger.info("This instance is healthy, updating KVConnector via RPC")
@@ -2050,7 +1390,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         """
         executor_id = strategy.executor_id
         for config in strategy.engine_parallel_config:
-            if str(config.executor_id) == str(executor_id):
+            if config.executor_id == executor_id:
                 return config
 
         # 如果找不到匹配的 config，返回默认配置
@@ -2091,96 +1431,6 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                                 return True  # 有不健康设备，是故障实例
         return False  # 全部健康，是健康实例
 
-    def _strategy_requires_full_restart(self, strategy: DeployStrategy) -> bool:
-        """判断策略是否需要所有 DP executor 重启 worker。
-
-        DeepSeek-V4 异构场景（DP4TP4 -> DP4TP(3,4,4,4)）改变了全局
-        world_size、MoE EP 通信组和非对称权重切分。vllm_plugins 的
-        ``tp_asymmetric_shardings`` / ``new_tp`` 一旦出现，所有 DP rank
-        都必须重建通信组，健康 DP 仅做 KV connector RPC 更新是不够的。
-
-        DEGRADE / PD_REBUILD / RECOVER 三种会改变拓扑的策略都必须把
-        完整的 engine_parallel_config 下发给每一个 DP executor。
-        """
-        if strategy.deploy_type == DeployType.RECOVER:
-            # 从异构/缩容拓扑恢复同样会重建 world_size 和通信组。只要当前
-            # 拓扑是异构的，或备份的对称 tp/dp 与当前不一致，或目标 dp 与
-            # 当前不一致，就必须让全部 DP 同时重启；否则会复现与 DEGRADE
-            # 相同的旧通信域问题。
-            # 纯 DP 恢复（DP15TP1 -> DP16TP1）时 tp 没有变化，旧逻辑只看
-            # tp 会误判为“无需全量重启”：健康 executor 先杀旧 worker，而
-            # 恢复中的 executor 还在等 16-rank barrier，新 worker 的
-            # init_process_group 会永久等待。
-            backup = getattr(self, "backup_parallel_config", {}) or {}
-            current_tp = self.parallel_config.tensor_parallel_size
-            current_dp = self.parallel_config.data_parallel_size
-            current_is_hetero = bool(
-                getattr(self.parallel_config, "is_heterogeneous_tp", False)
-            )
-            target_dp = max(
-                (
-                    conf.new_dp
-                    if conf.new_dp is not None
-                    else conf.dp
-                    for conf in strategy.engine_parallel_config
-                ),
-                default=current_dp,
-            )
-            requires_full_restart = recover_requires_full_restart(
-                backup=backup,
-                current_tp=current_tp,
-                current_dp=current_dp,
-                current_is_heterogeneous=current_is_hetero,
-                target_dp=target_dp,
-            )
-            if not requires_full_restart:
-                return False
-            # fall through to the coverage validation below.
-        elif strategy.deploy_type in (DeployType.DEGRADE, DeployType.PD_REBUILD):
-            requires_full_restart = False
-            for conf in strategy.engine_parallel_config:
-                new_tp = conf.new_tp
-                if new_tp is not None and new_tp != conf.tp:
-                    requires_full_restart = True
-                if conf.tp_asymmetric_shardings:
-                    requires_full_restart = True
-                if new_tp == 0 and conf.new_dp == 0:
-                    # 有 executor 被缩到零，通信拓扑也发生变化。
-                    requires_full_restart = True
-            if not requires_full_restart:
-                return False
-        else:
-            return False
-
-        # Fail closed instead of deadlocking: every active DP rank must be
-        # present in the strategy.  A missing rank would make the new global
-        # init_process_group wait for ranks that will never join.
-        expected_dp = max(
-            (
-                conf.new_dp
-                if conf.new_dp is not None
-                else conf.dp
-                for conf in strategy.engine_parallel_config
-            ),
-            default=0,
-        )
-        present = {
-            int(getattr(conf, "data_parallel_rank", -1))
-            for conf in strategy.engine_parallel_config
-            if getattr(conf, "data_parallel_rank", None) is not None
-            and int(getattr(conf, "data_parallel_rank", -1)) >= 0
-        }
-        missing = set(range(expected_dp)) - present
-        if missing:
-            raise ValueError(
-                "Heterogeneous full-restart strategy does not cover DP ranks "
-                f"{sorted(missing)}. The decision center must send the same "
-                "engine_parallel_config to every DP executor because the "
-                "global worker world size and MoE communication groups are "
-                "being rebuilt."
-            )
-        return True
-
     def _get_healthy_npu_ids_from_strategy(self, strategy: DeployStrategy) -> list[str] | None:
         """从策略中获取当前节点健康的 NPU ID 列表。
 
@@ -2217,23 +1467,13 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
     def _report_deploy_status(self, strategy: DeployStrategy, state: DeployState) -> None:
         """Report deployment status to decision center.
 
-        DecisionMakingCenter waits for ``report_deploy_status`` keyed by the
-        executor id it generated during ``/init_executor_state``
-        (``exe-<service>-<engine>-<n>``), not by the local numeric
-        data_parallel_rank. Prefer the registered id; fall back to the
-        strategy's top-level executor_id for manual trigger testing.
-
         Args:
             state: Deployment state
         """
         try:
             if self._decision_center_client:
-                executor_id = (
-                    self._decision_center_executor_id
-                    or str(strategy.executor_id)
-                )
                 self._decision_center_client.report_deploy_status(
-                    executor_id=executor_id,
+                    executor_id=str(strategy.executor_id),
                     deploy_state=state,
                     update_engine_info=strategy.update_engine_info
                 )
@@ -2266,13 +1506,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
         # Report stopped state
         self.executor_state = ExecutorState.STOPPED
-
-        # Only tear down workers/message queues here.  Calling
-        # _cleanup_and_restart_workers() would run _init_workers() and
-        # spawn a fresh set of workers during shutdown; the parent
-        # MultiprocExecutor.shutdown() skips worker termination once
-        # shutting_down=True, so those workers would leak.
-        self._cleanup_message_queues_and_workers()
+        self._cleanup_and_restart_workers()
 
         # Use current_strategy if available, otherwise create a dummy strategy for shutdown reporting
         if self.current_strategy:
@@ -2312,284 +1546,100 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
     def _get_engine_parallel_config(self, strategy: DeployStrategy):
         """从策略获取新的 TP/DP 配置。
 
-        除了更新当前 executor 的 TP/DP 外，还把完整的
-        ``heterogeneous_dp_config``（每个 DP rank 的 tp_size 与
-        tp_asymmetric_shardings）写入 parallel_config。这样：
-        - worker 可以据此建立 15-rank 的全局通信域；
-        - DeepSeek-V4 权重加载可以读取 [2,1,1] 这类非对称切分；
-        - DP4TP4 -> DP4TP(3,4,4,4) 时所有 DP 都会用同一份拓扑重启。
+        直接更新 parallel_config 中的 tensor_parallel_size 和 data_parallel_size，
+        world_size、local_world_size 由 vLLM 自动计算。
+
+        注意：global_start_rank 在调用处使用 node_rank_within_dp 计算，
+        不再在此方法中基于 active_count 计算。
+
+        Args:
+            node_rank_within_dp: Original node rank within DP
+            strategy: DEGRADE deployment strategy
         """
-        logger.info("Getting new TP/DP config from strategy")
+        logger.info(f"Getting new TP/DP config from strategy")
+        engine_parallel_config_list = strategy.engine_parallel_config
+        # 按 data_parallel_rank 从小到大排序，确保遍历顺序正确
         engine_parallel_config_list = sorted(
-            strategy.engine_parallel_config,
+            engine_parallel_config_list,
             key=lambda x: getattr(x, 'data_parallel_rank', 0) or 0
         )
 
         executor_id = strategy.executor_id
         logger.info(
-            "executor_id=%s, engine_parallel_config_list=%s",
-            executor_id, engine_parallel_config_list,
-        )
+            f"#############executor_id={executor_id}, engine_parallel_config_list:{engine_parallel_config_list} ")
         matched = False
         rm_data_parallel_rank = 0
 
-        # 构建完整异构拓扑（跳过 new_tp/new_dp 均为 0 的空转 executor）。
-        hetero_configs = []
-        for conf in engine_parallel_config_list:
-            new_tp = conf.new_tp if conf.new_tp is not None else conf.tp
-            new_dp = conf.new_dp if conf.new_dp is not None else conf.dp
-            if new_tp == 0 and new_dp == 0:
-                continue
-            ratios = conf.tp_asymmetric_shardings
-            if ratios is None and new_tp != conf.tp:
-                # 与 get_tp_asymmetric_shardings 的 legacy 逻辑保持一致。
-                tmp_strategy = {
-                    "executor_id": conf.executor_id,
-                    "engine_parallel_config": [asdict(conf)],
-                }
-                ratios = get_tp_asymmetric_shardings(tmp_strategy)
-            hetero_configs.append(
-                {
-                    "executor_id": str(conf.executor_id),
-                    "dp_rank": int(
-                        getattr(conf, "data_parallel_rank", 0) or 0
-                    ),
-                    "tp_size": int(new_tp),
-                    "tp_sharding_ratios": (
-                        [int(r) for r in ratios] if ratios else None
-                    ),
-                }
-            )
-        hetero_configs.sort(key=lambda c: c["dp_rank"])
-        # 跳过被缩到零的 executor 后重新连续编号，保证
-        # heterogeneous_dp_config 覆盖 0..N-1。
-        for new_rank, cfg in enumerate(hetero_configs):
-            cfg["dp_rank"] = new_rank
-
-        # 纯 DP 扩缩容（各 rank tp 不变且无显式非对称配比）继续走
-        # 原有对称流程，避免 legacy 多机/EPLB 场景被 hetero 校验拒绝。
-        hetero_restart = any(
-            (
-                c.new_tp is not None and c.new_tp != c.tp
-            ) or bool(c.tp_asymmetric_shardings)
-            for c in engine_parallel_config_list
-        )
-        hetero_configs_for_pc = hetero_configs if hetero_restart else None
-        own_dp_rank = (
-            next(
-                (
-                    cfg["dp_rank"]
-                    for cfg in hetero_configs
-                    if cfg["executor_id"] == str(executor_id)
-                ),
-                None,
-            )
-            if hetero_restart else None
-        )
-
         for idx, engine_parallel_config in enumerate(engine_parallel_config_list):
+            # 兼容 executor_id 类型不一致的情况（字符串 vs 整数）
             engine_executor_id = engine_parallel_config.executor_id
             logger.info(
-                "Checking executor_id match: strategy.executor_id=%s (%s) vs "
-                "config.executor_id=%s (%s), config: new_tp=%s, new_dp=%s, "
-                "tp=%s, dp=%s, tp_asymmetric_shardings=%s",
-                executor_id, type(executor_id).__name__,
-                engine_executor_id,
-                type(engine_executor_id).__name__
-                if engine_executor_id is not None else "None",
-                engine_parallel_config.new_tp,
-                engine_parallel_config.new_dp,
-                engine_parallel_config.tp,
-                engine_parallel_config.dp,
-                engine_parallel_config.tp_asymmetric_shardings,
-            )
-            if engine_executor_id is None or executor_id is None:
-                continue
-            if str(executor_id) != str(engine_executor_id):
-                continue
-
-            matched = True
-            if strategy.deploy_type == DeployType.RECOVER:
-                # 恢复策略的参数和备份的并行配置应一致。没有备份时（例如
-                # 实例启动后直接收到 RECOVER）退化为按当前配置恢复。
-                backup = getattr(self, "backup_parallel_config", {})
-                expected_tp = backup.get(
-                    "tensor_parallel_size",
-                    self.parallel_config.tensor_parallel_size,
-                )
-                expected_dp = backup.get(
-                    "data_parallel_size",
-                    self.parallel_config.data_parallel_size,
-                )
-                expected_rank = backup.get(
-                    "data_parallel_rank",
-                    self.parallel_config.data_parallel_rank,
-                )
-                assert engine_parallel_config.tp == expected_tp, (
-                    f'{engine_parallel_config.tp} == {expected_tp}'
-                )
-                assert engine_parallel_config.dp == expected_dp, (
-                    f'{engine_parallel_config.dp} == {expected_dp}'
-                )
-                assert (
-                    engine_parallel_config.data_parallel_rank == expected_rank
-                ), (
-                    f'{engine_parallel_config.data_parallel_rank}'
-                    f' == {expected_rank}'
-                )
-
-                self.parallel_config.tensor_parallel_size = engine_parallel_config.tp
-                self.parallel_config.data_parallel_size = engine_parallel_config.dp
-                self.parallel_config.data_parallel_rank = (
-                    own_dp_rank
-                    if own_dp_rank is not None
-                    else engine_parallel_config.data_parallel_rank
-                )
-                self.parallel_config.data_parallel_rank_local = backup.get(
-                    "data_parallel_rank_local",
-                    self.parallel_config.data_parallel_rank_local,
-                )
-                self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
-                self.parallel_config.__post_init__()
-                self.parallel_config.data_parallel_rank = (
-                    own_dp_rank
-                    if own_dp_rank is not None
-                    else engine_parallel_config.data_parallel_rank
-                )
-                self.parallel_config.data_parallel_rank_local = backup.get(
-                    "data_parallel_rank_local",
-                    self.parallel_config.data_parallel_rank_local,
-                )
-                self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
-                # __post_init__/rank 回写之后，index 与单节点 local 字段必须
-                # 与最终 rank 保持一致。D 端 DP15 -> DP16 恢复时
-                # data_parallel_size_local 之前仍可能是 15（或 scale-to-zero
-                # executor 的 0），会让 worker 的 Mooncake 端口偏移和
-                # node_rank 计算指向旧拓扑。
-                self.parallel_config.data_parallel_index = (
-                    self.parallel_config.data_parallel_rank
-                )
-                if self.parallel_config.nnodes == 1:
-                    self.parallel_config.data_parallel_rank_local = (
-                        self.parallel_config.data_parallel_rank
-                    )
-                    self.parallel_config.data_parallel_size_local = (
-                        self.parallel_config.data_parallel_size
-                    )
-            elif strategy.deploy_type in (DeployType.DEGRADE, DeployType.PD_REBUILD):
-                # 连续多次缩容/异构重建只备份第一次的原始对称配置，
-                # 供后续 RECOVER 恢复。
-                self._try_backup_origin_parallel_config_when_degrade()
-
-                # 汇总当前 executor 之前被置空（scale-to-zero）的 DP rank。
-                rm_data_parallel_rank = len([
-                    c for c in engine_parallel_config_list[:idx]
-                    if c.new_tp == 0 and c.new_dp == 0 and c.dp > 1
-                ])
-
-                new_tp = engine_parallel_config.new_tp if engine_parallel_config.new_tp is not None else engine_parallel_config.tp
-                new_dp = engine_parallel_config.new_dp if engine_parallel_config.new_dp is not None else engine_parallel_config.dp
-                backup = getattr(self, "backup_parallel_config", {})
-                logger.info(
-                    "Matched executor_id=%s, backup_parallel_config=%s, "
-                    "New TP=%s, new DP=%s, rm_data_parallel_rank=%s",
-                    executor_id, backup, new_tp, new_dp,
-                    rm_data_parallel_rank,
-                )
-
-                self.parallel_config.tensor_parallel_size = new_tp
-                self.parallel_config.data_parallel_size = new_dp
-                if own_dp_rank is not None:
-                    # 异构拓扑里按 active executor 重新连续编号。
-                    self.parallel_config.data_parallel_rank = own_dp_rank
-                else:
-                    explicit_dp_rank = getattr(
-                        engine_parallel_config, "data_parallel_rank", None
-                    )
-                    if explicit_dp_rank is not None:
-                        self.parallel_config.data_parallel_rank = (
-                            explicit_dp_rank
-                        )
-                    else:
-                        self.parallel_config.data_parallel_rank = (
-                            backup.get("data_parallel_rank", 0)
-                            - rm_data_parallel_rank
-                        )
-                self.parallel_config.heterogeneous_dp_config = self._to_heterogeneous_dp_config(hetero_configs_for_pc)
-                if new_tp > 0 and new_dp > 0:
-                    self.parallel_config.world_size = (
-                        new_tp
-                        * self.parallel_config.pipeline_parallel_size
-                        * self.parallel_config.prefill_context_parallel_size
-                    )
-                else:
-                    self.parallel_config.world_size = 0
-                # data_parallel_index 是异构全局 rank 计算的输入
-                # （get_global_rank），必须和重新编号后的 data_parallel_rank
-                # 保持一致。
-                self.parallel_config.data_parallel_index = (
-                    self.parallel_config.data_parallel_rank
-                )
-                # 单节点 DP 下 local == global；scale-to-zero 后如果
-                # active executor 被重新编号，local rank 也必须跟着变，
-                # 否则 Mooncake worker 侧按 data_parallel_rank_local 计算
-                # 端口偏移会指向旧 DP。
-                if self.parallel_config.nnodes == 1:
-                    self.parallel_config.data_parallel_rank_local = (
-                        self.parallel_config.data_parallel_rank
-                    )
-                    self.parallel_config.data_parallel_size_local = (
-                        self.parallel_config.data_parallel_size
-                    )
-            elif strategy.deploy_type == DeployType.STOP:
-                self._try_backup_origin_parallel_config_when_degrade()
-                self.parallel_config.tensor_parallel_size = 0
-                self.parallel_config.data_parallel_size = 0
-                self.parallel_config.world_size = 0
-            else:
-                raise ValueError(f"receive unknown strategy: {strategy}")
-
+                f"Checking executor_id match: strategy.executor_id={executor_id} (type={type(executor_id).__name__}) "
+                f"vs engine_config.executor_id={engine_executor_id} (type={type(engine_executor_id).__name__ if engine_executor_id is not None else 'None'}), "
+                f"config: new_tp={engine_parallel_config.new_tp}, new_dp={engine_parallel_config.new_dp}, "
+                f"tp={engine_parallel_config.tp}, dp={engine_parallel_config.dp}")
             logger.info(
-                "executor_id=%s, TP=%s, DP=%s, world_size=%s, "
-                "world_size_across_dp=%s, data_parallel_rank=%s, "
-                "heterogeneous_dp_config=%s",
-                executor_id,
-                self.parallel_config.tensor_parallel_size,
-                self.parallel_config.data_parallel_size,
-                self.parallel_config.world_size,
-                self.parallel_config.world_size_across_dp,
-                self.parallel_config.data_parallel_rank,
-                self.parallel_config.heterogeneous_dp_config,
-            )
-            break
+                f"###########*********##executor_id={executor_id}, engine_parallel_config:{engine_parallel_config} ")
+            if engine_executor_id is not None and executor_id is not None:
+                # 尝试将两者转为字符串进行比较，避免类型不一致导致的比较失败
+                if str(executor_id) == str(engine_executor_id):
+                    matched = True
+                    if strategy.deploy_type == DeployType.RECOVER:
+                        # 恢复策略的参数和备份的并行配置应一致
+                        assert engine_parallel_config.tp == self.backup_parallel_config["tensor_parallel_size"], f'{engine_parallel_config.tp} == {self.backup_parallel_config["tensor_parallel_size"]}'
+                        assert engine_parallel_config.dp == self.backup_parallel_config["data_parallel_size"], f'{engine_parallel_config.dp} == {self.backup_parallel_config["data_parallel_size"]}'
+                        assert engine_parallel_config.data_parallel_rank == self.backup_parallel_config["data_parallel_rank"], f'{engine_parallel_config.data_parallel_rank} == {self.backup_parallel_config["data_parallel_rank"]}'
+
+                        self.parallel_config.tensor_parallel_size = engine_parallel_config.tp
+                        self.parallel_config.data_parallel_size = engine_parallel_config.dp
+                        self.parallel_config.__post_init__()
+                        self.parallel_config.data_parallel_rank = engine_parallel_config.data_parallel_rank
+                        self.parallel_config.data_parallel_rank_local = self.backup_parallel_config["data_parallel_rank_local"]
+                    elif strategy.deploy_type == DeployType.DEGRADE:
+                        logger.debug(f"+++++++[mzm]+++++++++++++Degrade  executor_id={executor_id}+++++++[mzm]+++++++++++++")
+                        # 备份缩容前的对称策略(连续多次缩容不会多次写入，仅第一次缩容进行有效备份)
+                        self._try_backup_origin_parallel_config_when_degrade()
+
+                        # 按data_parallel_rank排序后，汇总dp-rank小于当前executor的故障信息。
+                        # 如果某executor的new_tp/new_dp均为0, 意味着该executor进入idle状态.
+                        # 此时, 后续executor的dp-rank需要相应往前排
+                        rm_data_parallel_rank = len([c for c in engine_parallel_config_list[:idx] if c.new_tp == 0 and c.new_dp == 0 and c.dp > 1])
+
+                        # Use new_tp/new_dp if available, otherwise fall back to tp/dp
+                        new_tp = engine_parallel_config.new_tp if engine_parallel_config.new_tp is not None else engine_parallel_config.tp
+                        new_dp = engine_parallel_config.new_dp if engine_parallel_config.new_dp is not None else engine_parallel_config.dp
+                        logger.info(f"Matched executor_id={executor_id}, self.backup_parallel_config={self.backup_parallel_config}, New TP={new_tp}, new DP={new_dp}, rm_data_parallel_rank={rm_data_parallel_rank}")
+
+                        # 直接更新 parallel_config，让 vLLM 自动计算其他值
+                        self.parallel_config.tensor_parallel_size = new_tp
+                        self.parallel_config.data_parallel_size = new_dp
+                        self.parallel_config.data_parallel_rank = self.backup_parallel_config['data_parallel_rank'] - rm_data_parallel_rank
+                        # self.parallel_config.data_parallel_rank_local -= rm_data_parallel_rank
+                        # world_size = TP × PP × PCP，需要手动更新
+                        if new_tp > 0 and new_dp > 0:
+                            self.parallel_config.world_size = new_tp * self.parallel_config.pipeline_parallel_size * self.parallel_config.prefill_context_parallel_size
+                        else:
+                            self.parallel_config.world_size = 0
+                    elif strategy.deploy_type == DeployType.STOP:
+                        logger.debug(f"+++++++[mzm]+++++++++++++Stop executor_id={executor_id}+++++++[mzm]+++++++++++++")
+                        # 备份缩容前的对称策略(连续多次缩容不会多次写入，仅第一次缩容进行有效备份)
+                        self._try_backup_origin_parallel_config_when_degrade()
+                        self.parallel_config.tensor_parallel_size = 0
+                        self.parallel_config.data_parallel_size = 0
+                        self.parallel_config.world_size = 0
+                    else:
+                        # 不应接收DEGRADE/RECOVER以外的策略
+                        raise ValueError(f"receive unknown strategy: {strategy}")
+                    logger.info(f"executor_id={executor_id}, TP={self.parallel_config.tensor_parallel_size}, DP={self.parallel_config.data_parallel_size}, world_size={self.parallel_config.world_size}, data_parallel_rank={self.parallel_config.data_parallel_rank}")
+                    
+                    # 提前break，仅处理当前executor有关信息
+                    break
 
         if not matched:
+            # 检查是否因为 executor_id 类型不匹配导致
             logger.warning(
                 f"No matching executor config found for executor_id={executor_id} (type={type(executor_id).__name__}), "
-                f"available configs: {[(ec.executor_id, type(ec.executor_id).__name__, ec.new_tp, ec.new_dp) for ec in engine_parallel_config_list]}"
-            )
-
-    @staticmethod
-    def _to_heterogeneous_dp_config(configs: list[dict]):
-        """Convert strategy dicts to ParallelConfig.HeterogeneousDPConfig."""
-        if not configs:
-            return None
-        try:
-            from vllm.config.parallel import HeterogeneousDPConfig
-        except ImportError:
-            from vllm_custom_plugins.plugins.zero_interrupt.vllm.config.parallel import (
-                HeterogeneousDPConfig,
-            )
-        return [
-            HeterogeneousDPConfig(
-                **{
-                    k: v
-                    for k, v in cfg.items()
-                    if k in ("dp_rank", "tp_size", "tp_sharding_ratios")
-                }
-            )
-            for cfg in configs
-        ]
+                f"available configs: {[(ec.executor_id, type(ec.executor_id).__name__, ec.new_tp, ec.new_dp) for ec in engine_parallel_config_list]}")
 
     @staticmethod
     def get_davinci_devices():
@@ -2645,11 +1695,7 @@ class ITSNPUWorker(AscendWorkerProc):
     - DEGRADE/RECOVER: Apply new tp/dp from zero_interrupt_config
     - PD_REBUILD: Online KV-Cache transfer chain rebuild via RPC
 
-    NOTE: worker_busy_loop dispatches string RPC methods on the wrapped
-    worker implementation (self.worker -> WorkerWrapperBase -> NPUWorker),
-    NOT on this WorkerProc subclass.  Therefore the PD_REBUILD RPC method
-    must be installed on the NPUWorker class (see patch.py) and the
-    StrategyHandler is attached to the wrapped worker below.
+    NOTE: 此代码目前不生效
     """
 
     def __init__(self, vllm_config: Any, *args: Any, **kwargs: Any) -> None:
@@ -2671,16 +1717,6 @@ class ITSNPUWorker(AscendWorkerProc):
             worker=self.worker,
             pd_rebuild_enabled=VLLM_ITS_ENABLE_PD_REBUILD,
         )
-
-        # worker_busy_loop dispatches `update_kv_connector_for_pd` on the
-        # wrapped worker implementation.  Attach the handler there as well so
-        # the NPUWorker method installed by patch.py can find it.
-        try:
-            wrapped_worker = self.worker.worker
-        except Exception:  # noqa: BLE001
-            wrapped_worker = None
-        if wrapped_worker is not None:
-            wrapped_worker._its_strategy_handler = self._strategy_handler
 
         # Apply zero interrupt config (update tp/dp or execute PD rebuild)
         self._apply_zero_interrupt_config()

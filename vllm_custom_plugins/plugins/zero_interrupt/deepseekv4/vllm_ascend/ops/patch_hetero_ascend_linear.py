@@ -479,7 +479,7 @@ def _patched_col_weight_loader(self, param: Parameter, loaded_weight: torch.Tens
         # asymmetric ColumnParallelLinear weight loader (it handles packed /
         # quantized parameters), then apply the same wo_a reshape as stock.
         self.tp_asymmetric_shardings = ratios
-        from vllm_custom_plugins.plugins.zero_interrupt.vllm.model_executor.layers.patch_linear import (
+        from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm.model_executor.layers.patch_linear import (
             ColumnParallelLinearAsymmetric,
         )
 

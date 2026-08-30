@@ -18,7 +18,7 @@ heterogeneous TP.
 
 from __future__ import annotations
 
-from vllm_custom_plugins.plugins.zero_interrupt.vllm.distributed.patch_hetero_utils import (
+from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm.distributed.patch_hetero_utils import (
     get_current_tp_sharding_ratios,
     get_tp_partition_offset,
 )

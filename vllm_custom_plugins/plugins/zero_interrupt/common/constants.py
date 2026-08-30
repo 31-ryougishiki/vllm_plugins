@@ -43,6 +43,29 @@ VLLM_ITS_ENABLE_PD_REBUILD = os.getenv("VLLM_ITS_ENABLE_PD_REBUILD", "true").low
 VLLM_SERVICE_ID = os.getenv("VLLM_SERVICE_ID", str(uuid.uuid4()))
 
 # =============================================================================
+# DeepSeek-V4 Feature Flag
+# =============================================================================
+# 当 VLLM_ITS_DEEPSEEK_V4=1 时，所有与 0829 分支冲突的 patch/整文件替换
+# 均切换到 zero_interrupt/deepseekv4/ 目录下的实现；
+# 未设置或为 0 时，默认使用主目录（vllm_plugins_0829 合并过来的实现）。
+VLLM_ITS_DEEPSEEK_V4 = (
+    os.getenv("VLLM_ITS_DEEPSEEK_V4", "0").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+
+def is_deepseek_v4_enabled() -> bool:
+    """Return True when the DeepSeek-V4 patch family should be selected.
+
+    Read the environment at call time so callers that set
+    ``VLLM_ITS_DEEPSEEK_V4`` before invoking the dispatcher work correctly.
+    """
+    return (
+        os.getenv("VLLM_ITS_DEEPSEEK_V4", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+
+# =============================================================================
 # API Endpoints
 # =============================================================================
 API_INIT_EXECUTOR_STATE = "/api/v1/decision_center/init_executor_state"

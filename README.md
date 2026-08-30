@@ -2,6 +2,10 @@
 
 A **vLLM plugin system** for applying clean, surgical patches to vLLM classes at runtime without modifying upstream source code. Uses vLLM's plugin entry point system to auto-register patches on vLLM startup.
 
+> 本仓为 `vllm_plugins` 与 `vllm_plugins_0829` 的合并结果，模块级合并说明见
+> [`MERGE_0829.md`](MERGE_0829.md)。
+
+
 ## Installation
 
 ```bash
@@ -84,6 +88,7 @@ export VLLM_CUSTOM_PATCHES="MyPatch"
 |---------------------|-------------|
 | `VLLM_CUSTOM_PATCHES` | Comma-separated patch names to apply (e.g., `"PriorityScheduler"`) |
 | `VLLM_PATCH_LOG_LEVEL` | Log level (DEBUG, INFO, WARNING, ERROR). Default: DEBUG |
+| `VLLM_ITS_DEEPSEEK_V4` | `1` selects the DeepSeek-V4 patch family (`plugins/zero_interrupt/deepseekv4/`); default `0` uses the main 0829 family |
 
 ## Available Plugins
 

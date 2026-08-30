@@ -102,6 +102,16 @@ The plugin can be configured via environment variables:
 | `VLLM_ITS_ENABLE_FAULT_KEEP` | true | Enable fault keep mode |
 | `VLLM_ITS_ENABLE_PD_REBUILD` | true | Enable PD chain rebuild |
 | `VLLM_SERVICE_ID` | auto-generated UUID | Service instance ID |
+| `VLLM_ITS_DEEPSEEK_V4` | 0 | When `1`, all conflicting patches/whole-file replacements switch to the `zero_interrupt/deepseekv4/` DeepSeek-V4 implementation; default `0` uses the main 0829 implementation |
+
+> **Dual-family layout**: the main directory under
+> `plugins/zero_interrupt/` is the merged `vllm_plugins_0829` implementation.
+> The `plugins/zero_interrupt/deepseekv4/` directory is the self-contained
+> `vllm_plugins` DeepSeek-V4 implementation. The runtime dispatcher
+> (`zero_interrupt/patch.py`) and `setup.py` both read
+> `VLLM_ITS_DEEPSEEK_V4` and select the same family, so runtime patches and
+> file replacements stay consistent.
+
 
 ## Usage
 
@@ -186,10 +196,10 @@ The plugin exposes the following HTTP endpoints:
 | MoE + PD分离 + DP/EP | Qwen3-Moe (235B-A22B) | ✓ |
 | MoE + PD不分离 + DP/EP | Qwen3-30B-A3B | ✓ |
 | 稠密模型 + PD不分离 + TP | Qwen3-Dense | ✓ |
-| 异构TP重启 + MoE + PD分离 | DeepSeek-V4-Flash-w8a8-mtp: prefill DP4TP4 -> DP4TP(3,4,4,4) | ✓ |
+| 异构TP重启 + MoE + PD分离 | DeepSeek-V4-Flash-w8a8-mtp: prefill DP4TP4 -> DP4TP(3,4,4,4) | ✓ (`VLLM_ITS_DEEPSEEK_V4=1`) |
 
 DeepSeek-V4 异构重启的详细设计见
-[`DeepSeekV4_HETERO.md`](DeepSeekV4_HETERO.md)。
+[`deepseekv4/DeepSeekV4_HETERO.md`](deepseekv4/DeepSeekV4_HETERO.md)。
 
 ## Development
 

@@ -106,22 +106,6 @@ class EPLBConfig:
 
 
 @config
-class HeterogeneousDPConfig:
-    """Configuration for a single DP rank with heterogeneous TP.
-
-    Used when different DP ranks require different TP sizes or asymmetric
-    weight sharding ratios. This is mutually exclusive with the simple
-    ``tensor_parallel_size`` int configuration for the heterogeneous case.
-    """
-
-    dp_rank: int
-    tp_size: int = Field(ge=1)
-    tp_sharding_ratios: list[int] | None = None
-    """Per-TP-rank weight sharding ratios. ``None`` means uniform.
-    E.g. ``[2, 1, 1]`` for tp_size=3 means a 50%/25%/25% split."""
-
-
-@config
 class ParallelConfig:
     """Configuration for the distributed execution."""
 
@@ -167,15 +151,6 @@ class ParallelConfig:
     --data-parallel-start-rank."""
     is_moe_model: bool | None = None
     """Whether the deployed model is MoE (if known)."""
-    heterogeneous_dp_config: list[HeterogeneousDPConfig] | None = None
-    """Optional per-DP-rank heterogeneous TP configuration.
-
-    When set, each DP rank can have a different ``tp_size`` and optional
-    ``tp_sharding_ratios`` for asymmetric weight sharding. This is mutually
-    exclusive with the simple ``tensor_parallel_size`` int for heterogeneous
-    deployments. Only supported for single-node PP=1, PCP=1 setups.
-    """
-
     enable_expert_parallel: bool = False
     """Use expert parallelism instead of tensor parallelism for MoE layers."""
     enable_ep_weight_filter: bool = False
@@ -255,7 +230,7 @@ class ParallelConfig:
     """ray distributed model workers placement group."""
 
     distributed_executor_backend: (
-        str | DistributedExecutorBackend | type[Executor] | None
+            str | DistributedExecutorBackend | type[Executor] | None
     ) = None
     """
     Backend to use for distributed model workers, either "ray" or "mp"
@@ -403,6 +378,8 @@ class ParallelConfig:
         should only be set by API server scale-out.
     """
 
+    world_size_across_dp: int = Field(default=0)
+
     @field_validator("disable_nccl_for_dp_synchronization", mode="wrap")
     @classmethod
     def _skip_none_validation(cls, value: Any, handler: Callable) -> Any:
@@ -475,7 +452,7 @@ class ParallelConfig:
             )
 
         if not self.numa_bind and (
-            self.numa_bind_nodes is not None or self.numa_bind_cpus is not None
+                self.numa_bind_nodes is not None or self.numa_bind_cpus is not None
         ):
             raise ValueError(
                 "numa_bind_nodes and numa_bind_cpus require numa_bind=True."
@@ -504,67 +481,12 @@ class ParallelConfig:
                     "num_redundant_experts."
                 )
 
-        if self.is_heterogeneous_tp:
-            if self.heterogeneous_dp_config is None:
-                raise ValueError(
-                    "heterogeneous_dp_config must be a non-empty list when "
-                    "is_heterogeneous_tp is True."
-                )
-            config_ranks = {
-                cfg.dp_rank for cfg in self.heterogeneous_dp_config
-            }
-            if config_ranks != set(range(self.data_parallel_size)):
-                raise ValueError(
-                    "heterogeneous_dp_config must cover all dp_ranks "
-                    "0..data_parallel_size-1 exactly once."
-                )
-            for cfg in self.heterogeneous_dp_config:
-                ratios = cfg.tp_sharding_ratios
-                if ratios is None:
-                    continue
-                if len(ratios) != cfg.tp_size:
-                    raise ValueError(
-                        "tp_sharding_ratios length must equal tp_size for "
-                        f"dp_rank={cfg.dp_rank}: len(ratios)={len(ratios)}, "
-                        f"tp_size={cfg.tp_size}."
-                    )
-                if any(ratio <= 0 for ratio in ratios):
-                    raise ValueError(
-                        "tp_sharding_ratios entries must be positive integers "
-                        f"for dp_rank={cfg.dp_rank}, got {ratios}."
-                    )
-            if self.enable_eplb:
-                raise ValueError(
-                    "heterogeneous_dp_config is incompatible with EPLB "
-                    "(enable_eplb=True)."
-                )
-            if self.pipeline_parallel_size > 1:
-                raise NotImplementedError(
-                    "heterogeneous_dp_config requires pipeline_parallel_size=1."
-                )
-            if self.prefill_context_parallel_size > 1:
-                raise NotImplementedError(
-                    "heterogeneous_dp_config requires prefill_context_parallel_size=1."
-                )
-            if self.decode_context_parallel_size > 1:
-                raise NotImplementedError(
-                    "heterogeneous_dp_config requires decode_context_parallel_size=1."
-                )
-            if self.nnodes > 1:
-                raise NotImplementedError(
-                    "heterogeneous_dp_config requires nnodes=1 (single node)."
-                )
-            if self.enable_elastic_ep:
-                raise ValueError(
-                    "heterogeneous_dp_config is incompatible with elastic EP."
-                )
-
         # Note(hc): In the current implementation of decode context
         # parallel(DCP), tp_size needs to be divisible by dcp_size,
         # because the world size does not change by dcp, it simply
         # reuses the GPUs of TP group, and split one TP group into
         # tp_size//dcp_size DCP groups.
-        if not self.is_heterogeneous_tp and self.tensor_parallel_size % self.decode_context_parallel_size != 0:
+        if self.tensor_parallel_size % self.decode_context_parallel_size != 0:
             raise ValueError(
                 f"tp_size={self.tensor_parallel_size} must be divisible by"
                 f"dcp_size={self.decode_context_parallel_size}."
@@ -581,13 +503,19 @@ class ParallelConfig:
     def world_size_across_dp(self) -> int:
         """world_size_across_dp is TPxPPxDP, it is the size of the world
         including data parallelism."""
-        if self.is_heterogeneous_tp:
-            pp = self.pipeline_parallel_size
-            pcp = self.prefill_context_parallel_size
-            return sum(
-                self.get_tp_size_for_dp(i) for i in range(self.data_parallel_size)
-            ) * pp * pcp
+        # [0.23.0] allow the asymmetric (zero-interrupt) degrade path to
+        # OVERRIDE the computed value (asym_world_size, the global world size
+        # across executors with non-uniform per-executor TP). For the symmetric
+        # path (no override set) it still returns world_size * data_parallel_size
+        # so the DP=4->3 degrade that relies on dynamic recompute keeps working.
+        override = self.__dict__.get("_world_size_across_dp_override")
+        if override is not None:
+            return override
         return self.world_size * self.data_parallel_size
+
+    @world_size_across_dp.setter
+    def world_size_across_dp(self, value: int) -> None:
+        self.__dict__["_world_size_across_dp_override"] = value
 
     @property
     def use_ubatching(self) -> bool:
@@ -622,40 +550,6 @@ class ParallelConfig:
 
         return answer
 
-    @property
-    def is_heterogeneous_tp(self) -> bool:
-        """True when per-DP-rank heterogeneous TP config is active."""
-        return self.heterogeneous_dp_config is not None
-
-    def get_tp_size_for_dp(self, dp_rank: int) -> int:
-        """Get the TP size for a specific DP rank."""
-        if self.heterogeneous_dp_config is None:
-            return self.tensor_parallel_size
-        for cfg in self.heterogeneous_dp_config:
-            if cfg.dp_rank == dp_rank:
-                return cfg.tp_size
-        return self.tensor_parallel_size
-
-    def get_sharding_ratios_for_dp(self, dp_rank: int) -> list[int] | None:
-        """Get the asymmetric sharding ratios for a DP rank, or None if uniform."""
-        if self.heterogeneous_dp_config is None:
-            return None
-        for cfg in self.heterogeneous_dp_config:
-            if cfg.dp_rank == dp_rank:
-                return cfg.tp_sharding_ratios
-        return None
-
-    def get_rank_offset_for_dp(self, dp_rank: int) -> int:
-        """Starting global rank for this DP rank (cumulative sum of preceding DP world sizes)."""
-        if self.heterogeneous_dp_config is None:
-            return dp_rank * self.world_size
-        offset = 0
-        pp = self.pipeline_parallel_size
-        pcp = self.prefill_context_parallel_size
-        for i in range(dp_rank):
-            offset += self.get_tp_size_for_dp(i) * pp * pcp
-        return offset
-
     def _pick_stateless_dp_port(self) -> tuple[int, socket.socket | None]:
         """Return ``(port, listen_socket)`` for DP group init.
 
@@ -685,14 +579,18 @@ class ParallelConfig:
 
     @overload
     def stateless_init_dp_group(
-        self, return_store: Literal[False] = ...
-    ) -> ProcessGroup: ...
+            self, return_store: Literal[False] = ...
+    ) -> ProcessGroup:
+        ...
+
     @overload
     def stateless_init_dp_group(
-        self, return_store: Literal[True] = ...
-    ) -> tuple[ProcessGroup, Store]: ...
+            self, return_store: Literal[True] = ...
+    ) -> tuple[ProcessGroup, Store]:
+        ...
+
     def stateless_init_dp_group(
-        self, return_store: bool = False
+            self, return_store: bool = False
     ) -> ProcessGroup | tuple[ProcessGroup, Store]:
         # NOTE: In high-concurrency scenarios multiple processes
         # can pick the same (currently free) port through a race
@@ -744,37 +642,31 @@ class ParallelConfig:
     #
     @property
     def use_sequence_parallel_moe(self) -> bool:
-        tp_gt_1 = (
-            any(self.get_tp_size_for_dp(i) > 1
-                for i in range(self.data_parallel_size))
-            if self.is_heterogeneous_tp
-            else self.tensor_parallel_size > 1
-        )
         return (
-            self.all2all_backend
-            in (
-                "allgather_reducescatter",
-                "deepep_high_throughput",
-                "deepep_low_latency",
-                "mori_high_throughput",
-                "mori_low_latency",
-                "nixl_ep",
-            )
-            and self.enable_expert_parallel
-            and tp_gt_1
-            and self.data_parallel_size > 1
+                self.all2all_backend
+                in (
+                    "allgather_reducescatter",
+                    "deepep_high_throughput",
+                    "deepep_low_latency",
+                    "mori_high_throughput",
+                    "mori_low_latency",
+                    "nixl_ep",
+                )
+                and self.enable_expert_parallel
+                and self.tensor_parallel_size > 1
+                and self.data_parallel_size > 1
         )
 
     @property
     def use_batched_dp_moe(self) -> bool:
         return (
-            self.all2all_backend
-            in (
-                "deepep_low_latency",
-                "nixl_ep",
-            )
-            and self.enable_expert_parallel
-            and self.data_parallel_size > 1
+                self.all2all_backend
+                in (
+                    "deepep_low_latency",
+                    "nixl_ep",
+                )
+                and self.enable_expert_parallel
+                and self.data_parallel_size > 1
         )
 
     @property
@@ -786,7 +678,7 @@ class ParallelConfig:
         if self.nnodes == 1:
             return 1
         data_parallel_node_size = (
-            self.data_parallel_size // self.data_parallel_size_local
+                self.data_parallel_size // self.data_parallel_size_local
         )
         return self.nnodes // data_parallel_node_size
 
@@ -807,7 +699,7 @@ class ParallelConfig:
 
     @staticmethod
     def sync_dp_state(
-        dp_group: ProcessGroup, has_unfinished: bool, pending_pause: bool
+            dp_group: ProcessGroup, has_unfinished: bool, pending_pause: bool
     ) -> tuple[bool, bool]:
         """Combined all-reduce for DP state synchronization.
 
@@ -891,13 +783,6 @@ class ParallelConfig:
             "numa_bind_nodes",
             "numa_bind_cpus",
         }
-        if self.is_heterogeneous_tp:
-            # Under heterogeneous TP each DP rank intentionally has a
-            # different tensor_parallel_size (e.g. 3 vs 4) and therefore a
-            # different derived world_size, so both must not diverge the DP
-            # worker configuration hash used to validate collective-
-            # communication consistency across DP ranks.
-            ignored_factors.update({"tensor_parallel_size", "world_size"})
 
         from vllm.config.utils import get_hash_factors, hash_factors
 
@@ -906,33 +791,15 @@ class ParallelConfig:
 
     def __post_init__(self) -> None:
         # Continue with the rest of the initialization
-        if self.is_heterogeneous_tp:
-            my_tp = self.get_tp_size_for_dp(self.data_parallel_rank)
-            # Update tensor_parallel_size to the per-DP-rank value so that
-            # downstream code (VllmConfig, model construction, etc.) that
-            # reads tensor_parallel_size gets the correct value for this rank.
-            self.tensor_parallel_size = my_tp
-            self.world_size = (
-                self.pipeline_parallel_size
-                * my_tp
-                * self.prefill_context_parallel_size
-            )
-        else:
-            self.world_size = (
+        self.world_size = (
                 self.pipeline_parallel_size
                 * self.tensor_parallel_size
                 * self.prefill_context_parallel_size
-            )
+        )
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")
-            if self.is_heterogeneous_tp:
-                # __post_init__ above set world_size to the local DP rank's
-                # world size (tp_size(dp) * pp * pcp); the external launcher
-                # needs the total size across the heterogeneous DP ranks.
-                self.world_size = self.world_size_across_dp
-            else:
-                self.world_size *= self.data_parallel_size
+            self.world_size *= self.data_parallel_size
 
         if self.enable_elastic_ep:
             if not self.enable_eplb:
@@ -955,7 +822,7 @@ class ParallelConfig:
                 # For external launcher,
                 # we need to set the data parallel rank automatically
                 self.data_parallel_rank = int(os.environ["RANK"]) // (
-                    self.world_size // self.data_parallel_size
+                        self.world_size // self.data_parallel_size
                 )
                 logger.info(
                     "Set data_parallel_rank to %d automatically.",
@@ -993,7 +860,10 @@ class ParallelConfig:
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
             logger.info("Disabling V1 multiprocessing for external launcher.")
 
-        if self.distributed_executor_backend is None and self.world_size_across_dp > 1:
+        # [lqf] hack
+        world_size_across_dp = self.world_size * self.data_parallel_size
+
+        if self.distributed_executor_backend is None and world_size_across_dp > 1:
             # We use multiprocessing by default if world_size fits on the
             # current node and we aren't in a ray placement group.
 
@@ -1006,8 +876,8 @@ class ParallelConfig:
             elif current_platform.is_cuda() and self.nnodes > 1:
                 backend = "mp"
             elif (
-                current_platform.is_cuda()
-                and current_platform.device_count() < self.world_size
+                    current_platform.is_cuda()
+                    and current_platform.device_count() < self.world_size
             ):
                 gpu_count = current_platform.device_count()
                 raise ValueError(
@@ -1047,8 +917,8 @@ class ParallelConfig:
             )
         allowed_backends = ("mp", "uni", "external_launcher")
         if (
-            self.distributed_executor_backend not in allowed_backends
-            and self.nnodes > 1
+                self.distributed_executor_backend not in allowed_backends
+                and self.nnodes > 1
         ):
             raise ValueError(
                 "nnodes > 1 can only be set when distributed executor "
@@ -1077,8 +947,8 @@ class ParallelConfig:
     @property
     def use_ray(self) -> bool:
         return self.distributed_executor_backend == "ray" or (
-            isinstance(self.distributed_executor_backend, type)
-            and getattr(self.distributed_executor_backend, "uses_ray", False)
+                isinstance(self.distributed_executor_backend, type)
+                and getattr(self.distributed_executor_backend, "uses_ray", False)
         )
 
     @model_validator(mode="after")
@@ -1091,12 +961,12 @@ class ParallelConfig:
             self.disable_custom_all_reduce = True
 
         if (
-            self.distributed_executor_backend is not None
-            and not isinstance(self.distributed_executor_backend, str)
-            and not (
+                self.distributed_executor_backend is not None
+                and not isinstance(self.distributed_executor_backend, str)
+                and not (
                 isinstance(self.distributed_executor_backend, type)
                 and issubclass(self.distributed_executor_backend, Executor)
-            )
+        )
         ):
             raise ValueError(
                 "Unrecognized distributed executor backend "

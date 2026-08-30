@@ -34,6 +34,11 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import has_rope, is_vl_model
 
+# [merge-0829] 保留 0829 分支的 its_rotary 开关：仅在 VLLM_CUSTOM_PATCHES
+# 中包含 its_rotary 时启用半 rope_dim 缓冲与非 interleave 的 cos/sin 切分；
+# 未开启时保持 v0.23.0 原生行为。
+HAS_ITS_ROTARY = "its_rotary" in os.environ.get("VLLM_CUSTOM_PATCHES", "")
+
 if HAS_TRITON:
     from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 
@@ -82,8 +87,12 @@ def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, devi
             rope_dim = int(rope_dim * model_config.hf_text_config.partial_rotary_factor)
         elif hasattr(model_config.hf_text_config, "rotary_dim"):
             rope_dim = int(model_config.hf_text_config.rotary_dim)
-        _cos = torch.ones(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
-        _sin = torch.zeros(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
+        if HAS_ITS_ROTARY:
+            _cos = torch.ones(1, max_num_batched_tokens, 1, rope_dim // 2, dtype=dtype, device=device)
+            _sin = torch.zeros(1, max_num_batched_tokens, 1, rope_dim // 2, dtype=dtype, device=device)
+        else:
+            _cos = torch.ones(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
+            _sin = torch.zeros(1, max_num_batched_tokens, 1, rope_dim, dtype=dtype, device=device)
 
 
 def get_cos_and_sin_mla(positions, use_cache=False):
@@ -126,22 +135,35 @@ def _record_cos_and_sin_cache_interleaved(cos_sin_cache):
     _sin_cache = sin_cache.squeeze(1)
 
 
-def update_cos_sin(positions):
+def update_cos_sin(positions, cos_sin_cache=None):
     global _cos
     global _sin
     global _cos_slice
     global _sin_slice
+    global _cos_sin_cache
+
+    # [merge-0829] 惰性初始化：与 0829 分支兼容，允许调用方显式传入 cache。
+    if _cos_sin_cache is None and cos_sin_cache is not None:
+        _cos_sin_cache = cos_sin_cache
 
     if _cos_sin_cache is None or _cos is None or _sin is None:
         return
 
     num_tokens = positions.size(0)
-    _cos[:, :num_tokens] = (
-        _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
-    )
-    _sin[:, :num_tokens] = (
-        _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[1]
-    )
+    if HAS_ITS_ROTARY:
+        _cos[:, :num_tokens] = (
+            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).chunk(2, dim=-2)[0]
+        )
+        _sin[:, :num_tokens] = (
+            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).chunk(2, dim=-2)[1]
+        )
+    else:
+        _cos[:, :num_tokens] = (
+            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[0]
+        )
+        _sin[:, :num_tokens] = (
+            _cos_sin_cache.index_select(0, positions).view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=-2)[1]
+        )
     _cos_slice = _cos[:, :num_tokens]
     _sin_slice = _sin[:, :num_tokens]
 

@@ -1074,43 +1074,29 @@ class FusedMoEParallelConfig:
     def flatten_tp_across_dp_and_pcp(
         tp_size: int, dp_size: int, dp_rank: int, pcp_size: int, pcp_rank: int
     ) -> tuple[int, int]:
+        # TODO: [lqf] 非对称整改(need refactor)
+        from vllm.config import get_current_vllm_config
+        vllm_config = get_current_vllm_config()
+        additional_config = getattr(vllm_config, "additional_config", None)
+        zero_interrupt_config = additional_config.get("zero_interrupt_config", None)
+        asym = zero_interrupt_config is not None
+
+        if asym:
+            from vllm.distributed.parallel_state import get_global_rank_asym, asym_world_size
+
+            tp_rank = 0 if tp_size == 1 else get_tensor_model_parallel_rank()
+            # flatten_tp_size = dp_size * pcp_size * tp_size
+            flatten_tp_size = asym_world_size(zero_interrupt_config)
+            # flatten_tp_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+            flatten_tp_rank = get_global_rank_asym(tp_rank)
+
+            return flatten_tp_size, flatten_tp_rank
+
         tp_rank = 0 if tp_size == 1 else get_tensor_model_parallel_rank()
-        # Check for heterogeneous TP (different tp sizes per DP rank)
-        # NOTE: do NOT rely on the ``dp_size``/``dp_rank`` arguments here.
-        # Under heterogeneous TP the DP group of an "orphaned" TP rank is a
-        # singleton, so ``get_dp_group().world_size``/``rank_in_group`` are
-        # wrong. Also the TP group may be temporarily patched to size-1 for
-        # the draft model, so get_tensor_model_parallel_rank() may be wrong.
-        # Always read the true values from the current VllmConfig / world rank.
-        from vllm.config import get_current_vllm_config_or_none
-
-        cfg = get_current_vllm_config_or_none()
-        if cfg is not None and cfg.parallel_config.is_heterogeneous_tp:
-            from vllm.distributed.parallel_state import get_world_group
-
-            pc = cfg.parallel_config
-            true_dp_size = pc.data_parallel_size
-            true_dp_rank = pc.data_parallel_rank
-            tp_sizes = [pc.get_tp_size_for_dp(i) for i in range(true_dp_size)]
-            # Recover the true rank within this DP rank's TP group from the
-            # global rank, since get_tensor_model_parallel_rank() reads the
-            # (possibly patched) global TP group.
-            global_rank = get_world_group().rank
-            true_tp_rank = global_rank - pc.get_rank_offset_for_dp(true_dp_rank)
-            cum_offset = sum(
-                tp_sizes[i] * pcp_size for i in range(true_dp_rank)
-            )
-            flatten_tp_size = sum(tp_sizes) * pcp_size
-            flatten_tp_rank = (
-                cum_offset + pcp_rank * tp_sizes[true_dp_rank] + true_tp_rank
-            )
-        else:
-            # There are actually dp_size * pcp_size * tp_size devices.
-            # Update tp_size and tp_rank so we shard across all devices.
-            flatten_tp_size = dp_size * pcp_size * tp_size
-            flatten_tp_rank = (
-                dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
-            )
+        # There are actually dp_size * pcp_size * tp_size devices.
+        # Update tp_size and tp_rank so we shard across all devices.
+        flatten_tp_size = dp_size * pcp_size * tp_size
+        flatten_tp_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
         return flatten_tp_size, flatten_tp_rank
 
     @staticmethod
@@ -1199,24 +1185,8 @@ class FusedMoEParallelConfig:
             and vllm_parallel_config.enable_expert_parallel
         )
 
-        if vllm_parallel_config.is_heterogeneous_tp:
-            # Under heterogeneous TP the DP group of an orphaned TP rank is a
-            # singleton (get_dp_group().world_size == 1), and the TP group may
-            # be temporarily patched to size-1 for the draft model
-            # (patch_tensor_parallel_group). Both would make `use_ep` evaluate
-            # to False. Use the true sizes from the parallel config instead.
-            dp_size = vllm_parallel_config.data_parallel_size
-            dp_rank = vllm_parallel_config.data_parallel_rank
-            use_ep = (
-                vllm_parallel_config.data_parallel_size
-                * vllm_parallel_config.prefill_context_parallel_size
-                * vllm_parallel_config.tensor_parallel_size
-                > 1
-                and vllm_parallel_config.enable_expert_parallel
-            )
-        else:
-            dp_size = dp_size_
-            dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
+        dp_size = dp_size_
+        dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
         pcp_size = pcp_size_
         pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
         tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(

@@ -2183,28 +2183,17 @@ def _get_and_verify_max_len(
 
 def verify_with_parallel_config(
     self,
-    parallel_config,
+    parallel_config: ParallelConfig,
 ) -> None:
-    """v0.23-compatible verify_with_parallel_config with heterogeneous TP.
-
-    Under heterogeneous TP with explicit tp_sharding_ratios (e.g. tp=3,
-    ratios=[2,1,1]), 64 heads are intentionally not divisible by tp_size.
-    """
     total_num_attention_heads = self.model_arch_config.total_num_attention_heads
     tensor_parallel_size = parallel_config.tensor_parallel_size
-
-    has_asymmetric = bool(
-        getattr(parallel_config, "is_heterogeneous_tp", False)
-        and parallel_config.get_sharding_ratios_for_dp(
-            parallel_config.data_parallel_rank
-        )
-        is not None
-    )
-    if not has_asymmetric and total_num_attention_heads % tensor_parallel_size != 0:
-        raise ValueError(
+    if total_num_attention_heads % tensor_parallel_size != 0:
+        import logging
+        logging.getLogger(__name__).warning(
             f"Total number of attention heads ({total_num_attention_heads})"
-            " must be divisible by tensor parallel size "
-            f"({tensor_parallel_size})."
+            " is not divisible by tensor parallel size "
+            f"({tensor_parallel_size}). "
+            "Uneven split will be used: remainder goes to the last rank."
         )
 
     if parallel_config.enable_expert_parallel:
@@ -2242,15 +2231,4 @@ def verify_with_parallel_config(
             " must be divisible by dcp world size when enable "
             "decode context parallel for GQA "
             f"({parallel_config.decode_context_parallel_size})."
-        )
-
-    if (
-        self.multimodal_config is not None
-        and self.multimodal_config.mm_tensor_ipc == "torch_shm"
-        and parallel_config.world_size_across_dp > 1
-    ):
-        raise ValueError(
-            "mm_tensor_ipc='torch_shm' is not supported with "
-            "data_parallel_size > 1 or tensor_parallel_size > 1 "
-            "or pipeline_parallel_size > 1."
         )

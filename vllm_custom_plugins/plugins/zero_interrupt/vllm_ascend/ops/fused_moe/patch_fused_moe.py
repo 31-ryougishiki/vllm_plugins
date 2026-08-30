@@ -10,24 +10,68 @@ from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
-
-try:
-    # vLLM Ascend >= 0.23.0
-    from vllm_ascend.ops.fused_moe.fused_moe import get_compressed_expert_map
-except ImportError:
-    # vLLM Ascend 0.18.x
-    from vllm.model_executor.layers.fused_moe.layer import (
-        get_compressed_expert_map,
-    )
+from vllm_ascend.ops.fused_moe.fused_moe import get_compressed_expert_map
 from vllm_ascend.ops.fused_moe.fused_moe import (AscendFusedMoE, AscendUnquantizedFusedMoEMethod)
 
 from vllm_custom_plugins.plugins.zero_interrupt.vllm_ascend.eplb.core.patch_eplb_utils import patched_init_eplb_config
 
 class PatchAscendFusedMoE(AscendFusedMoE):
+
+    @property
+    def local_num_experts(self):
+        # [0.23.0] AscendFusedMoE.__init__ sets local_num_experts = global //
+        # ep_size (floor), which drops the remainder experts when the count is
+        # not divisible by ep_size (e.g. DP=4->3: 128 experts / 3 = 42.67 -> 42,
+        # dropping experts 42 and 85 -> IndexError at weight load). The
+        # expert_map (from determine_expert_map) already distributes the
+        # remainder to the leading ranks (43/43/42, covering all 128), so
+        # derive local_num_experts from the expert_map count instead of the
+        # floor. For divisible cases (128/4=32) the count equals the floor,
+        # so behavior is unchanged.
+        em = getattr(self, "_expert_map", None)
+        if em is not None:
+            try:
+                return int((em >= 0).sum().item())
+            except Exception:
+                pass
+        return self.__dict__.get("_local_num_experts_fallback", 0)
+
+    @local_num_experts.setter
+    def local_num_experts(self, v):
+        self.__dict__["_local_num_experts_fallback"] = v
+
     def __init__(self, *args, **kwargs):
         """
             主要修改 local_num_experts 计算逻辑，适配非对称场景
         """
+        # [0.23.0] For the standard (symmetric) path — no zero_interrupt config,
+        # i.e. normal DP=4 startup and any non-degrade path — delegate to the
+        # REAL 0.23.0 AscendFusedMoE.__init__. The 0.18.0-derived manual __init__
+        # below is incompatible with 0.23.0's AscendFusedMoE API
+        # (intermediate_size_per_partition is now a read-only @property;
+        # _init_runner no longer exists; etc.). Only the asymmetric
+        # degrade/recover path needs the patched EPLB expert distribution, so
+        # gate the custom logic behind zero_interrupt_config.
+        vllm_config = get_current_vllm_config()
+        additional_config = getattr(vllm_config, "additional_config", None)
+        zero_interrupt_config = (additional_config.get(
+            "zero_interrupt_config", None) if additional_config else None)
+        if not zero_interrupt_config:
+            AscendFusedMoE.__init__(self, *args, **kwargs)
+            return
+
+        # [0.23.0] Also delegate to the real AscendFusedMoE.__init__ on the
+        # asymmetric (degrade/recover) path. The 0.18.0-derived custom __init__
+        # below is incompatible with 0.23.0's AscendFusedMoE API (_init_runner
+        # removed, intermediate_size_per_partition is a read-only @property,
+        # init_eplb_config arity/signature changed, expert_map_manager /
+        # base_quant_method / swiglu_limit / mix_placement added). The real
+        # 0.23.0 init_eplb_config + redundant-expert (EPLB) mechanism handles
+        # expert distribution, including non-divisible counts via redundant
+        # experts, so the custom patched_init_eplb_config path is not needed.
+        AscendFusedMoE.__init__(self, *args, **kwargs)
+        return
+
         FusedMoE.__init__(self, *args, **kwargs) # 绕开 AscendFusedMoE 的 __init__()
         # super().__init__(*args, **kwargs) # TODO: do not use AscendFusedMoE's __init__
         logger.info_once(
@@ -109,40 +153,13 @@ class PatchAscendFusedMoE(AscendFusedMoE):
         # but this class attribute may not be accessible yet when create_weights is called in some code paths
         # (e.g., when SharedFusedMoE or other subclasses trigger weight creation before the attribute propagates).
         # Manually compute and inject intermediate_size_per_partition to ensure it's available.
-        # DeepSeek-V4 异构重启：按 tp_asymmetric_shardings（例如 [2,1,1]）切分
-        # 而非 intermediate_size // tp_size，否则 2048 在 tp=3 上会切成
-        # 682/682/682 而不是 1024/512/512。
-        _asym_ratios = None
-        try:
-            from vllm.config import get_current_vllm_config_or_none
-            from vllm_custom_plugins.plugins.zero_interrupt.vllm.v1.executor.utils import (
-                get_tp_asymmetric_shardings,
-            )
-
-            _cfg = get_current_vllm_config_or_none()
-            _additional = getattr(_cfg, "additional_config", None) or {}
-            _ratios = get_tp_asymmetric_shardings(
-                _additional.get("zero_interrupt_config", {})
-            )
-            if _ratios and len(_ratios) == self.tp_size:
-                _asym_ratios = [int(r) for r in _ratios]
-        except Exception:
-            _asym_ratios = None
-
-        if _asym_ratios is not None:
-            _world_split = sum(_asym_ratios)
-            _split = _asym_ratios[self.tp_rank]
-            intermediate_size_per_partition = (
-                intermediate_size // _world_split
-            ) * _split
-            _remainder = intermediate_size % _world_split
-            # remainder 给最后一个 rank，保持各 rank 分片之和等于
-            # intermediate_size。
-            if self.tp_rank == self.tp_size - 1:
-                intermediate_size_per_partition += _remainder
-        else:
-            intermediate_size_per_partition = intermediate_size // self.tp_size
-        self.intermediate_size_per_partition = intermediate_size_per_partition
+        intermediate_size_per_partition = intermediate_size // self.tp_size
+        # [0.23.0] intermediate_size_per_partition is now a read-only @property
+        # on FusedMoE (vllm/model_executor/layers/fused_moe/layer.py) that returns
+        # self.moe_config.intermediate_size_per_partition. Assigning it on the
+        # instance raises "property ... has no setter". Set it on moe_config
+        # instead (which the @property reads); FusedMoE.__init__ above already
+        # does this, so the line below is redundant but kept explicit.
         self.moe_config.intermediate_size_per_partition = intermediate_size_per_partition
         logger.info_once(f"TP={self.tp_size}, local_num_experts={self.local_num_experts}, "
                          f"hidden_size={self.hidden_size}, intermediate_size={intermediate_size}, "
