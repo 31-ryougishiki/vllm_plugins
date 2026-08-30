@@ -64,7 +64,7 @@ A 独有的 DeepSeek-V4 hetero 模块（`patch_hetero_*`、`patch_deepseek_v4*`
 | `vllm/v1/core/kv_cache_utils.py` | A v0.23 原实现 + B 的 mixed-page_size / 非对称投影与归一化，运行期按 `VLLM_ITS_DEEPSEEK_V4` 分流 |
 | `vllm_ascend/distributed/parallel_state.py` | 直接采用 A（严格超集，含 `init_ascend_model_parallel_asym`） |
 | `vllm_ascend/worker/worker.py` | A hetero 路径 + B 旧 asym 路径 + mamba KV 重算修复 |
-| `vllm_ascend/patch/worker/patch_qwen3_5.py` | 安装运行时分发器 + `*_deepseek_v4.py` / `*_0829.py` 两份实现 |
+| `vllm_ascend/patch/worker/patch_qwen3_5.py` | v0.23 GDN 实现 + 0829 非对称感知 `forward`/`rearrange_mixed_qkv`；310P 保持 A 路径 |
 | `vllm_ascend/ops/rotary_embedding.py` | A 为底 + B `its_rotary` 开关 |
 
 ### 共享（不分版本）
@@ -106,8 +106,10 @@ python3 -m vllm.entrypoints.openai.api_server ...
 - 用假 `vllm` / `vllm_ascend` 包验证 `setup.py` 在
   `VLLM_ITS_DEEPSEEK_V4=0` 与 `=1` 两种环境下安装的文件字节级一致
   （安装结果不再依赖该变量）。
-- 用 stub 验证 `zero_interrupt/patch.py` 与 `patch_qwen3_5.py` 分发器在
-  `VLLM_ITS_DEEPSEEK_V4=1/0` 下分别路由到 A/B 实现。
+- 用 stub 验证 `zero_interrupt/patch.py` 在
+  `VLLM_ITS_DEEPSEEK_V4=1/0` 下分别路由到 A/B 实现；
+  `patch_qwen3_5.py` 已编译并确认对称路径委托 v0.23 原实现、
+  非对称路径使用 0829 shardings 切分。
 - 校验主目录与 B 仓文件一致性（仅预期的共享合并文件有差异），
   `deepseekv4/` 与 A 仓文件一致性（仅绝对导入前缀有预期改写）。
 
@@ -117,5 +119,5 @@ python3 -m vllm.entrypoints.openai.api_server ...
   origin_0.23.0 上的可用性以 0829 仓原有验证结论为准。
 - 安装阶段不再依赖 `VLLM_ITS_DEEPSEEK_V4`；该变量只需在 vLLM 运行期
   设置，用于选择 runtime monkey-patch 族与统一替换文件的内部分支。
-- `patch_qwen3_5.py` 在安装时会同时安装两份实现；切换场景只需修改
-  运行期环境变量并重启服务。
+- `patch_qwen3_5.py` 已合并为单文件：对称 TP 时行为与 v0.23 原实现一致，
+  非对称 TP 时启用 0829 的 `tp_asymmetric_shardings` 切分。

@@ -98,8 +98,8 @@ class MyPatch(VLLMPatch[TargetClass]):
 replacement sources (parallel.py, parallel_state.py, fused_moe config,
 kv_cache_utils, ascend worker/parallel_state, rotary, patch_qwen3_5) are
 unified files installed by `setup.py` without consulting the environment;
-they branch internally at runtime. `patch_qwen3_5.py` is installed as a
-runtime dispatcher plus `*_deepseek_v4.py` / `*_0829.py` implementations.
+they branch internally at runtime. `patch_qwen3_5.py` combines the v0.23
+GDN implementation with the 0829 asymmetric-TP-aware forward/rearrange.
 
 
 

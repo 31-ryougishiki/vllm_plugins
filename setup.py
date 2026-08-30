@@ -132,25 +132,13 @@ if vllm_ascend_path and os.path.exists(vllm_ascend_path):
     replace_file_content(worker_src_path, worker_dest_path)
 
     print(f"Start replacing patch_qwen3_5.py in vllm_ascend...")
-    patch_qwen_3_5_src_root = os.path.join(
-        zero_interrupt_root, 'vllm_ascend', 'patch', 'worker'
+    patch_qwen_3_5_dest_path = os.path.join(
+        vllm_ascend_path, 'patch', 'worker', 'patch_qwen3_5.py'
     )
-    patch_qwen_3_5_dest_dir = os.path.join(
-        vllm_ascend_path, 'patch', 'worker'
+    patch_qwen_3_5_src_path = os.path.join(
+        zero_interrupt_root, 'vllm_ascend', 'patch', 'worker', 'patch_qwen3_5.py'
     )
-    # 安装运行时分发器 + 两份实现，import 时按环境变量选择。
-    for src_name, dest_name in (
-        ("patch_qwen3_5.py", "patch_qwen3_5.py"),
-        (
-            "patch_qwen3_5_deepseek_v4.py",
-            "patch_qwen3_5_deepseek_v4.py",
-        ),
-        ("patch_qwen3_5_0829.py", "patch_qwen3_5_0829.py"),
-    ):
-        replace_file_content(
-            os.path.join(patch_qwen_3_5_src_root, src_name),
-            os.path.join(patch_qwen_3_5_dest_dir, dest_name),
-        )
+    replace_file_content(patch_qwen_3_5_src_path, patch_qwen_3_5_dest_path)
 else:
     print(f"Fail to find vllm_ascend path")
 
