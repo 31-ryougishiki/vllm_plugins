@@ -48,10 +48,10 @@ VLLM_SERVICE_ID = os.getenv("VLLM_SERVICE_ID", str(uuid.uuid4()))
 # 当 VLLM_ITS_DEEPSEEK_V4=1 时，所有与 0829 分支冲突的 patch/整文件替换
 # 均切换到 zero_interrupt/deepseekv4/ 目录下的实现；
 # 未设置或为 0 时，默认使用主目录（vllm_plugins_0829 合并过来的实现）。
-VLLM_ITS_DEEPSEEK_V4 = (
-    os.getenv("VLLM_ITS_DEEPSEEK_V4", "0").strip().lower()
-    in ("1", "true", "yes", "on")
-)
+#
+# 该开关只在【调用时】通过 is_deepseek_v4_enabled() 读取。不要在此处定义
+# 导入期常量：调用方可能在导入本模块之后才设置环境变量，导入期固化会导致
+# patch 族选择失效。
 
 
 def is_deepseek_v4_enabled() -> bool:

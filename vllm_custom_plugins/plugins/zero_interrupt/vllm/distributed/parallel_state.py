@@ -1742,6 +1742,7 @@ def init_distributed_environment(
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
+    parallel_config = config.parallel_config if config is not None else None
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
     if (
         config is not None
@@ -1752,7 +1753,6 @@ def init_distributed_environment(
         )
         and not enable_elastic_ep
     ):
-        parallel_config = config.parallel_config
         # adjust to take into account data parallelism
         # offset the rank by the data parallel rank
         if parallel_config.is_heterogeneous_tp:

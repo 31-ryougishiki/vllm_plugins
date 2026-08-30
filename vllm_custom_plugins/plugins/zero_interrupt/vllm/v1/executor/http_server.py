@@ -63,6 +63,10 @@ class ITSHttpServer:
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._shutdown_event = threading.Event()
+        # Reference to the running uvicorn Server so stop() can request a
+        # clean exit of server.run() (which otherwise never returns and
+        # keeps serving on the port after shutdown).
+        self._uvicorn_server: Any = None
 
         self._setup_routes()
 
@@ -142,7 +146,13 @@ class ITSHttpServer:
                     body = await request.body()
                     if not body:
                         raise HTTPException(status_code=400, detail="No data provided or invalid JSON")
-                    data = {}
+                    # A non-empty body that is not valid JSON must be
+                    # rejected.  Falling back to data={} would parse it as a
+                    # default DEGRADE strategy with an empty executor_id and
+                    # forward that to the strategy sync thread.
+                    raise HTTPException(
+                        status_code=400, detail="Invalid JSON body"
+                    )
 
                 # Parse the strategy from request
                 strategy = self._parse_deploy_request(data)
@@ -310,23 +320,36 @@ class ITSHttpServer:
                 log_level="warning",
                 access_log=False,
             )
-            server = uvicorn.Server(config)
+            self._uvicorn_server = uvicorn.Server(config)
+
+            # stop() may race with thread startup.  If a stop was already
+            # requested, do not run the server: uvicorn run() never observes
+            # _running/_shutdown_event and would keep the port bound forever.
+            if not self._running or self._shutdown_event.is_set():
+                return
 
             # Run server
-            server.run()
+            self._uvicorn_server.run()
 
         except Exception as e:
             logger.error(f"HTTP server error: {e}")
         finally:
             self._running = False
+            self._uvicorn_server = None
 
     def stop(self) -> None:
         """Stop the HTTP server."""
-        if not self._running:
-            return
-
         self._running = False
         self._shutdown_event.set()
+        # server.run() does not observe _running/_shutdown_event; request a
+        # clean uvicorn exit so the port is actually released.  Do not early
+        # return when _running is already False: stop() can race with the
+        # server thread creating the uvicorn Server, and in that case the
+        # thread must still observe should_exit / _shutdown_event after it
+        # finishes constructing the server.
+        server = getattr(self, "_uvicorn_server", None)
+        if server is not None:
+            server.should_exit = True
         logger.info("HTTP server stopped")
 
     def is_running(self) -> bool:

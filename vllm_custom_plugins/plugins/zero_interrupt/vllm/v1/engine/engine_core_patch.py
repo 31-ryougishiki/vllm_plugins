@@ -262,13 +262,20 @@ def patch_engine_core() -> None:
                     # 阻塞新请求进入，立即中止正在执行的请求
                     self.process_input_queue_block = True
                     # 立即中止所有正在执行的请求
-                    self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+                    aborted_reqs = self.scheduler.finish_requests(
+                        None, RequestStatus.FINISHED_ABORTED
+                    )
+                    self._send_abort_outputs(aborted_reqs)
                     # 等待请求中止完成（短暂等待即可）
                     for _ in range(50):  # 最多等待5秒
                         if not self.scheduler.has_unfinished_requests():
                             break
                         time.sleep(0.1)
-                    assert not self.scheduler.has_unfinished_requests(), "still has_unfinished_requests after wating 5 sec"
+                    if self.scheduler.has_unfinished_requests():
+                        logger.warning(
+                            "Requests still unfinished after 5s abort wait; "
+                            "continuing with deployment strategy anyway."
+                        )
 
                     # 设置暂停并执行策略
                     self._paused_for_restart = True  # TODO: [lqf] 实际上没有并发的流程，这个flag好像并没有作用
@@ -306,13 +313,18 @@ def patch_engine_core() -> None:
                         self.step_counter = 0
                     self.engines_running = False  # force the engine-core to wait for new req after degrade/recover
                     # TODO: [lqf] 这里要再次清理请求? 防止缩容过程中用户下发了新的请求?
-                    self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+                    aborted_reqs = self.scheduler.finish_requests(
+                        None, RequestStatus.FINISHED_ABORTED
+                    )
+                    self._send_abort_outputs(aborted_reqs)
                     for _ in range(50):
                         if not self.scheduler.has_unfinished_requests():
                             break
                         time.sleep(0.1)
-                    self.scheduler.finished_req_ids.clear()  # hack
-                    self.batch_queue.clear()
+                    # 不要 clear finished_req_ids：scheduler 用该集合跟踪
+                    # 已完成请求，清空会破坏后续 scheduler output 跟踪。
+                    if self.batch_queue is not None:
+                        self.batch_queue.clear()
                 elif wait_set:
                     logger.info("WaitNewDeployment received, waiting for RecvNewDeployment")
                     executor.wait_new_deployment.clear()
@@ -326,7 +338,10 @@ def patch_engine_core() -> None:
                         logger.info("RecvNewDeployment received, executing strategy")
                         recv_set.clear()
                         # 阻塞新请求进入，立即中止正在执行的请求
-                        self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
+                        aborted_reqs = self.scheduler.finish_requests(
+                            None, RequestStatus.FINISHED_ABORTED
+                        )
+                        self._send_abort_outputs(aborted_reqs)
                         for _ in range(50):
                             if not self.scheduler.has_unfinished_requests():
                                 break
@@ -387,20 +402,22 @@ def patch_engine_core() -> None:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             logger.info("step_with_batch_queue: self.scheduler.has_requests() == True")
+            # patched: 获取零中断相关变量状态
+            executor = getattr(self, "model_executor", None)
+            world_size = getattr(executor, "world_size", None) if executor else None
+            paused = getattr(self, "_paused_for_restart", False)
+
+            if world_size == 0 or paused:
+                # patched: 针对DP域下所有worker都关停的情况, 直接返回，不执行任何动作。
+                # 必须在 schedule() 之前判断：空闲/暂停的 executor 不能把请求
+                # 调度进 RUNNING 状态（永远不会有 update_from_output 消费它）。
+                return None, True
+
             scheduler_output = self.scheduler.schedule()
             with self.log_error_detail(scheduler_output):
-                # patched: 获取零中断相关变量状态
-                executor = getattr(self, "model_executor", None)
-                world_size = getattr(executor, "world_size", None) if executor else None
-                paused = getattr(self, "_paused_for_restart", False)
-
-                if world_size == 0 or paused:
-                    # patched: 针对DP域下所有worker都关停的情况, 直接返回，不执行任何动作
-                    return None, True
-                else:
-                    exec_future = self.model_executor.execute_model(
-                        scheduler_output, non_block=True
-                    )
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
 
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
@@ -580,12 +597,15 @@ def patch_engine_core() -> None:
         outputs.engine_index = engine_core.engine_index
 
         try:
-            vllm_config = engine_core.vllm_config
-            api_server_count = vllm_config.parallel_config._api_process_count
-            for client_idx in range(api_server_count):
+            # 与 idle 通知保持一致，使用本 EngineCore 实际连接的输出
+            # socket 数量，不要用 _api_process_count：两者在多 client /
+            # external LB / hybrid LB 下并不相等，漏发会导致客户端无法
+            # 清除 idle 标记。
+            num_output_sockets = len(engine_core.addresses.outputs)
+            for client_idx in range(num_output_sockets):
                 engine_core.output_queue.put_nowait((client_idx, outputs))  # 发给所有client
             logger.info(
-                f"Engine {engine_core.engine_index} sent recovered notification to all {api_server_count} clients")
+                f"Engine {engine_core.engine_index} sent recovered notification to all {num_output_sockets} clients")
 
             # 只有DP>1时才有coordinator，此时使用DPEngineCoreProc，特殊负载分数才应生效
             if isinstance(engine_core, DPEngineCoreProc):
@@ -593,6 +613,35 @@ def patch_engine_core() -> None:
                 logger.info(f"Engine {engine_core.engine_index} sent recovered notification to coordinator")
         except Exception as e:
             logger.warning(f"Failed to send recovered notification: {e}")
+
+    def _will_restart_workers(executor) -> bool:
+        """Return whether executing the current strategy will restart workers.
+
+        The legacy 0829 executor does not expose the idempotency/restart
+        predicate used by the DeepSeek-V4 variant, so reconstruct it from its
+        strategy branches: DEGRADE/RECOVER always restart, PD_REBUILD only
+        restarts on the fault instance (healthy instances update the KV
+        connector in place via RPC).
+        """
+        strategy = getattr(executor, "current_strategy", None)
+        if strategy is None:
+            return False
+        if strategy.deploy_type in (DeployType.DEGRADE, DeployType.RECOVER):
+            return True
+        if strategy.deploy_type == DeployType.PD_REBUILD:
+            if hasattr(executor, "_is_fault_instance_for_pd"):
+                try:
+                    return bool(
+                        executor._is_fault_instance_for_pd(strategy)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[PD] failed to determine fault instance; assuming "
+                        "workers will restart: %s",
+                        exc,
+                    )
+            return True
+        return False
 
     def _execute_deployment_strategy(engine_core, executor):
         if not (hasattr(executor, "current_strategy") and executor.current_strategy):
@@ -602,9 +651,13 @@ def patch_engine_core() -> None:
         if hasattr(executor, "handle_new_deployment"):
             # 1. 通过修改executor的vllm_config, 可以修改worker connector的engine-id
             vllm_config = executor.vllm_config
+            will_restart = _will_restart_workers(executor)
 
-            # 仅在 PD 分离场景（kv_transfer_config 不为 None）下执行 engine_id 更新逻辑
-            if is_pd_separated(vllm_config):
+            # 仅在 PD 分离场景（kv_transfer_config 不为 None）且确实会重启
+            # worker 时执行 engine_id 更新逻辑。幂等跳过/健康实例 RPC 不会
+            # 换 worker，此时改 scheduler 侧 engine_id 会让 worker 与 D 端
+            # 仍持有旧 id，PD KV 链指向陈旧元数据。
+            if is_pd_separated(vllm_config) and will_restart:
                 from uuid import uuid4
                 ori_engine_id = vllm_config.kv_transfer_config.engine_id
                 ori_engine_id_components = ori_engine_id.replace('_', '-').split('-')
@@ -639,20 +692,44 @@ def patch_engine_core() -> None:
 
             success = executor.handle_new_deployment()
 
-            # 仅 PD 分离场景
-            if is_pd_separated(vllm_config):
-                # 5. 更新 scheduler connector 的 side_channel_port
-                pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
-                # Handshake base port
+            # 仅 PD 分离场景且 worker 确实重启后刷新 scheduler connector。
+            if success and is_pd_separated(vllm_config) and will_restart:
+                if hasattr(executor, "update_kv_connector_metadata"):
+                    executor.update_kv_connector_metadata(engine_core)
+
+                # 5. 更新 scheduler connector 的 side_channel_port 与拓扑字段。
+                # 异构 TP（DP4TP(3,4,4,4)）下 DP 端口偏移是累计的
+                # 0/3/7/11，不能再用 dp_rank * tp_size 的均匀公式；tp_size /
+                # max_device_id 也必须在每次部署刷新，否则 RECOVER 回对称后
+                # 仍向 D 端通告旧的异构布局。
+                parallel_config = vllm_config.parallel_config
+                if getattr(parallel_config, "is_heterogeneous_tp", False):
+                    port_offset = parallel_config.get_rank_offset_for_dp(
+                        parallel_config.data_parallel_rank
+                    )
+                    max_device_id = parallel_config.world_size_across_dp
+                else:
+                    port_offset = (
+                        parallel_config.data_parallel_rank
+                        * parallel_config.tensor_parallel_size
+                        * parallel_config.pipeline_parallel_size
+                        * parallel_config.prefill_context_parallel_size
+                    )
+                    max_device_id = (
+                        parallel_config.tensor_parallel_size
+                        * parallel_config.data_parallel_size
+                        * parallel_config.pipeline_parallel_size
+                    )
                 side_channel_port = (
-                        vllm_config.kv_transfer_config.kv_port
-                        + vllm_config.parallel_config.data_parallel_rank
-                        * vllm_config.parallel_config.tensor_parallel_size
-                        * vllm_config.parallel_config.pipeline_parallel_size
-                        * pcp_size
+                    vllm_config.kv_transfer_config.kv_port + port_offset
                 )
 
+                sched_kv_connector = engine_core.scheduler.get_kv_connector()
                 sched_kv_connector.connector_scheduler.side_channel_port = side_channel_port
+                sched_kv_connector.connector_scheduler.tp_size = (
+                    parallel_config.tensor_parallel_size
+                )
+                sched_kv_connector.connector_scheduler.max_device_id = max_device_id
                 logger.info(
                     f"[PD] reset executor's sched_kv_connector.connector_scheduler.side_channel_port={side_channel_port}")
 

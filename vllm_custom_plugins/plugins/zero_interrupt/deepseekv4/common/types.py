@@ -119,6 +119,24 @@ class DeployStrategy:
     engine_parallel_config: list[EngineParallelConfig]
     engine_npu_healthy_state: list[EngineNPUHealthyState]
     update_engine_info: UpdateEngineInfo | None = None
+    strategy_generation: str | None = None
+    """Idempotency/rendezvous generation set by the triggering client.
+
+    Every executor in one trigger wave receives the same value.  A different
+    value forces executors that already reached the target topology to join a
+    fresh full-restart barrier instead of short-circuiting, which lets an
+    executor that missed the previous partial trigger wave recover together
+    with its peers.  ``None`` preserves the legacy topology-only idempotency.
+    """
+    barrier_master_port: int | None = None
+    """Fresh TCPStore rendezvous port selected by the triggering client.
+
+    Present when ``strategy_generation`` is present: every executor in the
+    trigger wave receives the same pre-checked free port, so a full-restart
+    barrier no longer depends on each executor's local barrier-port pool
+    state (which can drift after a partially delivered wave).  ``None``
+    preserves the legacy local-pool selection for decision-center payloads.
+    """
 
 
 @dataclass

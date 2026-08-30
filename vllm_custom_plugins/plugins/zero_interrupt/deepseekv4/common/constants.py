@@ -48,3 +48,11 @@ VLLM_SERVICE_ID = os.getenv("VLLM_SERVICE_ID", str(uuid.uuid4()))
 API_INIT_EXECUTOR_STATE = "/api/v1/decision_center/init_executor_state"
 API_DEPLOY = "/api/v1/executor/deploy"
 API_REPORT_DEPLOY_STATUS = "/api/v1/decision_center/report_deploy_status"
+
+# =============================================================================
+# Engine-core <-> DPLB client 空转引擎哨兵值
+# =============================================================================
+# 契约：engine_core_patch._send_idle_notification 用该负载分数标记空转
+# engine，core_client_patch.process_engine_outputs 据此把该 engine 从路由
+# 中摘除（num_waiting/num_running 同时 >= 该值即为空转；恢复通知为 0/0）。
+VLLM_ITS_IDLE_LOAD_SCORE = 999999

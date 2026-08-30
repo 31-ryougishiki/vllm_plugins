@@ -136,13 +136,18 @@ def _rebuild_col_weights(self, output_size: int, ratios: list[int]) -> None:
     from vllm.distributed.utils import get_tp_partition_size
 
     output_sizes = list(getattr(self, "output_sizes", [output_size]) or [output_size])
-    self.output_size_per_partition = get_tp_partition_size(
-        output_size, self.tp_rank, self.tp_size, ratios
-    )
     self.output_partition_sizes = [
         get_tp_partition_size(size, self.tp_rank, self.tp_size, ratios)
         for size in output_sizes
     ]
+    # Merged-column layers hold the concatenation of each column's partition
+    # for this rank.  The last rank receives each column's division
+    # remainder (see get_tp_partition_size), so the per-rank total MUST be
+    # derived from the per-column partition sizes: computing it from
+    # sum(output_sizes) would disagree with the merged weight/bias layout
+    # whenever a column size is not divisible by sum(ratios), leaving the
+    # bias parameter short on the last rank (silent wrong output).
+    self.output_size_per_partition = sum(self.output_partition_sizes)
 
     assert self.quant_method is not None
     self.quant_method.create_weights(
@@ -657,12 +662,10 @@ def _patched_merged_weight_loader(
             param_data.copy_(loaded_weight)
             return
 
-        output_sizes = (
-            self.output_sizes[loaded_shard_id[0] : loaded_shard_id[-1] + 1]
-            if loaded_shard_id is not None
-            else self.output_sizes
-        )
-        current_shard_offset = 0
+        if isinstance(loaded_shard_id, tuple):
+            shard_ids = list(loaded_shard_id)
+        else:
+            shard_ids = list(range(len(self.output_sizes)))
         use_bitsandbytes_4bit = getattr(
             param, "use_bitsandbytes_4bit", False
         )
@@ -675,12 +678,8 @@ def _patched_merged_weight_loader(
                 "Shard id with multiple indices is not supported "
                 "for BNB quantization with TP yet."
             )
-        shard_offsets: list[tuple[int, int, int]] = []
-        for i, output_size in enumerate(output_sizes):
-            shard_offsets.append((i, current_shard_offset, output_size))
-            current_shard_offset += output_size
         packed_dim = getattr(param, "packed_dim", None)
-        for shard_id, shard_offset, shard_size in shard_offsets:
+        for full_shard_id in shard_ids:
             from vllm.model_executor.layers.linear import (
                 adjust_bitsandbytes_4bit_shard,
                 adjust_block_scale_shard,
@@ -689,6 +688,15 @@ def _patched_merged_weight_loader(
             from vllm.model_executor.parameter import (
                 BlockQuantScaleParameter,
             )
+
+            # Slice the checkpoint to the FULL column for this shard id,
+            # exactly like the stock tuple path.  The int-shard
+            # ``self.weight_loader`` call below performs the ratio-aware TP
+            # narrowing; pre-narrowing here would double-shift the weight.
+            # The only correction vs stock is passing the real column index
+            # instead of the relative enumerate index.
+            shard_offset = sum(self.output_sizes[:full_shard_id])
+            shard_size = self.output_sizes[full_shard_id]
 
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
@@ -711,22 +719,33 @@ def _patched_merged_weight_loader(
                 }
                 orig_offsets["total"] = (self.output_size, 0)
                 shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
-                    param, orig_offsets, str(shard_id)
+                    param, orig_offsets, str(full_shard_id)
                 )
 
             loaded_weight_shard = loaded_weight.narrow(
                 output_dim, shard_offset, shard_size
             )
-            self.weight_loader(param, loaded_weight_shard, shard_id)
+            self.weight_loader(param, loaded_weight_shard, full_shard_id)
         return
 
     assert loaded_shard_id < len(self.output_sizes)
     if output_dim is not None:
-        total_ratio = sum(ratios)
+        # The merged parameter layout concatenates each column's partition
+        # for this rank.  The offset of column ``loaded_shard_id`` is the
+        # cumulative sum of the ACTUAL partition sizes of the preceding
+        # columns, not ``s * ratio // total_ratio``: when a column size is
+        # not divisible by ``sum(ratios)`` the remainder is assigned to the
+        # last rank (see get_tp_partition_size), and the floor approximation
+        # would under-count that rank's offset and silently misalign the
+        # loaded weight shard.
         local_offset = 0
         for i in range(loaded_shard_id):
-            s = self.output_sizes[i]
-            local_offset += s * ratios[self.tp_rank] // total_ratio
+            local_offset += get_tp_partition_size(
+                self.output_sizes[i],
+                self.tp_rank,
+                self.tp_size,
+                ratios,
+            )
         shard_offset = local_offset
         shard_size = get_tp_partition_size(
             self.output_sizes[loaded_shard_id],
@@ -777,10 +796,24 @@ def _patched_merged_weight_loader(
         param_data = param_data.narrow(
             output_dim, shard_offset, shard_size
         )
-        _full_sz = self.output_sizes[loaded_shard_id]
+        # ``shard_size`` above has already been converted to block-scale /
+        # packed units by the quant adjustments.  Compute the checkpoint
+        # start in ORIGINAL output units and apply the same conversions so
+        # rank>0 does not narrow at a floor-of-packed-dimension offset.
         start_idx = get_tp_partition_offset(
-            _full_sz, self.tp_rank, self.tp_size, ratios
+            self.output_sizes[loaded_shard_id],
+            self.tp_rank,
+            self.tp_size,
+            ratios,
         )
+        if isinstance(param, BlockQuantScaleParameter):
+            weight_block_size = getattr(self, "weight_block_size", None)
+            _, start_idx = adjust_block_scale_shard(
+                weight_block_size, 0, start_idx
+            )
+        if packed_dim == output_dim:
+            start_idx = round(start_idx // param.packed_factor)
+            _, start_idx = adjust_marlin_shard(param, 0, start_idx)
         if not is_sharded_weight:
             loaded_weight = loaded_weight.narrow(
                 output_dim, start_idx, shard_size
@@ -851,29 +884,88 @@ def _patched_merged_weight_loader_v2(
             param.load_merged_column_weight(loaded_weight=loaded_weight)
             return
 
-        output_sizes = (
-            [self.output_sizes[idx] for idx in loaded_shard_id]
-            if loaded_shard_id
-            else None
-        )
-        if isinstance(param, BlockQuantScaleParameter):
-            weight_block_size = getattr(self, "weight_block_size", None)
-            output_sizes = [
-                adjust_block_scale_shard(weight_block_size, size, 0)[0]
-                for size in (output_sizes or self.output_sizes)
-            ]
-        self._load_fused_module_from_checkpoint(
-            param, loaded_weight, output_sizes=output_sizes
-        )
+        # Split the fused checkpoint into its columns and feed each column
+        # through the ratio-aware int-shard path below.  Do NOT delegate to
+        # ``_load_fused_module_from_checkpoint``: that helper renumbers the
+        # tuple entries from 0, so for ``loaded_shard_id=(1, 2)`` the second
+        # column is loaded with shard_id=0 and its local offset / checkpoint
+        # start are computed from ``self.output_sizes[0]``.
+        if isinstance(loaded_shard_id, tuple):
+            shard_ids = list(loaded_shard_id)
+        else:
+            shard_ids = list(range(len(self.output_sizes)))
+        for full_shard_id in shard_ids:
+            from vllm.model_executor.parameter import (
+                PackedColumnParameter,
+                PackedvLLMParameter,
+            )
+
+            local_offset = 0
+            for i in range(full_shard_id):
+                local_offset += get_tp_partition_size(
+                    self.output_sizes[i],
+                    self.tp_rank,
+                    self.tp_size,
+                    ratios,
+                )
+            shard_size = get_tp_partition_size(
+                self.output_sizes[full_shard_id],
+                self.tp_rank,
+                self.tp_size,
+                ratios,
+            )
+            if isinstance(param, BlockQuantScaleParameter):
+                weight_block_size = getattr(self, "weight_block_size", None)
+                shard_size, local_offset = adjust_block_scale_shard(
+                    weight_block_size, shard_size, local_offset
+                )
+
+            # Slice the checkpoint to the FULL column for this shard id
+            # (stock `_load_fused_module_from_checkpoint` behaviour).  The
+            # patched v2 parameter loader then applies the ratio-aware TP
+            # narrow to that column slice.
+            column_offset = sum(self.output_sizes[:full_shard_id])
+            column_size = self.output_sizes[full_shard_id]
+            if isinstance(param, BlockQuantScaleParameter):
+                weight_block_size = getattr(self, "weight_block_size", None)
+                column_size, column_offset = adjust_block_scale_shard(
+                    weight_block_size, column_size, column_offset
+                )
+            elif (
+                isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
+                and param.packed_dim == param.output_dim
+            ):
+                column_size, column_offset = (
+                    param.adjust_shard_indexes_for_packing(
+                        shard_size=column_size, shard_offset=column_offset
+                    )
+                )
+            loaded_column = loaded_weight.narrow(
+                param.output_dim, column_offset, column_size
+            )
+            param.load_merged_column_weight(
+                loaded_weight=loaded_column,
+                shard_id=full_shard_id,
+                shard_offset=local_offset,
+                shard_size=shard_size,
+                tp_rank=self.tp_rank,
+                checkpoint_total_size=self.output_sizes[full_shard_id],
+            )
         return
 
     assert loaded_shard_id < len(self.output_sizes)
 
-    total_ratio = sum(ratios)
+    # Same layout rule as the v1 loader above: accumulate the actual
+    # partition sizes of the preceding columns so the last rank's offset
+    # includes their division remainders.
     local_offset = 0
     for i in range(loaded_shard_id):
-        s = self.output_sizes[i]
-        local_offset += s * ratios[self.tp_rank] // total_ratio
+        local_offset += get_tp_partition_size(
+            self.output_sizes[i],
+            self.tp_rank,
+            self.tp_size,
+            ratios,
+        )
     shard_offset = local_offset
     shard_size = get_tp_partition_size(
         self.output_sizes[loaded_shard_id],
@@ -894,6 +986,7 @@ def _patched_merged_weight_loader_v2(
         shard_offset=shard_offset,
         shard_size=shard_size,
         tp_rank=self.tp_rank,
+        checkpoint_total_size=self.output_sizes[loaded_shard_id],
     )
 
 

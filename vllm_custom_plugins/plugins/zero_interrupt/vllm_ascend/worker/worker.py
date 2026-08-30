@@ -1121,6 +1121,14 @@ class NPUWorker(WorkerBase):
                     HeterogeneousDPConfig(**cfg)
                     for cfg in heterogeneous_dp_config
                 ]
+            else:
+                # Symmetric RECOVER (heterogeneous_dp_config=None) must
+                # explicitly clear any hetero config carried by the
+                # deep-copied parallel_config.  Otherwise the stale
+                # is_heterogeneous_tp flag forces the worker back into the
+                # 15-rank asym group init instead of rebuilding symmetric
+                # TP/DP/EP groups.
+                asym_parallel_config.heterogeneous_dp_config = None
 
             self.vllm_config.parallel_config = asym_parallel_config
             # v0.23 hetero parallel_state 根据

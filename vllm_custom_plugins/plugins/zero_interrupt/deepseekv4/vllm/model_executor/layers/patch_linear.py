@@ -153,6 +153,14 @@ class ColumnParallelLinearAsymmetric(ColumnParallelLinear):
                     num_kv_heads * head_size,
                     num_kv_heads * getattr(self, "v_head_size", head_size)
                 ]
+        # Merged/QKV layers store the concatenation of each column's local
+        # partition.  The total per-rank output size must therefore be the
+        # SUM of the per-column partition sizes; the partition of the summed
+        # ``output_size`` only agrees when every column is divisible by
+        # sum(ratios).  Otherwise the last rank's remainders make the bias
+        # (and any consumer of output_size_per_partition) disagree with the
+        # merged weight layout.
+        self.output_size_per_partition = sum(self.output_partition_sizes)
 
         super(ColumnParallelLinear, self).__init__(
             input_size=input_size,
@@ -332,7 +340,8 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
 
         output_size = (
             self.total_num_heads * self.head_size
-            + 2 * self.total_num_kv_heads * self.v_head_size
+            + self.total_num_kv_heads
+            * (self.head_size + self.v_head_size)
         )
         self.output_sizes = [
             self.total_num_heads * self.head_size,  # q_proj
@@ -376,7 +385,10 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
             "q": 0,
             "k": self.num_heads * self.head_size,
             "v": (self.num_heads + self.num_kv_heads) * self.head_size,
-            "total": (self.num_heads + 2 * self.num_kv_heads) * self.head_size
+            "total": (
+                (self.num_heads + self.num_kv_heads) * self.head_size
+                + self.num_kv_heads * self.v_head_size
+            ),
         }
         return shard_offset_mapping.get(loaded_shard_id)
 
@@ -411,7 +423,7 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
             (
                 "v",
                 (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
-                self.total_num_kv_heads * self.head_size,
+                self.total_num_kv_heads * self.v_head_size,
             ),
         ]
 
@@ -441,9 +453,17 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
         self.validate_shard_id(loaded_shard_id)
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
-                param.load_qkv_weight(
-                    loaded_weight=loaded_weight, shard_id=0, tp_rank=self.tp_rank  # 新增tp_rank参数
-                )
+                # When weights are already fused on disk (e.g. Phi-3's
+                # qkv_proj), there is only a single scale for the entire
+                # fused matrix. Fill all slots (q, k, v) with this scale so
+                # later reductions (e.g. .max()) work on a fully initialized
+                # parameter instead of only slot 0.
+                for idx in range(param.data.shape[0]):
+                    param.load_qkv_weight(
+                        loaded_weight=loaded_weight,
+                        shard_id=idx,
+                        tp_rank=self.tp_rank,
+                    )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_qkv_weight(loaded_weight=loaded_weight, tp_rank=self.tp_rank)
@@ -533,7 +553,7 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
                 (
                     "v",
                     (self.total_num_heads + self.total_num_kv_heads) * self.head_size,
-                    self.total_num_kv_heads * self.head_size,
+                    self.total_num_kv_heads * self.v_head_size,
                 ),
             ]
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
@@ -543,6 +563,12 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
                 # Special case for Quantized Weights.
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
+                if isinstance(param, BlockQuantScaleParameter):
+                    weight_block_size = getattr(self, "weight_block_size", None)
+                    shard_size, shard_offset = adjust_block_scale_shard(
+                        weight_block_size, shard_size, shard_offset
+                    )
+
                 if packed_dim == output_dim:
                     shard_size = shard_size // param.packed_factor
                     shard_offset = shard_offset // param.packed_factor
@@ -562,11 +588,12 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
                         "v": (
                             (self.total_num_heads + self.total_num_kv_heads)
                             * self.head_size,
-                            self.total_num_kv_heads * self.head_size,
+                            self.total_num_kv_heads * self.v_head_size,
                         ),
                         "total": (
-                            (self.total_num_heads + 2 * self.total_num_kv_heads) *
-                            self.head_size,
+                            (self.total_num_heads + self.total_num_kv_heads)
+                            * self.head_size
+                            + self.total_num_kv_heads * self.v_head_size,
                             0,
                         ),
                     }
@@ -585,32 +612,66 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
 
         # If output dim is defined, use the default loading process.
         if output_dim is not None:
+            world_split_size = sum(self.tp_asymmetric_shardings)
+            shard_id_cum = sum(
+                self.tp_asymmetric_shardings[: self.tp_rank]
+            )
             if loaded_shard_id == "q":
                 shard_offset = 0
                 shard_size = self.num_heads * self.head_size
+                start_idx = (
+                    self.total_num_heads
+                    * shard_id_cum
+                    // world_split_size
+                    * self.head_size
+                )
             elif loaded_shard_id == "k":
                 shard_offset = self.num_heads * self.head_size
                 shard_size = self.num_kv_heads * self.head_size
+                start_idx = (
+                    self.total_num_kv_heads
+                    * shard_id_cum
+                    // world_split_size
+                    * self.head_size
+                )
             elif loaded_shard_id == "v":
                 shard_offset = (self.num_heads + self.num_kv_heads) * self.head_size
-                shard_size = self.num_kv_heads * self.head_size
+                shard_size = self.num_kv_heads * self.v_head_size
+                start_idx = (
+                    self.total_num_kv_heads
+                    * shard_id_cum
+                    // world_split_size
+                    * self.v_head_size
+                )
 
+            # All quant/pack adjustments below convert ``shard_size`` /
+            # ``shard_offset`` away from original output units.  Convert the
+            # checkpoint start offset through the same transformations so
+            # rank>0 does not narrow packed/block-scale tensors with an
+            # original-unit offset.
             if isinstance(param, BlockQuantScaleParameter):
                 weight_block_size = getattr(self, "weight_block_size", None)
                 shard_size, shard_offset = adjust_block_scale_shard(
                     weight_block_size, shard_size, shard_offset
+                )
+                _, start_idx = adjust_block_scale_shard(
+                    weight_block_size, 0, start_idx
                 )
             # Special case for Quantized Weights.
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.packed_factor
-                shard_offset = shard_offset // param.packed_factor
+                shard_size = round(shard_size // param.packed_factor)
+                shard_offset = round(shard_offset // param.packed_factor)
+                start_idx = round(start_idx // param.packed_factor)
 
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
+                )
+                _, start_idx = adjust_marlin_shard(
+                    param, 0, start_idx
                 )
 
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
@@ -628,10 +689,11 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
                     ),
                     "v": (
                         (self.num_heads + self.num_kv_heads) * self.head_size,
-                        self.num_kv_heads * self.head_size,
+                        self.num_kv_heads * self.v_head_size,
                     ),
                     "total": (
-                        (self.num_heads + 2 * self.num_kv_heads) * self.head_size,
+                        (self.num_heads + self.num_kv_heads) * self.head_size
+                        + self.num_kv_heads * self.v_head_size,
                         0,
                     ),
                 }
@@ -641,16 +703,6 @@ class QKVParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
 
-            # tp_asymmetric_shardings = [1,1,2] if self.tp_size == 3 else [1,1,1,1]
-            world_split_size = sum(self.tp_asymmetric_shardings)
-            shard_id = sum([self.tp_asymmetric_shardings[i] for i in range(self.tp_rank)])
-            if loaded_shard_id == "q":
-                start_idx = (self.total_num_heads * shard_id //
-                             world_split_size * self.head_size)
-            else:
-                start_idx = (self.total_num_kv_heads * shard_id //
-                             world_split_size * self.head_size)
-            # end
             if not is_sharded_weight:
                 loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
@@ -830,6 +882,7 @@ class RowParallelLinearAsymmetric(RowParallelLinear):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
+        assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -1007,12 +1060,10 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
                 param_data.copy_(loaded_weight)
                 return
 
-            output_sizes = (
-                self.output_sizes[loaded_shard_id[0]: loaded_shard_id[-1] + 1]
-                if loaded_shard_id is not None
-                else self.output_sizes
-            )
-            current_shard_offset = 0
+            if isinstance(loaded_shard_id, tuple):
+                shard_ids = list(loaded_shard_id)
+            else:
+                shard_ids = list(range(len(self.output_sizes)))
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
             if (
                     use_bitsandbytes_4bit
@@ -1023,12 +1074,15 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
                     "Shard id with multiple indices is not supported "
                     "for BNB quantization with TP yet."
                 )
-            shard_offsets: list[tuple[int, int, int]] = []
-            for i, output_size in enumerate(output_sizes):
-                shard_offsets.append((i, current_shard_offset, output_size))
-                current_shard_offset += output_size
             packed_dim = getattr(param, "packed_dim", None)
-            for shard_id, shard_offset, shard_size in shard_offsets:
+            for full_shard_id in shard_ids:
+                # Keep the ORIGINAL column index when slicing the fused
+                # checkpoint.  Relative enumerate indices would make the
+                # recursive int-shard call compute the local offset and
+                # checkpoint start from the wrong column (e.g. tuple (1, 2)
+                # would load column 2 with shard_id=0's geometry).
+                shard_offset = sum(self.output_sizes[:full_shard_id])
+                shard_size = self.output_sizes[full_shard_id]
                 # Special case for Quantization.
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
@@ -1055,14 +1109,14 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
                     }
                     orig_offsets["total"] = (self.output_size, 0)
                     shard_size, shard_offset = adjust_bitsandbytes_4bit_shard(
-                        param, orig_offsets, str(shard_id)
+                        param, orig_offsets, str(full_shard_id)
                     )
 
                 loaded_weight_shard = loaded_weight.narrow(
                     output_dim, shard_offset, shard_size
                 )
 
-                self.weight_loader(param, loaded_weight_shard, shard_id)
+                self.weight_loader(param, loaded_weight_shard, full_shard_id)
             return
 
         assert loaded_shard_id < len(self.output_sizes)
@@ -1076,7 +1130,6 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
             full_subweight_size = self.output_sizes[loaded_shard_id]
             if is_asymmetric_active:
                 from vllm.distributed.utils import (
-                    get_tp_partition_offset,
                     get_tp_partition_size,
                 )
 
@@ -1086,15 +1139,8 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
                     self.tp_size,
                     self.tp_asymmetric_shardings,
                 )
-                start_idx = get_tp_partition_offset(
-                    full_subweight_size,
-                    self.tp_rank,
-                    self.tp_size,
-                    self.tp_asymmetric_shardings,
-                )
             else:
                 shard_size = divide(full_subweight_size, self.tp_size)
-                start_idx = self.tp_rank * shard_size
 
             # 本地 param 中的偏移计算
             # 使用累积偏移确保每个shard写入正确位置
@@ -1136,6 +1182,35 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
             # ========== 执行 narrow ==========
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
 
+            # The checkpoint start offset must be in the SAME units as the
+            # adjusted ``shard_size``.  For symmetric sharding stock vLLM uses
+            # ``tp_rank * shard_size`` after the quant/pack adjustment; for
+            # asymmetric sharding compute the ratio offset in ORIGINAL output
+            # units first and apply the same block-scale/packing conversions,
+            # otherwise rank>0 narrows at a floor-of-packed-dimension offset
+            # that disagrees with the actual packed partition boundaries.
+            if is_asymmetric_active:
+                from vllm.distributed.utils import get_tp_partition_offset
+
+                start_idx = get_tp_partition_offset(
+                    self.output_sizes[loaded_shard_id],
+                    self.tp_rank,
+                    self.tp_size,
+                    self.tp_asymmetric_shardings,
+                )
+                if isinstance(param, BlockQuantScaleParameter):
+                    weight_block_size = getattr(self, "weight_block_size", None)
+                    _, start_idx = adjust_block_scale_shard(
+                        weight_block_size, 0, start_idx
+                    )
+                if packed_dim == output_dim:
+                    start_idx = round(start_idx // param.packed_factor)
+                    _, start_idx = adjust_marlin_shard(
+                        param, 0, start_idx
+                    )
+            else:
+                start_idx = self.tp_rank * shard_size
+
             if not is_sharded_weight:
                 loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
@@ -1149,6 +1224,7 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
             ignore_warning = getattr(param, "ignore_warning", False)
 
 
+        assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
 
@@ -1157,6 +1233,7 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
             param: BasevLLMParameter,
             loaded_weight: torch.Tensor,
             output_sizes: list[int] | None = None,
+            shard_ids: list[int] | None = None,
     ):
         """
         Handle special case for models where MLP layers are already
@@ -1167,19 +1244,28 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
         An example of a model with these fused layers:
         https://huggingface.co/microsoft/Phi-3-mini-4k-instruct
         """
+        del output_sizes  # only kept for stock signature compatibility
 
-        current_shard_offset = 0
-        shard_offsets: list[tuple[int, int, int]] = []
-        output_sizes = output_sizes or self.output_sizes
-        for i, output_size in enumerate(output_sizes):
-            shard_offsets.append((i, current_shard_offset, output_size))
-            current_shard_offset += output_size
+        if shard_ids is None:
+            shard_ids = list(range(len(self.output_sizes)))
 
-        for shard_id, shard_offset, shard_size in shard_offsets:
+        for full_shard_id in shard_ids:
+            # Use the ORIGINAL absolute checkpoint offset of the column, not
+            # a cumulative offset over a sliced ``output_sizes`` list:
+            # ``loaded_shard_id=(1, 2)`` must slice columns 1 and 2 of the
+            # full fused tensor, not columns 0 and 1.
+            shard_offset = sum(self.output_sizes[:full_shard_id])
+            shard_size = self.output_sizes[full_shard_id]
+
             # Special case for Quantization.
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
-            if (
+            if isinstance(param, BlockQuantScaleParameter):
+                weight_block_size = getattr(self, "weight_block_size", None)
+                shard_size, shard_offset = adjust_block_scale_shard(
+                    weight_block_size, shard_size, shard_offset
+                )
+            elif (
                     isinstance(param, (PackedColumnParameter, PackedvLLMParameter))
                     and param.packed_dim == param.output_dim
             ):
@@ -1190,7 +1276,7 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
             loaded_weight_shard = loaded_weight.narrow(
                 param.output_dim, shard_offset, shard_size
             )
-            self.weight_loader_v2(param, loaded_weight_shard, shard_id)
+            self.weight_loader_v2(param, loaded_weight_shard, full_shard_id)
 
     def weight_loader_v2(
             self,
@@ -1201,25 +1287,31 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
         self.validate_shard_id(loaded_shard_id)
         if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
             if isinstance(param, PerTensorScaleParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
+                if isinstance(loaded_shard_id, tuple):
+                    for idx in loaded_shard_id:
+                        param.load_merged_column_weight(
+                            loaded_weight=loaded_weight, shard_id=idx
+                        )
+                else:
+                    # Fused-on-disk MLP has one scale for the whole matrix;
+                    # fill every column slot so later reductions operate on
+                    # an initialized parameter instead of only slot 0.
+                    for idx in range(param.data.shape[0]):
+                        param.load_merged_column_weight(
+                            loaded_weight=loaded_weight, shard_id=idx
+                        )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 param.load_merged_column_weight(loaded_weight=loaded_weight)
                 return
-            output_sizes = (
-                [self.output_sizes[idx] for idx in loaded_shard_id]
-                if loaded_shard_id
-                else None
+            shard_ids = (
+                list(loaded_shard_id)
+                if isinstance(loaded_shard_id, tuple)
+                else list(range(len(self.output_sizes)))
             )
-            if isinstance(param, BlockQuantScaleParameter):
-                weight_block_size = getattr(self, "weight_block_size", None)
-                output_sizes = [
-                    adjust_block_scale_shard(weight_block_size, size, 0)[0]
-                    for size in (output_sizes or self.output_sizes)
-                ]
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(
-                param, loaded_weight, output_sizes=output_sizes
+                param, loaded_weight, shard_ids=shard_ids
             )
             return
 
@@ -1233,11 +1325,19 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
             from vllm.distributed.utils import get_tp_partition_size
 
             ratios = self.tp_asymmetric_shardings
-            total_ratio = sum(ratios)
+            # The merged parameter layout concatenates each column's
+            # partition for this rank.  Accumulate the ACTUAL partition
+            # sizes of the preceding columns (the last rank receives the
+            # division remainder, see get_tp_partition_size); the floor
+            # approximation s * ratio // total would under-count that
+            # rank's offset and silently misalign the loaded shard.
             local_offset = 0
             for i in range(loaded_shard_id):
-                local_offset += (
-                    self.output_sizes[i] * ratios[self.tp_rank] // total_ratio
+                local_offset += get_tp_partition_size(
+                    self.output_sizes[i],
+                    self.tp_rank,
+                    self.tp_size,
+                    ratios,
                 )
             shard_offset = local_offset
             shard_size = get_tp_partition_size(
@@ -1264,4 +1364,5 @@ class MergedColumnParallelLinearAsymmetric(ColumnParallelLinearAsymmetric):
             shard_offset=shard_offset,
             shard_size=shard_size,
             tp_rank=self.tp_rank,
+            checkpoint_total_size=self.output_sizes[loaded_shard_id],
         )

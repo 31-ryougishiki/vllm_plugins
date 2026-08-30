@@ -36,6 +36,7 @@ class ITSHttpServer:
             port: int = VLLM_ITS_HTTP_SERVER_PORT_START,
             strategy_sync_thread: Optional[Any] = None,
             expected_executor_id: Optional[str] = None,
+            status_provider: Optional[Any] = None,
     ):
         """Initialize the HTTP server.
 
@@ -44,9 +45,13 @@ class ITSHttpServer:
             strategy_sync_thread: Reference to StrategySyncThread for passive receiving
             expected_executor_id: If set, POST /deploy strategies whose
                 top-level executor_id does not match are rejected with 400.
+            status_provider: Optional zero-argument callable returning a dict
+                of executor runtime fields (e.g. world_size) merged into the
+                /status response.
         """
         self.port = port
         self.strategy_sync_thread = strategy_sync_thread
+        self.status_provider = status_provider
         self.expected_executor_id = (
             None
             if expected_executor_id is None
@@ -63,6 +68,10 @@ class ITSHttpServer:
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._shutdown_event = threading.Event()
+        # Reference to the running uvicorn Server so stop() can request a
+        # clean exit of server.run() (which otherwise never returns and
+        # keeps serving on the port after shutdown).
+        self._uvicorn_server: Any = None
 
         self._setup_routes()
 
@@ -106,10 +115,23 @@ class ITSHttpServer:
         @self._app.get("/api/v1/executor/status")
         async def status():
             """Get executor status."""
+            extra: dict[str, Any] = {}
+            if self.status_provider is not None:
+                try:
+                    provided = self.status_provider()
+                    if isinstance(provided, dict):
+                        extra.update(provided)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "status_provider failed while building /status "
+                        "response: %s",
+                        exc,
+                    )
             return {
                 "status": "running",
                 "port": self.port,
                 "strategy_sync_configured": self.strategy_sync_thread is not None,
+                **extra,
             }
 
         @self._app.get("/api/v1/executor/strategy")
@@ -142,7 +164,13 @@ class ITSHttpServer:
                     body = await request.body()
                     if not body:
                         raise HTTPException(status_code=400, detail="No data provided or invalid JSON")
-                    data = {}
+                    # A non-empty body that is not valid JSON must be
+                    # rejected.  Falling back to data={} would parse it as a
+                    # default DEGRADE strategy with an empty executor_id and
+                    # forward that to the strategy sync thread.
+                    raise HTTPException(
+                        status_code=400, detail="Invalid JSON body"
+                    )
 
                 # Parse the strategy from request
                 strategy = self._parse_deploy_request(data)
@@ -273,12 +301,31 @@ class ITSHttpServer:
                     new_engine_id=str(new_engine_id),
                 )
 
+        strategy_generation = data.get("strategy_generation")
+        if strategy_generation is not None:
+            strategy_generation = str(strategy_generation)
+
+        barrier_master_port = data.get("barrier_master_port")
+        if barrier_master_port is not None:
+            try:
+                barrier_master_port = int(barrier_master_port)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "barrier_master_port must be an integer, got "
+                        f"{barrier_master_port!r}"
+                    ),
+                )
+
         return DeployStrategy(
             deploy_type=deploy_type,
             executor_id=executor_id,
             engine_parallel_config=engine_parallel_config,
             engine_npu_healthy_state=engine_npu_healthy_state,
             update_engine_info=update_engine_info,
+            strategy_generation=strategy_generation,
+            barrier_master_port=barrier_master_port,
         )
 
     def start(self) -> None:
@@ -310,23 +357,38 @@ class ITSHttpServer:
                 log_level="warning",
                 access_log=False,
             )
-            server = uvicorn.Server(config)
+            self._uvicorn_server = uvicorn.Server(config)
+
+            # stop() may race with thread startup (for example when the
+            # executor shuts down immediately after a failed init).  If a
+            # stop was already requested, do not run the server: it would
+            # otherwise keep the port bound forever because uvicorn's
+            # run() loop never observes _running/_shutdown_event.
+            if not self._running or self._shutdown_event.is_set():
+                return
 
             # Run server
-            server.run()
+            self._uvicorn_server.run()
 
         except Exception as e:
             logger.error(f"HTTP server error: {e}")
         finally:
             self._running = False
+            self._uvicorn_server = None
 
     def stop(self) -> None:
         """Stop the HTTP server."""
-        if not self._running:
-            return
-
         self._running = False
         self._shutdown_event.set()
+        # server.run() does not observe _running/_shutdown_event; request a
+        # clean uvicorn exit so the port is actually released.  Do not early
+        # return when _running is already False: stop() can race with the
+        # server thread creating the uvicorn Server, and in that case the
+        # thread must still observe should_exit / _shutdown_event after it
+        # finishes constructing the server.
+        server = self._uvicorn_server
+        if server is not None:
+            server.should_exit = True
         logger.info("HTTP server stopped")
 
     def is_running(self) -> bool:

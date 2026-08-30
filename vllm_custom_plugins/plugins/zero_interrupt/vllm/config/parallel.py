@@ -406,7 +406,18 @@ class ParallelConfig:
     # [merge-0829] 兼容旧零中断非对称路径：允许 executor 显式覆盖
     # world_size_across_dp（asym_world_size）。DeepSeek-V4 异构路径不写
     # override，而是通过 heterogeneous_dp_config 计算。
-    world_size_across_dp: int = Field(default=0)
+    #
+    # NOTE: world_size_across_dp is NOT declared as a dataclass field here.
+    # It is a @property (with setter) further down.  Declaring it as a Field
+    # would make the property object itself the field default: constructor
+    # arguments would be silently ignored on read, and the phantom field
+    # would leak into dataclasses.fields() / compute_hash.  The setter
+    # stores the 0829 asym_world_size override in the private init=False
+    # field below, which the property prefers.
+    _world_size_across_dp_override: int | None = Field(
+        default=None, init=False
+    )
+    """Explicit asym_world_size override written by the 0829 legacy path."""
 
     @field_validator("disable_nccl_for_dp_synchronization", mode="wrap")
     @classmethod
@@ -587,7 +598,7 @@ class ParallelConfig:
         """world_size_across_dp is TPxPPxDP, it is the size of the world
         including data parallelism."""
         # 旧零中断非对称路径显式写入的 override 优先。
-        override = self.__dict__.get("_world_size_across_dp_override")
+        override = self._world_size_across_dp_override
         if override is not None:
             return override
         if self.is_heterogeneous_tp:
@@ -600,7 +611,7 @@ class ParallelConfig:
 
     @world_size_across_dp.setter
     def world_size_across_dp(self, value: int) -> None:
-        self.__dict__["_world_size_across_dp_override"] = value
+        self._world_size_across_dp_override = value
 
     @property
     def use_ubatching(self) -> bool:
@@ -903,13 +914,17 @@ class ParallelConfig:
             "numa_bind",
             "numa_bind_nodes",
             "numa_bind_cpus",
+            # 0829 legacy asym_world_size override is per-executor runtime
+            # topology bookkeeping, not a collective-communication shape.
+            "_world_size_across_dp_override",
         }
-        if self.is_heterogeneous_tp:
+        if self.is_heterogeneous_tp or self._world_size_across_dp_override is not None:
             # Under heterogeneous TP each DP rank intentionally has a
             # different tensor_parallel_size (e.g. 3 vs 4) and therefore a
             # different derived world_size, so both must not diverge the DP
             # worker configuration hash used to validate collective-
-            # communication consistency across DP ranks.
+            # communication consistency across DP ranks.  The 0829 legacy
+            # asym_world_size override has the same per-rank asymmetry.
             ignored_factors.update({"tensor_parallel_size", "world_size"})
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -966,10 +981,54 @@ class ParallelConfig:
             # Data parallel was specified in the engine args.
             if self.distributed_executor_backend == "external_launcher":
                 # For external launcher,
-                # we need to set the data parallel rank automatically
-                self.data_parallel_rank = int(os.environ["RANK"]) // (
-                    self.world_size // self.data_parallel_size
-                )
+                # we need to set the data parallel rank automatically.
+                global_rank = int(os.environ["RANK"])
+                if self.is_heterogeneous_tp:
+                    # Per-DP TP sizes are not uniform (e.g. [3,4,4,4]).
+                    # ``RANK // (total_world_size / dp_size)`` uses an
+                    # average width and maps ranks to the wrong DP.  Walk
+                    # the cumulative offsets instead.
+                    self.data_parallel_rank = next(
+                        (
+                            dp_rank
+                            for dp_rank in range(self.data_parallel_size)
+                            if self.get_rank_offset_for_dp(dp_rank)
+                            <= global_rank
+                            < self.get_rank_offset_for_dp(dp_rank)
+                            + self.get_tp_size_for_dp(dp_rank)
+                            * self.pipeline_parallel_size
+                            * self.prefill_context_parallel_size
+                        ),
+                        -1,
+                    )
+                    if self.data_parallel_rank < 0:
+                        raise ValueError(
+                            "RANK=%d does not fall into any heterogeneous "
+                            "DP rank offset range for tp sizes %s."
+                            % (
+                                global_rank,
+                                [
+                                    self.get_tp_size_for_dp(i)
+                                    for i in range(self.data_parallel_size)
+                                ],
+                            )
+                        )
+                    # ``data_parallel_rank`` was just derived from RANK, but
+                    # the hetero block at the top of __post_init__ applied the
+                    # per-DP TP/world size while the field still held its
+                    # default value.  Re-apply the TP size for the mapped DP
+                    # rank so non-zero ranks get their own tp_size (4 for
+                    # DP1..3 in DP4TP(3,4,4,4)) instead of DP0's 3, then keep
+                    # the external-launcher contract of storing the TOTAL
+                    # world size across DP ranks.
+                    self.tensor_parallel_size = self.get_tp_size_for_dp(
+                        self.data_parallel_rank
+                    )
+                    self.world_size = self.world_size_across_dp
+                else:
+                    self.data_parallel_rank = global_rank // (
+                        self.world_size // self.data_parallel_size
+                    )
                 logger.info(
                     "Set data_parallel_rank to %d automatically.",
                     self.data_parallel_rank,

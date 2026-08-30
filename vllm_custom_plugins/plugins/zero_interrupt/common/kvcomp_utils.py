@@ -211,7 +211,7 @@ class KVCompConfig:
         self.is_mla = False
         self.model_name = model_name
 
-        if hash_weight_type not in ["uniform", "fixed"]:
+        if hash_weight_type not in ["random", "fixed"]:
             raise ValueError(f"hash_weight_type should be either 'random' or 'fixed', but got {hash_weight_type}")
         self.hash_weight_type = hash_weight_type
 
@@ -223,7 +223,7 @@ class KVCompConfig:
         self.chunk_size = chunk_size
 
         if chunk_repre_method not in ["max", "min", "sum"]:
-            raise ValueError(f"chunk_size should be divisible by 128, but got {chunk_size}")
+            raise ValueError(f"chunk_repre_method should be one of 'max'/'min'/'sum', but got {chunk_repre_method}")
         self.chunk_repre_method = chunk_repre_method
 
         self.head_dim = head_dim
@@ -505,6 +505,11 @@ class KVCompMetaData:
     hash_encoder: HashEncoder
     hashk_caches: list[torch.Tensor]
 
+    # MLA 分支使用的 nope/rope 哈希缓存，由 initialize_kvcomp_metadata
+    # 创建空列表、init_and_bind_hashk_cache 在绑定阶段填充。
+    hashk_cache_nope: list[torch.Tensor] = field(default_factory=list)
+    hashk_cache_rope: list[torch.Tensor] = field(default_factory=list)
+
     num_actual_tokens: int = 0
     max_seq_len_for_hamming: int = 0
     slot_mapping: torch.Tensor = None
@@ -559,6 +564,8 @@ def initialize_kvcomp_metadata(
 
     hash_encoder = HashEncoder(kvcomp_config.head_dim, kvcomp_config.hash_bits, dtype, device)
     hashk_caches: list[torch.Tensor | None] = []
+    hashk_cache_nope: list[torch.Tensor | None] = []
+    hashk_cache_rope: list[torch.Tensor | None] = []
 
     # Build and return KVCompMetaData object
     kvcomp_meta_data = KVCompMetaData(
@@ -570,6 +577,8 @@ def initialize_kvcomp_metadata(
         hamming_output=hamming_output,
         hash_encoder=hash_encoder,
         hashk_caches=hashk_caches,
+        hashk_cache_nope=hashk_cache_nope,
+        hashk_cache_rope=hashk_cache_rope,
         seq_lens_for_reshape=seq_lens_for_reshape,
         valid_query_mask=valid_query_mask,
         seq_lens_from_hamming=seq_lens_from_hamming,

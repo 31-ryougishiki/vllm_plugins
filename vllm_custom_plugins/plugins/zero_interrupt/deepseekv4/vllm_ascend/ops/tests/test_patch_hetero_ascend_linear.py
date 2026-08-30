@@ -426,6 +426,14 @@ class TestHeteroAscendLinearScaffolding(unittest.TestCase):
             1: [1024, 512],
             2: [1536, 768],
         }
+        # ``weight_loader`` with an int ``loaded_shard_id`` receives the
+        # checkpoint tensor for THAT column only (fused tensors use
+        # ``loaded_shard_id=None``/a tuple in stock vLLM).  Feed one column
+        # tensor per shard so the assertion matches the real loader contract.
+        columns = [
+            full[: output_sizes[0]],
+            full[output_sizes[0] :],
+        ]
         for rank in range(3):
             partitions = expected_partitions[rank]
             param = _SimpleParam(
@@ -433,12 +441,13 @@ class TestHeteroAscendLinearScaffolding(unittest.TestCase):
             )
             layer = _SimpleMergedLayer(rank, output_sizes)
             for shard_id in range(2):
+                loaded = columns[shard_id]
                 self._patch._patched_merged_weight_loader(
-                    layer, param, full, loaded_shard_id=shard_id
+                    layer, param, loaded, loaded_shard_id=shard_id
                 )
                 local_offset = sum(partitions[:shard_id])
                 start = expected_starts[rank][shard_id]
-                expected = full[start : start + partitions[shard_id]]
+                expected = loaded[start : start + partitions[shard_id]]
                 self.assertTrue(
                     torch.equal(
                         param.data[

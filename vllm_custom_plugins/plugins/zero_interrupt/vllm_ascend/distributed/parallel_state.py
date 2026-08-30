@@ -13,10 +13,12 @@ _MLP_TP: GroupCoordinator | None = None
 _OTP: GroupCoordinator | None = None
 _LMTP: GroupCoordinator | None = None
 _EMBED_TP: GroupCoordinator | None = None
+_OLORA_TP: GroupCoordinator | None = None
 
 # flashcomm specific groups
 _FLASHCOMM2_OTP: GroupCoordinator | None = None
 _FLASHCOMM2_ODP: GroupCoordinator | None = None
+_FLASHCOMM2_ODP_OWNED = False
 _FC3_QUANT_X: GroupCoordinator | None = None
 
 # shard_weight across rank groups
@@ -53,8 +55,9 @@ def _init_ascend_heterogeneous_fallbacks():
         _FC3_QUANT_X = None
 
     # FlashComm2 fallbacks use TP group
-    global _FLASHCOMM2_ODP
+    global _FLASHCOMM2_ODP, _FLASHCOMM2_ODP_OWNED
     _FLASHCOMM2_ODP = get_tp_group()
+    _FLASHCOMM2_ODP_OWNED = False
 
     # All fine-grained TP groups remain None (not supported)
     global _OTP, _LMTP, _EMBED_TP, _MLP_TP, _OLORA_TP
@@ -71,6 +74,11 @@ def _init_ascend_heterogeneous_fallbacks():
     # FlashComm2 OTP not supported
     global _FLASHCOMM2_OTP
     _FLASHCOMM2_OTP = None
+
+    # Layer-sharding group is a symmetric-path construction; the hetero MoE
+    # path does not use it.
+    global _SHARD_WEIGHT
+    _SHARD_WEIGHT = None
 
 
 def init_ascend_model_parallel(
@@ -219,10 +227,11 @@ def init_ascend_model_parallel(
         flashcomm2_otp_size = get_ascend_config().flashcomm2_oproj_tensor_parallel_size
         num_fc2_oproj_tensor_parallel_groups: int = global_tp_size // flashcomm2_otp_size
         global _FLASHCOMM2_OTP
-        global _FLASHCOMM2_ODP
+        global _FLASHCOMM2_ODP, _FLASHCOMM2_ODP_OWNED
 
         _FLASHCOMM2_OTP = None
         _FLASHCOMM2_ODP = get_tp_group()
+        _FLASHCOMM2_ODP_OWNED = False
 
         if flashcomm2_otp_size > 1:
             odp_group_ranks: list[list[int]] = [
@@ -252,6 +261,7 @@ def init_ascend_model_parallel(
             _FLASHCOMM2_ODP = init_model_parallel_group(
                 odp_group_ranks, get_world_group().local_rank, backend, group_name="flashcomm2_odp"
             )
+            _FLASHCOMM2_ODP_OWNED = True
 
     def create_shard_weight_group(module_tp_group_ranks: None) -> GroupCoordinator:
         # Argument module_tp_group_ranks: The module specific tensor parallel group.
@@ -316,8 +326,15 @@ def init_ascend_model_parallel_asym(
         group_name="mc2",
     )
 
-    global _FLASHCOMM2_ODP
+    global _FLASHCOMM2_ODP, _FLASHCOMM2_ODP_OWNED
     _FLASHCOMM2_ODP = get_tp_group()
+    _FLASHCOMM2_ODP_OWNED = False
+
+    global _FLASHCOMM2_OTP
+    _FLASHCOMM2_OTP = None
+
+    global _SHARD_WEIGHT
+    _SHARD_WEIGHT = None
 
     global _DYNAMIC_EPLB, _FC3_QUANT_X
     _DYNAMIC_EPLB = None
@@ -408,6 +425,11 @@ def destroy_ascend_model_parallel():
         _OTP.destroy()
     _OTP = None
 
+    global _OLORA_TP
+    if _OLORA_TP:
+        _OLORA_TP.destroy()
+    _OLORA_TP = None
+
     global _P_TP
     if _P_TP:
         _P_TP.destroy()
@@ -418,10 +440,11 @@ def destroy_ascend_model_parallel():
         _FLASHCOMM2_OTP.destroy()
         _FLASHCOMM2_OTP = None
 
-    global _FLASHCOMM2_ODP
-    if _FLASHCOMM2_ODP and get_ascend_config().flashcomm2_oproj_tensor_parallel_size != 1:
+    global _FLASHCOMM2_ODP, _FLASHCOMM2_ODP_OWNED
+    if _FLASHCOMM2_ODP and _FLASHCOMM2_ODP_OWNED:
         _FLASHCOMM2_ODP.destroy()
-        _FLASHCOMM2_ODP = None
+    _FLASHCOMM2_ODP = None
+    _FLASHCOMM2_ODP_OWNED = False
 
     global _SHARD_WEIGHT
     if _SHARD_WEIGHT:

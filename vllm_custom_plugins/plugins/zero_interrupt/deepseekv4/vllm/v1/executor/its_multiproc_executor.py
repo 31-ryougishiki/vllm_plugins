@@ -75,6 +75,15 @@ from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.common import Strateg
 from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm_ascend.utils import patch_direct_register_custom_op
 patch_direct_register_custom_op()  # [h30014172] 防止 vllm_ascend.patch.worker 重复注册 unquantized_gemm operator
 
+# Full-restart barrier uses the same 2x int32 SUM collective shape as
+# ParallelConfig.sync_dp_state so a peer still inside _has_global_unfinished_reqs
+# can never be paired with a differently-shaped collective.  The first element
+# carries a private tag: if an executor that did NOT receive the strategy pairs
+# with this barrier through the normal DP sync, the result no longer equals
+# tag * world_size and the barrier fails closed instead of killing workers while
+# a peer is still serving the old world.
+_FULL_RESTART_BARRIER_TAG = 100_000_000
+
 # Try to import AscendMultiprocExecutor, fallback to MultiprocExecutor
 try:
     from vllm_ascend.patch.platform.patch_multiproc_executor import AscendMultiprocExecutor, AscendWorkerProc
@@ -143,6 +152,13 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         # valid only for the old manual trigger scripts.
         self._decision_center_executor_id: str | None = None
 
+        # Last successfully executed strategy_generation (see
+        # DeployStrategy.strategy_generation).  Used to distinguish a
+        # replayed strategy from a NEW trigger wave that must restart all
+        # executors again after the previous wave was only partially
+        # delivered.
+        self._executed_strategy_generation: str | None = None
+
         # Configuration
         self._fault_keep_enabled = VLLM_ITS_ENABLE_FAULT_KEEP
         self._http_port = VLLM_ITS_HTTP_SERVER_PORT_START
@@ -186,6 +202,31 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
         # Call parent class init
         super().__init__(vllm_config, monitor_workers)
+
+    def _get_runtime_status(self) -> dict[str, Any]:
+        """Return executor runtime fields for the ITS /status endpoint.
+
+        ``world_size`` is the deployment-relevant value: 0 means this
+        executor has been scaled to zero / is idle, which the test scripts
+        use to decide when a decision-center degrade has been applied even
+        though the idle engine's vLLM ``/health`` endpoint may still answer
+        200.
+        """
+        strategy = self.current_strategy
+        return {
+            "executor_state": (
+                self.executor_state.value
+                if getattr(self.executor_state, "value", None) is not None
+                else str(self.executor_state)
+            ),
+            "world_size": int(getattr(self, "world_size", 0) or 0),
+            "data_parallel_rank": int(
+                getattr(self.parallel_config, "data_parallel_rank", 0) or 0
+            ),
+            "deploy_type": (
+                strategy.deploy_type.value if strategy is not None else None
+            ),
+        }
 
     def collective_rpc(
         self,
@@ -327,6 +368,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             port=self._http_port,
             strategy_sync_thread=self._strategy_sync_thread,
             expected_executor_id=str(self.parallel_config.data_parallel_rank),
+            status_provider=self._get_runtime_status,
         )
         self._http_server.start()
         logger.info(f"Waiting for deployment strategy via HTTP POST to port {self._http_port}")
@@ -1024,8 +1066,18 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 # executor does not join the rendezvous.  Healthy executors
                 # advance once when they build the survivor group; if this
                 # executor skipped that advance, a later RECOVER would pick
-                # a different barrier port and deadlock.
-                self._next_barrier_master_port()
+                # a different barrier port and deadlock.  Strategies carrying
+                # an explicit barrier_master_port do not consume the local
+                # pool, so nothing to advance for them.
+                if strategy.barrier_master_port is None:
+                    self._next_barrier_master_port()
+                else:
+                    logger.info(
+                        "Full-restart barrier skipped: executor_id=%s uses "
+                        "client-supplied barrier port %d.",
+                        strategy.executor_id,
+                        int(strategy.barrier_master_port),
+                    )
                 logger.info(
                     "Full-restart barrier skipped: executor_id=%s is "
                     "scale-to-zero and cleans up independently.",
@@ -1108,8 +1160,21 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             # This must happen before `_get_engine_parallel_config` mutates
             # parallel_config.  The reserved port rotates once per barrier
             # generation, so the previous barrier's still-live dp_group never
-            # occupies the port selected here.
-            barrier_master_port = self._next_barrier_master_port()
+            # occupies the port selected here.  When the trigger client
+            # supplied a fresh barrier_master_port (generation-tagged manual
+            # waves), use it verbatim on every executor: local pools can be
+            # out of sync after a partially delivered wave, while the
+            # client-side port was checked free against ALL live groups.
+            client_barrier_port = getattr(strategy, "barrier_master_port", None)
+            if client_barrier_port is not None and int(client_barrier_port) > 0:
+                barrier_master_port = int(client_barrier_port)
+                logger.info(
+                    "Full-restart barrier: using client-supplied barrier "
+                    "master port %d.",
+                    barrier_master_port,
+                )
+            else:
+                barrier_master_port = self._next_barrier_master_port()
             barrier_group, barrier_store = self._build_surviving_dp_group(
                 surviving_dp_size,
                 surviving_dp_rank,
@@ -1170,8 +1235,13 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         # ParallelConfig.sync_dp_state (two int32 SUM). On the old group this
         # makes the barrier interchangeable with peers still inside
         # `_has_global_unfinished_reqs`; on the temporary survivor group it
-        # is a plain deterministic rendezvous.
-        tensor = torch.tensor([0, 0], dtype=torch.int32)
+        # is a plain deterministic rendezvous.  The private tag in the first
+        # element lets this side verify that only strategy-bearing executors
+        # contributed to the SUM (a peer that merely paired through the normal
+        # DP sync corrupts the tag and is detected below).
+        tensor = torch.tensor(
+            [_FULL_RESTART_BARRIER_TAG, 0], dtype=torch.int32
+        )
         work = torch.distributed.all_reduce(
             tensor,
             op=torch.distributed.ReduceOp.SUM,
@@ -1204,6 +1274,21 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 "(topology changes rebuild MoE weights and global "
                 "communication groups, so restarting only the faulty DP is "
                 "invalid)."
+            )
+
+        if (
+            int(tensor[0].item()) != _FULL_RESTART_BARRIER_TAG * world_size
+            or int(tensor[1].item()) != 0
+        ):
+            _discard_temporary_group()
+            raise RuntimeError(
+                "Heterogeneous full restart barrier detected a peer that "
+                "paired through the normal DP sync instead of the deployment "
+                f"barrier (sum={tensor.tolist()}, expected="
+                f"[{_FULL_RESTART_BARRIER_TAG * world_size}, 0]). "
+                "At least one DP executor did not receive the current "
+                "strategy; refusing to restart workers against a live old "
+                "world."
             )
 
         # Every surviving executor has now left the old dp_group. Adopt the
@@ -1242,7 +1327,14 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             if (
                 self.current_strategy is not None
                 and not getattr(self, "shutting_down", False)
-                and self._strategy_requires_full_restart(self.current_strategy)
+                and (
+                    self._strategy_requires_full_restart(self.current_strategy)
+                    or (
+                        self._is_new_strategy_generation(self.current_strategy)
+                        and self.current_strategy.deploy_type
+                        in (DeployType.DEGRADE, DeployType.RECOVER)
+                    )
+                )
             ):
                 self._barrier_for_full_restart()
                 logger.info(
@@ -1404,12 +1496,30 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         from vllm.v1.core.kv_cache_manager import KVCacheManager
 
         old_manager = getattr(scheduler, "kv_cache_manager", None)
-        hash_block_size = getattr(scheduler, "block_size", None)
+
+        # Recompute BOTH block sizes the same way EngineCoreProc does at
+        # startup.  ``scheduler.block_size`` only stores the scheduler/LCM
+        # alignment size; ``hash_block_size`` can differ for multi-group
+        # hybrid KV caches (GCD hashing or cache_config.hash_block_size).
+        # Using the scheduler block size for both would make
+        # request_block_hasher disagree with the new KVCacheManager after a
+        # worker restart and produce false prefix-cache hits/misses.
+        from vllm.v1.core.kv_cache_utils import (
+            get_request_block_hasher,
+            init_none_hash,
+            resolve_kv_cache_block_sizes,
+        )
+
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            kv_cache_config, self.vllm_config
+        )
+        scheduler.block_size = scheduler_block_size
+
         new_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=scheduler.max_model_len,
-            scheduler_block_size=scheduler.block_size,
-            hash_block_size=hash_block_size or scheduler.block_size,
+            scheduler_block_size=scheduler_block_size,
+            hash_block_size=hash_block_size,
             max_num_batched_tokens=(
                 scheduler.scheduler_config.max_num_batched_tokens
             ),
@@ -1430,7 +1540,27 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             getattr(kv_cache_config, "needs_kv_cache_zeroing", False)
         )
 
+        # Rebind the request block hasher to the recomputed hash_block_size.
+        # ``Request.from_engine_core_request`` uses this callable in
+        # ``_handle_client_request``; leaving the pre-restart hasher in place
+        # would hash at the old granularity while the rebuilt cache manager
+        # uses the new one.
         connector = getattr(scheduler, "connector", None)
+        if engine_core is not None:
+            cache_config = self.vllm_config.cache_config
+            if cache_config.enable_prefix_caching or connector is not None:
+                from vllm.utils.hashing import get_hash_fn_by_name
+
+                caching_hash_fn = get_hash_fn_by_name(
+                    cache_config.prefix_caching_hash_algo
+                )
+                init_none_hash(caching_hash_fn)
+                engine_core.request_block_hasher = get_request_block_hasher(
+                    hash_block_size, caching_hash_fn
+                )
+            else:
+                engine_core.request_block_hasher = None
+
         if connector is not None:
             try:
                 connector.bind_gpu_block_pool(new_manager.block_pool)
@@ -1985,10 +2115,15 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
             # 重复下发同一份全量重启策略时幂等跳过：当前 worker world 已经是
             # 目标拓扑，再次无 barrier 重启会异步杀 worker。这里不能静默
-            # 丢弃，仍要上报成功并保持 RUNNING。
-            if self._strategy_requires_full_restart(
-                strategy
-            ) and self._strategy_matches_current_topology(strategy):
+            # 丢弃，仍要上报成功并保持 RUNNING。带新 strategy_generation
+            # 的触发波即使拓扑相同也必须完整重启：上一次下发可能只送达了
+            # 部分 executor，其余 executor 已经切到目标拓扑并跳过，只有
+            # 统一按新 generation 重建才能把漏收 executor 拉回同一通信域。
+            if (
+                self._strategy_requires_full_restart(strategy)
+                and not self._is_new_strategy_generation(strategy)
+                and self._strategy_matches_current_topology(strategy)
+            ):
                 logger.info(
                     "DEGRADE strategy already matches current topology "
                     "(dp=%s, tp=%s); skipping redundant worker restart.",
@@ -2008,6 +2143,9 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             # Scheduler cleanup is now handled inside _cleanup_and_restart_workers
             # via _cleanup_scheduler_requests() for all DEGRADE scenarios
             self._cleanup_and_restart_workers()
+            self._executed_strategy_generation = self._strategy_generation(
+                strategy
+            )
 
             # dp=0 场景：空转状态
             if self.world_size == 0:
@@ -2053,6 +2191,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             if (
                 self.parallel_config.data_parallel_size > 1
                 and backup
+                and not self._is_new_strategy_generation(strategy)
                 and not self._strategy_requires_full_restart(strategy)
             ):
                 logger.info(
@@ -2068,6 +2207,9 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 return True
 
             self._cleanup_and_restart_workers()
+            self._executed_strategy_generation = self._strategy_generation(
+                strategy
+            )
 
             # 错过 DEGRADE 的 executor 首次 RECOVER 成功后补一份对称备份，
             # 使后续重复 RECOVER 能命中上面的幂等分支，且后续 DEGRADE/
@@ -2128,7 +2270,12 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             if self._strategy_requires_full_restart(strategy):
                 # 与 DEGRADE 相同的幂等边界：同一份异构/缩容策略重复下发时，
                 # worker world 已经是目标拓扑，不能再次无 barrier 杀 worker。
-                if self._strategy_matches_current_topology(strategy):
+                # 新 generation 的触发波不能跳过：部分送达的上一次波可能只
+                # 重启了部分 executor。
+                if (
+                    not self._is_new_strategy_generation(strategy)
+                    and self._strategy_matches_current_topology(strategy)
+                ):
                     logger.info(
                         "PD_REBUILD strategy already matches current "
                         "topology (dp=%s, tp=%s); skipping redundant worker "
@@ -2184,15 +2331,29 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 self._cleanup_and_restart_workers()
             else:
                 logger.info("This instance is healthy, updating KVConnector via RPC")
-                # 健康实例通过 RPC 更新 KVConnector
-                self.collective_rpc("update_kv_connector_for_pd",
-                                    args=(strategy,),
-                                    timeout=60)
+                # 健康实例通过 RPC 更新 KVConnector。NPUWorker 上的 RPC
+                # 入口会返回 StrategyHandler.execute_strategy() 的布尔结果；
+                # 任一 worker 失败都必须让部署失败，不能静默上报成功。
+                rpc_results = self.collective_rpc("update_kv_connector_for_pd",
+                                                  args=(strategy,),
+                                                  timeout=60)
+                if (
+                    not isinstance(rpc_results, (list, tuple))
+                    or not rpc_results
+                    or any(result is not True for result in rpc_results)
+                ):
+                    raise RuntimeError(
+                        "healthy-instance KV connector RPC update failed: "
+                        f"results={rpc_results!r}"
+                    )
 
             if self.world_size == 0:
                 self.executor_state = ExecutorState.STOPPED
             else:
                 self.executor_state = ExecutorState.RUNNING
+            self._executed_strategy_generation = self._strategy_generation(
+                strategy
+            )
             self._report_deploy_status(strategy, DeployState.EXECUTOR_DEPLOY_SUCCESS)
             return True
 
@@ -2253,6 +2414,21 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                                 logger.info(f"Found unhealthy device on {current_host_ip}: {device}")
                                 return True  # 有不健康设备，是故障实例
         return False  # 全部健康，是健康实例
+
+    def _strategy_generation(self, strategy: DeployStrategy) -> str | None:
+        """Return the trigger-wave generation carried by ``strategy``."""
+        return getattr(strategy, "strategy_generation", None)
+
+    def _is_new_strategy_generation(self, strategy: DeployStrategy) -> bool:
+        """True when this strategy belongs to a new trigger wave.
+
+        ``strategy_generation=None`` (decision-center strategies and legacy
+        manual payloads) keeps the old topology-only idempotency rules.
+        """
+        generation = self._strategy_generation(strategy)
+        if generation is None:
+            return False
+        return generation != self._executed_strategy_generation
 
     def _strategy_requires_full_restart(self, strategy: DeployStrategy) -> bool:
         """判断策略是否需要所有 DP executor 重启 worker。
@@ -2327,13 +2503,21 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             ),
             default=0,
         )
+        # A rank scaled to zero may be the HIGHEST pre-restart rank (e.g.
+        # DP16 -> DP15 fault rank 15), so max(new_dp)=15 alone would not flag
+        # a strategy that omitted it.  Require every pre-restart DP rank to be
+        # present as well; omitted scale-to-zero executors skip the barrier
+        # pool advance and later RECOVER can rendezvous on a stale port.
+        required_dp = max(
+            expected_dp, int(self.parallel_config.data_parallel_size or 0)
+        )
         present = {
             int(getattr(conf, "data_parallel_rank", -1))
             for conf in strategy.engine_parallel_config
             if getattr(conf, "data_parallel_rank", None) is not None
             and int(getattr(conf, "data_parallel_rank", -1)) >= 0
         }
-        missing = set(range(expected_dp)) - present
+        missing = set(range(required_dp)) - present
         if missing:
             raise ValueError(
                 "Heterogeneous full-restart strategy does not cover DP ranks "
@@ -2392,6 +2576,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             if self.parallel_config.data_parallel_size > 1:
                 return not (
                     backup
+                    and not self._is_new_strategy_generation(strategy)
                     and not self._strategy_requires_full_restart(strategy)
                 )
             return True
@@ -2401,7 +2586,10 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             DeployType.PD_REBUILD,
         ):
             if self._strategy_requires_full_restart(strategy):
-                return not self._strategy_matches_current_topology(strategy)
+                return (
+                    self._is_new_strategy_generation(strategy)
+                    or not self._strategy_matches_current_topology(strategy)
+                )
             if strategy.deploy_type == DeployType.PD_REBUILD:
                 return self._is_fault_instance_for_pd(strategy)
             # Legacy DEGRADE without full restart still restarts this
@@ -2502,6 +2690,16 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         # MultiprocExecutor.shutdown() skips worker termination once
         # shutting_down=True, so those workers would leak.
         self._cleanup_message_queues_and_workers()
+
+        # A STOP deployment must be indistinguishable from the dp=0 idle
+        # state for the EngineCore/client: handle_new_deployment and
+        # _execute_deployment_strategy derive "idle" from world_size, so keep
+        # it zero after the workers are gone.  Otherwise STOP is reported as
+        # RUNNING and the recovered (0,0) notification immediately cancels
+        # the idle notification that was just sent.
+        self.world_size = 0
+        self.local_world_size = 0
+        self.futures_queue = deque[FutureWrapper]()
 
         # Use current_strategy if available, otherwise create a dummy strategy for shutdown reporting
         if self.current_strategy:

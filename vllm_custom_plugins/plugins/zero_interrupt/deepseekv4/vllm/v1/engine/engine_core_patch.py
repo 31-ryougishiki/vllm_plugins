@@ -28,8 +28,17 @@ from vllm.v1.outputs import ModelRunnerOutput
 from datetime import timedelta
 
 
-from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.common.constants import VLLM_ITS_STRATEGY_TIMEOUT, VLLM_ITS_MAX_RETRY_COUNT
-from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.common.types import DeployType, UpdateEngineInfo
+from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.common.constants import (
+    VLLM_ITS_STRATEGY_TIMEOUT,
+    VLLM_ITS_MAX_RETRY_COUNT,
+    VLLM_ITS_IDLE_LOAD_SCORE,
+)
+from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.common.types import (
+    DeployState,
+    DeployType,
+    ExecutorState,
+    UpdateEngineInfo,
+)
 from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm.v1.executor.utils import (
     get_pd_scheduler_connector_topology,
 )
@@ -258,6 +267,16 @@ def patch_engine_core() -> None:
     def patched_handle_shutdown(self, *args, **kwargs):
         global _callback_registered
         logger.debug("========================================[patched_handle_shutdown] start====================================================")
+        if getattr(self, "_its_force_exit", False):
+            # All worker-restart retries failed and the executor has been
+            # shut down.  Returning False terminates run_busy_loop; without
+            # this check the process keeps looping forever with a dead
+            # executor and the client keeps routing requests to it.
+            logger.error(
+                "EngineCore force-exit requested after restart retries "
+                "were exhausted."
+            )
+            return False
         executor = getattr(self, "model_executor", None)
         logger.debug(f"+++[mzm]+++++executor={executor}+++[mzm]+++++")
         if not _callback_registered and executor is not None:
@@ -420,13 +439,17 @@ def patch_engine_core() -> None:
         """
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule()
 
         executor = getattr(self, "model_executor", None)
         world_size = getattr(executor, "world_size", None) if executor else None
         paused = getattr(self, "_paused_for_restart", False)
         if world_size == 0 or paused:
+            # An idle/paused executor must not schedule work that can never
+            # be executed (schedule() would move requests into RUNNING
+            # state without a matching update_from_output).
             return {}, False
+
+        scheduler_output = self.scheduler.schedule()
 
         exec_future = self.model_executor.execute_model(
             scheduler_output, non_block=True
@@ -518,20 +541,22 @@ def patch_engine_core() -> None:
                     len(batch_queue),
                     request_states,
                 )
+            # patched: 获取零中断相关变量状态
+            executor = getattr(self, "model_executor", None)
+            world_size = getattr(executor, "world_size", None) if executor else None
+            paused = getattr(self, "_paused_for_restart", False)
+
+            if world_size == 0 or paused:
+                # patched: 针对DP域下所有worker都关停的情况, 直接返回，不执行任何动作。
+                # 必须在 schedule() 之前判断：空闲/暂停的 executor 不能把请求
+                # 调度进 RUNNING 状态（永远不会有 update_from_output 消费它）。
+                return None, True
+
             scheduler_output = self.scheduler.schedule()
             with self.log_error_detail(scheduler_output):
-                # patched: 获取零中断相关变量状态
-                executor = getattr(self, "model_executor", None)
-                world_size = getattr(executor, "world_size", None) if executor else None
-                paused = getattr(self, "_paused_for_restart", False)
-
-                if world_size == 0 or paused:
-                    # patched: 针对DP域下所有worker都关停的情况, 直接返回，不执行任何动作
-                    return None, True
-                else:                    
-                    exec_future = self.model_executor.execute_model(
-                        scheduler_output, non_block=True
-                    )
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
 
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
@@ -659,10 +684,11 @@ def patch_engine_core() -> None:
             return
 
         # 创建带有特殊负载分数的输出，告知客户端此 engine 空转
-        # 使用 999999 作为空转标记
+        # 使用 VLLM_ITS_IDLE_LOAD_SCORE 作为空转标记
+        # （core_client_patch.process_engine_outputs 依赖同一契约值摘除路由）。
         stats = SchedulerStats(
-            num_waiting_reqs=999999,
-            num_running_reqs=999999,
+            num_waiting_reqs=VLLM_ITS_IDLE_LOAD_SCORE,
+            num_running_reqs=VLLM_ITS_IDLE_LOAD_SCORE,
             step_counter=0,
             current_wave=0
         )
@@ -737,6 +763,14 @@ def patch_engine_core() -> None:
         if hasattr(executor, "handle_new_deployment"):
             # 1. 通过修改executor的vllm_config, 可以修改worker connector的engine-id
             vllm_config = executor.vllm_config
+            ori_engine_id = None
+            rotated = False
+            rotated_sched_connector = None
+            rotated_connector_worker = None
+            rotated_worker_metadata = None
+            orig_update_info = getattr(
+                executor.current_strategy, "update_engine_info", None
+            )
 
             # 幂等 RECOVER / 重复 DEGRADE 会在 executor 内短路，不会真正
             # 重启 worker。此时绝不能轮换 engine_id 或刷新 connector 元数据：
@@ -767,6 +801,7 @@ def patch_engine_core() -> None:
                 from uuid import uuid4
 
                 ori_engine_id = vllm_config.kv_transfer_config.engine_id
+                rotated = True
                 # 异构 TP 全量重启后 P 侧 15 个 worker 会重建
                 # TransferEngine/KV cache，te_rpc_port 和 KV 基地址全部变化。
                 # decode 侧 KVCacheRecvingThread 以 (engine_id, handshake_port)
@@ -810,10 +845,31 @@ def patch_engine_core() -> None:
                             vllm_config.kv_transfer_config.engine_id,
                         )
 
-                # 2. 直接修改scheduler connector的engine-id
+                # 2. 直接修改scheduler connector的engine-id。scheduler
+                # connector 缺失时绝不能继续：engine_id 已经轮换，若这里
+                # 用 assert 让异常穿过 patched_handle_shutdown，engine-core
+                # 进程会直接退出，而且轮换无法回滚。
                 sched_kv_connector = engine_core.scheduler.get_kv_connector()
-                assert sched_kv_connector is not None, "[PD][_execute_deployment_strategy] No KV connector found in scheduler"
-                assert hasattr(sched_kv_connector, "engine_id"),"[PD] No engine_id attribute in scheduler KV connector"
+                if sched_kv_connector is None or not hasattr(
+                    sched_kv_connector, "engine_id"
+                ):
+                    logger.error(
+                        "[PD][_execute_deployment_strategy] No usable KV "
+                        "connector found in scheduler; rolling back engine_id "
+                        "rotation %s -> %s and aborting deployment.",
+                        vllm_config.kv_transfer_config.engine_id,
+                        ori_engine_id,
+                    )
+                    vllm_config.kv_transfer_config.engine_id = ori_engine_id
+                    executor.current_strategy.update_engine_info = orig_update_info
+                    executor.executor_state = ExecutorState.EXECUTING_STRATEGY_FAILED
+                    if hasattr(executor, "_report_deploy_status"):
+                        executor._report_deploy_status(
+                            executor.current_strategy,
+                            DeployState.EXECUTOR_DEPLOY_FAIL,
+                        )
+                    return False
+                rotated_sched_connector = sched_kv_connector
                 sched_kv_connector.engine_id = vllm_config.kv_transfer_config.engine_id
                 sched_kv_connector.connector_scheduler.engine_id = vllm_config.kv_transfer_config.engine_id
                 logger.info(f"[PD] reset executor's sched_kv_connector.connector_scheduler.engine_id={vllm_config.kv_transfer_config.engine_id}")
@@ -831,6 +887,7 @@ def patch_engine_core() -> None:
                 # 4. 更新worker的engine_id
                 if sched_kv_connector.connector_worker:
                     connector_worker = sched_kv_connector.connector_worker
+                    rotated_connector_worker = connector_worker
                     connector_worker.engine_id = (
                         vllm_config.kv_transfer_config.engine_id
                     )
@@ -839,12 +896,42 @@ def patch_engine_core() -> None:
                         "xfer_handshake_metadata",
                         None,
                     )
+                    rotated_worker_metadata = worker_handshake_metadata
                     if worker_handshake_metadata is not None:
                         worker_handshake_metadata.engine_id = (
                             vllm_config.kv_transfer_config.engine_id
                         )
 
             success = executor.handle_new_deployment()
+
+            # engine_id 是在 worker 真正重启成功之前预改的。若重启失败，
+            # 必须整体回滚：scheduler 侧保留新 id 而 worker 仍是旧/已死，
+            # 后续请求会按陈旧元数据重建 PD 链路。
+            if not success and rotated and ori_engine_id is not None:
+                logger.warning(
+                    "[PD] deployment failed; rolling back engine_id "
+                    "rotation %s -> %s",
+                    vllm_config.kv_transfer_config.engine_id,
+                    ori_engine_id,
+                )
+                vllm_config.kv_transfer_config.engine_id = ori_engine_id
+                if rotated_sched_connector is not None:
+                    rotated_sched_connector.engine_id = ori_engine_id
+                    connector_scheduler = getattr(
+                        rotated_sched_connector, "connector_scheduler", None
+                    )
+                    if connector_scheduler is not None:
+                        connector_scheduler.engine_id = ori_engine_id
+                    for node_meta in getattr(
+                        connector_scheduler, "multi_nodes_meta_mapping", {}
+                    ).values():
+                        if isinstance(node_meta, dict):
+                            node_meta["engine_id"] = ori_engine_id
+                if rotated_connector_worker is not None:
+                    rotated_connector_worker.engine_id = ori_engine_id
+                if rotated_worker_metadata is not None:
+                    rotated_worker_metadata.engine_id = ori_engine_id
+                executor.current_strategy.update_engine_info = orig_update_info
 
             # PD 分离且 worker 重启后，scheduler connector 里保存的仍是旧
             # worker 的 handshake 元数据。异构重启后端口/engine_id 都会变，

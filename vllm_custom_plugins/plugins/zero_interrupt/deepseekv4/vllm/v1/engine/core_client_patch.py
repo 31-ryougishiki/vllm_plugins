@@ -15,6 +15,10 @@
 from vllm.logger import logger
 import traceback
 
+from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.common.constants import (
+    VLLM_ITS_IDLE_LOAD_SCORE,
+)
+
 # 模块级变量，用于追踪空转的 engine
 _idle_engines: set[int] = set()
 _patch_applied = False
@@ -51,7 +55,8 @@ def patch_dplb_client() -> None:
 
         空转 engine 的特征：
         - world_size=0，不再处理请求
-        - 负载分数被设置为极高值 (999999, 999999)
+        - 负载分数被设置为极高值 (VLLM_ITS_IDLE_LOAD_SCORE,
+          VLLM_ITS_IDLE_LOAD_SCORE)
         """
         global _idle_engines
         logger.debug(f"+++[mzm]++++Current idle engines: {_idle_engines}+++[mzm]++++")
@@ -60,7 +65,6 @@ def patch_dplb_client() -> None:
             logger.info("No idle engines, using original selection")
             return original_get_core_engine(self, request)
 
-        # 检查是否有可用的非空转 engine
         num_engines = len(self.core_engines)
         active_engines = [i for i in range(num_engines) if i not in _idle_engines]
         logger.info(f"Idle engines: {_idle_engines}, Active engines: {active_engines}")
@@ -70,27 +74,30 @@ def patch_dplb_client() -> None:
             logger.info("All engines are idle, falling back to original selection")
             return original_get_core_engine(self, request)
 
-        # 临时保存 lb_engines 并过滤
+        # 保持 core_engines 与原始 engine index 一一对应，只把 idle engine
+        # 的负载分数暂时设为极大值。原来的实现会重建一份缩短的
+        # core_engines/lb_engines 列表：LB 路径还能靠 result 对象回映，
+        # 但显式 data_parallel_rank 会按“缩短后的下标”选错 engine，且当
+        # 请求显式指向被摘除的最高 rank 时会直接 IndexError。
         saved_lb_engines = self.lb_engines
-        saved_core_engines = self.core_engines
+        masked_lb_engines = [
+            list(counts) for counts in saved_lb_engines
+        ]
+        for idx in _idle_engines:
+            if 0 <= idx < len(masked_lb_engines):
+                masked_lb_engines[idx] = [
+                    VLLM_ITS_IDLE_LOAD_SCORE,
+                    VLLM_ITS_IDLE_LOAD_SCORE,
+                ]
 
-        # 只保留活跃 engine 的负载信息
-        self.lb_engines = [saved_lb_engines[i] for i in active_engines]
-        self.core_engines = [saved_core_engines[i] for i in active_engines]
-
+        self.lb_engines = masked_lb_engines
         try:
             result = original_get_core_engine(self, request)
-            # 将返回的 engine 转换回原始索引
-            if result in self.core_engines:
-                actual_index = active_engines[self.core_engines.index(result)]
-                # 重新映射回原始 engine
-                result = saved_core_engines[actual_index]
-                logger.info(f"Request routed to engine {actual_index} (filtered idle: {_idle_engines})")
-            return result
         finally:
-            # 恢复原始列表
+            # 恢复原始列表；original 只修改 masked_lb_engines 中的元素，
+            # saved_lb_engines 中真实负载计数不会被污染。
             self.lb_engines = saved_lb_engines
-            self.core_engines = saved_core_engines
+        return result
 
     # ------------------------------------------------------------------
     # Patched process_engine_outputs
@@ -116,8 +123,15 @@ def patch_dplb_client() -> None:
             num_waiting = getattr(stats, 'num_waiting_reqs', 0)
             num_running = getattr(stats, 'num_running_reqs', 0)
 
-            # 如果分数异常高（999999, 999999 是空转标记），标记为空转
-            if num_waiting >= 999999 and num_running >= 999999:
+            # 如果分数异常高（>= VLLM_ITS_IDLE_LOAD_SCORE 是空转标记，由
+            # engine_core_patch._send_idle_notification 写入），标记为空转。
+            # _idle_engines 只在单进程的事件循环内被 add/discard（set 操作
+            # 原子），无并发写者；多 DPLBAsyncMPClient 实例共享同一进程级
+            # 集合是刻意设计（每个 client 都连接全部 EngineCore）。
+            if (
+                num_waiting >= VLLM_ITS_IDLE_LOAD_SCORE
+                and num_running >= VLLM_ITS_IDLE_LOAD_SCORE
+            ):
                 engine_idx = getattr(outputs, 'engine_index', None)
                 if engine_idx is not None and engine_idx not in _idle_engines:
                     logger.info(f"***********Marking engine {engine_idx} as idle (abnormal load score)")

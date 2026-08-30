@@ -149,6 +149,20 @@ class StrategyHandler:
 
             # 获取当前 worker 的 rank
             worker_rank = getattr(self._worker, "rank", 0)
+            parallel_config = getattr(
+                getattr(self._worker, "vllm_config", None),
+                "parallel_config",
+                None,
+            )
+            if parallel_config is not None:
+                # 单节点 DP 下 WorkerProc.rank 只是 DP 内本地 rank
+                # （TP1 时恒为 0）；D→P 轮询映射需要真实的 DP rank。
+                worker_rank = int(
+                    getattr(
+                        parallel_config, "data_parallel_rank", worker_rank
+                    )
+                    or worker_rank
+                )
 
             # 计算非对称映射（仅 D 实例需要）
             kv_fetch_mapping = None
@@ -210,8 +224,19 @@ class StrategyHandler:
 
         for config in strategy.engine_parallel_config:
             executor_id = getattr(config, "executor_id", 0)
-            # 偶数 executor_id = P 实例，奇数 = D 实例
-            is_p = (executor_id % 2 == 0)
+            # 旧手动触发脚本使用数字 executor_id（偶数为 P，奇数为 D），
+            # HTTP parser 会把它们保留为字符串（"0"/"1"）。决策中心分配的
+            # ``exe-...`` id 不含任何角色信息，无法按奇偶分类，只能跳过并
+            # 交给上层告警，不能在这里抛 TypeError。
+            try:
+                is_p = (int(executor_id) % 2 == 0)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Cannot infer P/D role from executor_id=%r; skipping "
+                    "peer-config classification.",
+                    executor_id,
+                )
+                continue
 
             if is_p == target_is_p:
                 configs.append(config)
