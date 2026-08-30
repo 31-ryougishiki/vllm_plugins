@@ -37,10 +37,11 @@
 }
 ```
 
-`tp_asymmetric_shardings` 未提供时沿用 vllm_plugins 旧逻辑：
-`ori_tp` 均摊到 `new_tp` 个 rank，余数给最后一个 rank
-（4 -> 3 为 `[1,1,2]`）。DeepSeek-V4 64 heads 推荐显式使用
-`[2,1,1]`（32/16/16 heads）。
+`tp_asymmetric_shardings` 未提供时由插件推导 DeepSeek-V4 golden 拓扑：
+`ori_tp` 均摊到 `new_tp` 个 rank，余数给**最靠前**的 rank
+（4 -> 3 为 `[2,1,1]`，32/16/16 heads）。显式提供 `[2,1,1]` 结果相同；
+`get_tp_asymmetric_shardings` 与 `get_heterogeneous_dp_config` 必须使用同一
+余数分配方向，否则 worker 通信域配置与权重/head 切分会不一致。
 
 ## 3 重启流程（与旧实现的关键差异）
 

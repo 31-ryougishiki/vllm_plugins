@@ -25,27 +25,14 @@ def init_zero_interrupt():
     """Initialize the ITS plugin.
 
     This function should be called during vLLM startup to enable
-    ITS functionality.
+    ITS functionality.  The DeepSeek-V4 family is defined by
+    ``deepseekv4/patch.py:apply()`` (control plane + all heterogeneous
+    model/data-plane patches); applying only the executor swap here would
+    start a half-patched service, so delegate to the full patch entry point.
     """
-    # Apply EngineCore patch
-    from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm.v1.engine.engine_core_patch import patch_engine_core
-    patch_engine_core()
+    from .patch import apply
 
-    # Patch MultiprocExecutor
-    import vllm.v1.executor.multiproc_executor as mp_module
-    from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm.v1.executor.its_multiproc_executor import ITSMultiprocExecutor
-    from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm.v1.executor import ITSNPUWorker
-
-    mp_module.MultiprocExecutor = ITSMultiprocExecutor
-    mp_module.WorkerProc = ITSNPUWorker
-
-    # Also patch if AscendMultiprocExecutor exists
-    try:
-        import vllm_ascend.patch.platform.patch_multiproc_executor as ascend_module
-        ascend_module.MultiprocExecutor = ITSMultiprocExecutor
-        ascend_module.WorkerProc = ITSNPUWorker
-    except ImportError:
-        pass
+    return apply()
 
 
 def register(manager):

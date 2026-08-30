@@ -30,6 +30,9 @@ from datetime import timedelta
 
 from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.common.constants import VLLM_ITS_STRATEGY_TIMEOUT, VLLM_ITS_MAX_RETRY_COUNT
 from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.common.types import DeployType, UpdateEngineInfo
+from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm.v1.executor.utils import (
+    get_pd_scheduler_connector_topology,
+)
 
 # 模块级变量，用于跟踪回调是否已注册
 _callback_registered = False
@@ -837,37 +840,26 @@ def patch_engine_core() -> None:
             
             # 仅 PD 分离场景
             if is_pd_separated(vllm_config):
-                # 5. 更新 scheduler connector 的 side_channel_port
+                # 5. 更新 scheduler connector 的 side_channel_port 及拓扑字段。
                 # 异构 TP（DP4TP(3,4,4,4)）下 DP 端口偏移是累计的
                 # 0/3/7/11，不能再用 dp_rank * tp_size 的均匀公式。
+                # tp_size/max_device_id 必须在每次部署都刷新：场景 3 P
+                # RECOVER 后 parallel_config.is_heterogeneous_tp 已变回
+                # False，只刷新异构分支会继续向 D 端通告旧的 tp=3 /
+                # 15-device 布局，导致 D 按错误 producer 布局选 rank，
+                # RECOVER 后输出与基线不一致。
                 parallel_config = vllm_config.parallel_config
-                if getattr(parallel_config, "is_heterogeneous_tp", False):
-                    port_offset = parallel_config.get_rank_offset_for_dp(
-                        parallel_config.data_parallel_rank
-                    )
-                else:
-                    pcp_size = parallel_config.prefill_context_parallel_size
-                    port_offset = (
-                        parallel_config.data_parallel_rank
-                        * parallel_config.tensor_parallel_size
-                        * parallel_config.pipeline_parallel_size
-                        * pcp_size
-                    )
-                side_channel_port = (
-                    vllm_config.kv_transfer_config.kv_port + port_offset
+                (
+                    side_channel_port,
+                    scheduler_tp_size,
+                    scheduler_max_device_id,
+                ) = get_pd_scheduler_connector_topology(
+                    parallel_config,
+                    vllm_config.kv_transfer_config.kv_port,
                 )
-
                 sched_kv_connector.connector_scheduler.side_channel_port = side_channel_port
-                if getattr(parallel_config, "is_heterogeneous_tp", False):
-                    # request_finished_all_groups 用 scheduler 的 tp_size
-                    # 向 decode 端通告 prefill TP 布局。异构重启后 DP0 只有
-                    # 3 个 rank，仍用旧的 4 会选到不存在的 producer rank。
-                    sched_kv_connector.connector_scheduler.tp_size = (
-                        parallel_config.tensor_parallel_size
-                    )
-                    sched_kv_connector.connector_scheduler.max_device_id = (
-                        parallel_config.world_size_across_dp
-                    )
+                sched_kv_connector.connector_scheduler.tp_size = scheduler_tp_size
+                sched_kv_connector.connector_scheduler.max_device_id = scheduler_max_device_id
                 logger.info(f"[PD] reset executor's sched_kv_connector.connector_scheduler.side_channel_port={side_channel_port}")
 
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Union
@@ -21,6 +22,23 @@ from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.math_utils import cdiv
 
 logger = init_logger(__name__)
+
+
+def _is_deepseek_v4_runtime() -> bool:
+    """Mirror the zero_interrupt runtime patch-family switch.
+
+    The 0829 legacy asymmetric fallback below must not run for the
+    DeepSeek-V4 family: DeepSeek-V4 pure-DP shrink strategies keep
+    ``heterogeneous_dp_config`` unset, so this file cannot distinguish the
+    two families from the config alone. Reading the same env var as the
+    plugin dispatcher keeps the unified replacement file self-contained.
+    """
+    return os.environ.get("VLLM_ITS_DEEPSEEK_V4", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 if has_triton_kernels():
     try:
@@ -1106,7 +1124,12 @@ class FusedMoEParallelConfig:
 
         # [merge-0829] 0829 旧零中断非对称路径：zero_interrupt_config 中
         # 携带非均匀 per-DP new_tp，由 parallel_state 的 asym helpers 计算。
-        if cfg is not None:
+        # 该路径不属于 DeepSeek-V4：DeepSeek-V4 的纯 DP 缩容使用
+        # heterogeneous_dp_config=None + 统一公式，且 executor 已把
+        # data_parallel_rank 重编号为存活组 rank；若误走 0829 分支会按
+        # 策略里的原始 data_parallel_rank 计算 flatten rank，与新通信域
+        # 不一致（故障卡不是最后一张时直接错位）。
+        if cfg is not None and not _is_deepseek_v4_runtime():
             additional_config = getattr(cfg, "additional_config", None) or {}
             zero_interrupt_config = additional_config.get(
                 "zero_interrupt_config", None

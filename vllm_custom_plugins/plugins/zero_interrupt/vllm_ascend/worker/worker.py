@@ -1139,7 +1139,14 @@ class NPUWorker(WorkerBase):
                 asym_parallel_config.prefill_context_parallel_size,
                 asym_parallel_config.decode_context_parallel_size,
             )
-            init_ascend_model_parallel_asym(asym_parallel_config)
+            # RECOVER 回对称拓扑（heterogeneous_dp_config 为 None）时不能
+            # 走 asym-only 初始化：它只建 MC2/ODP fallback，不会重建对称
+            # 启动路径上的 _P_TP 等 Ascend 细粒度组；P 端 DSA-CP 的
+            # kv_alltoall_and_rearrange 随后 get_p_tp_group() 会断言失败。
+            if asym_parallel_config.is_heterogeneous_tp:
+                init_ascend_model_parallel_asym(asym_parallel_config)
+            else:
+                init_ascend_model_parallel(asym_parallel_config)
             ensure_ec_transfer_initialized(self.vllm_config)
             return
 

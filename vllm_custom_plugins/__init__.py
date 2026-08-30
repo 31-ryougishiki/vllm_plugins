@@ -83,7 +83,18 @@ class PatchManager:
         logger.info(f"Applying patches: {patch_names}")
 
         for name in patch_names:
-            self.apply_patch(name)
+            success = self.apply_patch(name)
+            # zero_interrupt patches are load-bearing for the DeepSeek-V4 /
+            # 0829 zero-interruption scenarios: its own apply() deliberately
+            # raises RuntimeError to fail closed.  Swallowing that here would
+            # let vLLM start with a half-patched executor/model path and fail
+            # much later (wrong weights, dead strategy handling) instead of at
+            # startup, so abort immediately for this plugin.
+            if name == "zero_interrupt" and not success:
+                raise RuntimeError(
+                    "Failed to apply required patch 'zero_interrupt'; "
+                    "refusing to continue with a half-patched service."
+                )
 
         logger.info(f"Successfully applied: {self.applied_patches}")
 

@@ -19,9 +19,13 @@ get_global_world_size = _utils.get_global_world_size
 get_heterogeneous_dp_config = _utils.get_heterogeneous_dp_config
 get_scale_to_zero_dp_ranks = _utils.get_scale_to_zero_dp_ranks
 get_surviving_dp_barrier_geometry = _utils.get_surviving_dp_barrier_geometry
+get_renumbered_dp_rank = _utils.get_renumbered_dp_rank
+get_pd_scheduler_connector_topology = _utils.get_pd_scheduler_connector_topology
 get_tp_asymmetric_shardings = _utils.get_tp_asymmetric_shardings
 is_heterogeneous_restart = _utils.is_heterogeneous_restart
+pin_worker_world_port = _utils.pin_worker_world_port
 recover_requires_full_restart = _utils.recover_requires_full_restart
+reserve_restart_ports = _utils.reserve_restart_ports
 
 
 class TestHeteroUtils(unittest.TestCase):
@@ -86,6 +90,18 @@ class TestHeteroUtils(unittest.TestCase):
         self.assertEqual(
             get_tp_asymmetric_shardings(cfg), [2, 1, 1]
         )
+
+    def test_heterogeneous_dp_config_legacy_shardings_match_top_level(self):
+        cfg = self._strategy()
+        cfg["executor_id"] = "0"
+        cfg["engine_parallel_config"][0]["tp_asymmetric_shardings"] = None
+        configs = get_heterogeneous_dp_config(cfg)
+        # The per-DP heterogeneous config and the top-level sharding fallback
+        # must agree on where the remainder goes. Both derive [2, 1, 1] from
+        # old_tp=4 -> new_tp=3; [1, 1, 2] would load different weight/head
+        # partitions than the hetero weight loaders expect.
+        self.assertEqual(configs[0]["tp_sharding_ratios"], [2, 1, 1])
+        self.assertEqual(get_tp_asymmetric_shardings(cfg), [2, 1, 1])
 
     def test_uniform_when_same_tp(self):
         cfg = self._strategy()
@@ -217,6 +233,51 @@ class TestHeteroUtils(unittest.TestCase):
             (0, 0, {15}),
         )
 
+    def test_renumbered_dp_rank_matches_barrier_for_middle_fault(self):
+        cfg = {
+            "executor_id": "9",
+            "engine_parallel_config": [
+                {"executor_id": str(i), "dp": 16, "tp": 1,
+                 "data_parallel_rank": i, "new_dp": 15, "new_tp": 1}
+                for i in range(16)
+            ],
+        }
+        cfg["engine_parallel_config"][4]["new_tp"] = 0
+        cfg["engine_parallel_config"][4]["new_dp"] = 0
+        # Barrier survivors are renumbered 0..14; original rank 9 becomes 8.
+        self.assertEqual(
+            get_surviving_dp_barrier_geometry(cfg)[1],
+            get_renumbered_dp_rank(cfg),
+        )
+        self.assertEqual(get_renumbered_dp_rank(cfg), 8)
+
+    def test_renumbered_dp_rank_for_scale_to_zero_executor_is_none(self):
+        cfg = {
+            "executor_id": "0",
+            "engine_parallel_config": [
+                {"executor_id": str(i), "dp": 16, "tp": 1,
+                 "data_parallel_rank": i, "new_dp": 15, "new_tp": 1}
+                for i in range(16)
+            ],
+        }
+        cfg["engine_parallel_config"][0]["new_tp"] = 0
+        cfg["engine_parallel_config"][0]["new_dp"] = 0
+        self.assertIsNone(get_renumbered_dp_rank(cfg))
+        cfg["executor_id"] = "1"
+        self.assertEqual(get_renumbered_dp_rank(cfg), 0)
+
+    def test_renumbered_dp_rank_rejects_missing_executor(self):
+        cfg = {
+            "executor_id": "99",
+            "engine_parallel_config": [
+                {"executor_id": str(i), "dp": 4, "tp": 4,
+                 "data_parallel_rank": i, "new_dp": 4, "new_tp": 4}
+                for i in range(4)
+            ],
+        }
+        with self.assertRaises(ValueError):
+            get_renumbered_dp_rank(cfg)
+
     def test_surviving_dp_barrier_geometry_rejects_inconsistent_new_dp(self):
         cfg = {
             "executor_id": "0",
@@ -294,6 +355,127 @@ class TestHeteroUtils(unittest.TestCase):
                 target_dp=16,
             )
         )
+
+    def test_pd_scheduler_topology_uses_cumulative_offset_for_hetero(self):
+        pc = _HeteroParallelConfig(dp_rank=2)
+        self.assertEqual(
+            get_pd_scheduler_connector_topology(pc, kv_port=36000),
+            (36007, 4, 15),
+        )
+
+    def test_pd_scheduler_topology_restores_symmetric_after_recover(self):
+        pc = _SymmetricParallelConfig(dp_rank=2, tp=4, world_size_across_dp=16)
+        self.assertEqual(
+            get_pd_scheduler_connector_topology(pc, kv_port=36000),
+            (36008, 4, 16),
+        )
+
+    def test_pd_scheduler_topology_uses_renumbered_dp_rank(self):
+        pc = _SymmetricParallelConfig(dp_rank=0, tp=1, world_size_across_dp=15)
+        self.assertEqual(
+            get_pd_scheduler_connector_topology(pc, kv_port=36200),
+            (36200, 1, 15),
+        )
+
+
+class _HeteroParallelConfig:
+    is_heterogeneous_tp = True
+    tensor_parallel_size = 4
+    pipeline_parallel_size = 1
+    prefill_context_parallel_size = 1
+    world_size_across_dp = 15
+
+    def __init__(self, dp_rank):
+        self.data_parallel_rank = dp_rank
+
+    def get_rank_offset_for_dp(self, dp_rank):
+        return [0, 3, 7, 11][dp_rank]
+
+
+class _SymmetricParallelConfig:
+    is_heterogeneous_tp = False
+    pipeline_parallel_size = 1
+    prefill_context_parallel_size = 1
+
+    def __init__(self, dp_rank, tp, world_size_across_dp):
+        self.data_parallel_rank = dp_rank
+        self.tensor_parallel_size = tp
+        self.world_size_across_dp = world_size_across_dp
+
+
+class _FakeDPPortConfig:
+    """Minimal stand-in for the ParallelConfig DP port source."""
+
+    def __init__(self, dp_size, ports):
+        self.data_parallel_size = dp_size
+        self._data_parallel_master_port_list = list(ports)
+        # Mimic ParallelConfig.__post_init__: the next pop fills
+        # data_parallel_master_port first.
+        self.data_parallel_master_port = (
+            self._data_parallel_master_port_list.pop()
+            if self._data_parallel_master_port_list
+            else 29500
+        )
+
+    def get_next_dp_init_port(self):
+        if self._data_parallel_master_port_list:
+            return self._data_parallel_master_port_list.pop()
+        answer = self.data_parallel_master_port
+        self.data_parallel_master_port += 1
+        return answer
+
+
+class TestRestartPortReservation(unittest.TestCase):
+    def test_reservation_pins_one_shared_worker_world_port(self):
+        # Mirror ParallelConfig.__post_init__ (one pop) + EngineCore
+        # dp_group init (one pop): after both, an executor sees three
+        # remaining ports; reserve 2 barrier + 1 worker.
+        pc = _FakeDPPortConfig(
+            dp_size=16, ports=[20001, 20002, 20003, 20004, 20005]
+        )
+        pc.get_next_dp_init_port()  # engine-core dp_group
+        pool, worker_port = reserve_restart_ports(pc)
+        self.assertEqual(worker_port, 20001)
+        self.assertEqual(pc._data_parallel_master_port_list, [])
+        self.assertEqual(pc.data_parallel_master_port, 20001)
+        self.assertEqual(
+            [pool.next_port() for _ in range(3)],
+            [20003, 20002, 20003],
+        )
+
+    def test_every_restart_generation_reuses_the_same_port(self):
+        pc = _FakeDPPortConfig(
+            dp_size=16, ports=[20001, 20002, 20003, 20004, 20005]
+        )
+        pc.get_next_dp_init_port()
+        _, worker_port = reserve_restart_ports(pc)
+        # A scale-to-zero executor skips spawning workers during DP shrink;
+        # pinning is idempotent and keeps its copy aligned with survivors.
+        pin_worker_world_port(pc, worker_port)
+        for _ in range(3):
+            self.assertEqual(pc.get_next_dp_init_port(), worker_port)
+            pin_worker_world_port(pc, worker_port)
+
+    def test_repin_after_recover_post_init_regeneration(self):
+        pc = _FakeDPPortConfig(
+            dp_size=16, ports=[20001, 20002, 20003, 20004, 20005]
+        )
+        pc.get_next_dp_init_port()
+        _, worker_port = reserve_restart_ports(pc)
+        # RECOVER calls parallel_config.__post_init__(), which sees an empty
+        # port list and regenerates a fresh (per-executor random) source.
+        pc._data_parallel_master_port_list = [29999]
+        pc.data_parallel_master_port = 29998
+        pin_worker_world_port(pc, worker_port)
+        self.assertEqual(pc._data_parallel_master_port_list, [])
+        self.assertEqual(pc.data_parallel_master_port, worker_port)
+        self.assertEqual(pc.get_next_dp_init_port(), worker_port)
+
+    def test_single_dp_keeps_default_port_behaviour(self):
+        pc = _FakeDPPortConfig(dp_size=1, ports=[])
+        pool, worker_port = reserve_restart_ports(pc)
+        self.assertIsNone(worker_port)
+        self.assertEqual(len(pool), 0)
 
 
 class TestBarrierPortPool(unittest.TestCase):

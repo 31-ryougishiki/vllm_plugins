@@ -58,10 +58,14 @@ from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm.v1.executor.util
     BarrierPortPool,
     get_global_start_rank,
     get_heterogeneous_dp_config,
+    get_renumbered_dp_rank,
     get_surviving_dp_barrier_geometry,
     get_tp_asymmetric_shardings,
     is_heterogeneous_restart,
+    pin_worker_world_port,
     recover_requires_full_restart,
+    reserve_restart_ports,
+    strategy_matches_current_topology,
 )
 from .health_monitor import ITSHealthMonitor, ITSFailureCallback
 from .http_server import ITSHttpServer
@@ -152,16 +156,26 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         # where all DP executors can deterministically agree on the same
         # ports.  The pool rotates, so the port used by the previous barrier
         # is only reused after that group has been destroyed.
-        self._its_barrier_port_pool = BarrierPortPool()
-        parallel_config = vllm_config.parallel_config
-        if parallel_config.data_parallel_size > 1:
-            barrier_ports = [
-                parallel_config.get_next_dp_init_port() for _ in range(2)
-            ]
-            self._its_barrier_port_pool = BarrierPortPool(barrier_ports)
+        # Full-restart barriers and every new global worker world must use
+        # pre-reserved, deterministic ports.  The barrier needs two rotating
+        # slots because the previous engine-core dp_group survives until the
+        # next barrier; the worker world can reuse ONE fixed port because all
+        # old worker processes are terminated before new ones are spawned.
+        # Reserving the worker-world port here (in every DP executor, before
+        # worker configs are copied) also prevents the per-executor
+        # ``_data_parallel_master_port_list`` from drifting apart when a
+        # scale-to-zero executor skips a generation during DP shrink: at
+        # RECOVER the restored executor must join the same TCPStore port as
+        # the other 15 workers, otherwise init_process_group hangs forever.
+        (
+            self._its_barrier_port_pool,
+            self._its_worker_world_port,
+        ) = reserve_restart_ports(vllm_config.parallel_config)
+        if self._its_worker_world_port is not None:
             logger.info(
-                "Reserved ITS full-restart barrier ports: %s",
-                barrier_ports,
+                "Reserved ITS full-restart barrier ports and worker-world "
+                "port %d.",
+                self._its_worker_world_port,
             )
 
         # Components (initialized in _init_executor)
@@ -827,7 +841,27 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         All DP executors (including scale-to-zero executors that skip the
         barrier) must call this exactly once per full-restart generation so
         that a later RECOVER strategy picks the same port on every executor.
+
+        Exception: a RECOVER arriving on an executor with no degrade backup
+        means this executor likely missed the preceding DEGRADE while its
+        peers advanced their pools.  Rotating here would pick the pool's
+        first slot, which the peers (already rotated once) do not pick.
+        Instead deterministically select the second reserved slot; after the
+        peers complete this RECOVER and rotate once, all pools align again.
         """
+        strategy = getattr(self, "current_strategy", None)
+        backup = getattr(self, "backup_parallel_config", {}) or {}
+        if strategy is not None and strategy.deploy_type == DeployType.RECOVER and not backup:
+            ports = list(getattr(self._its_barrier_port_pool, "_ports", ()))
+            if len(ports) >= 2:
+                port = int(ports[-1])
+                logger.info(
+                    "Full-restart barrier: RECOVER without degrade backup; "
+                    "using deterministic reserved port %d.",
+                    port,
+                )
+                return port
+
         port = self._its_barrier_port_pool.next_port()
         logger.info(
             "Full-restart barrier: using reserved barrier master port %d.",
@@ -1587,6 +1621,18 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         """Initialize workers with current VllmConfig."""
         logger.info("Initializing workers with updated VllmConfig")
 
+        # Every full-restart generation (including scale-to-zero executors
+        # that spawn no worker) must agree on the same TCPStore port for the
+        # new global worker world.  Point every worker process' config copy at
+        # the fixed port reserved in __init__ instead of letting each copy pop
+        # its own stale ``_data_parallel_master_port_list`` entry; those lists
+        # diverge once an executor skips a generation (DP16 -> DP15) and a
+        # later RECOVER would otherwise deadlock in init_process_group.
+        if self._its_worker_world_port is not None:
+            pin_worker_world_port(
+                self.parallel_config, self._its_worker_world_port
+            )
+
         # Reset distributed environment if needed
         if model_parallel_is_initialized():
             destroy_model_parallel()
@@ -1674,6 +1720,15 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                         os.environ["ASCEND_RT_VISIBLE_DEVICES"] = healthy_npu_str
 
             self._get_engine_parallel_config(self.current_strategy)
+        # RECOVER 分支会调用 parallel_config.__post_init__()，而
+        # __post_init__ 看到空的 _data_parallel_master_port_list 后会重新
+        # 生成随机端口列表并覆盖 data_parallel_master_port。必须在策略
+        # 应用完成后再次钉住固定 worker-world 端口，否则恢复出来的
+        # executor 与其余存活 executor 会使用不同的 TCPStore 端口建组。
+        if self._its_worker_world_port is not None:
+            pin_worker_world_port(
+                self.parallel_config, self._its_worker_world_port
+            )
         # WorkerProc.rank/local_rank 仍是节点内（DP 内）的本地 rank，全局
         # torch.distributed rank 偏移由 v0.23 hetero
         # init_distributed_environment 按 get_rank_offset_for_dp 计算
@@ -1891,6 +1946,24 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         try:
             self.executor_state = ExecutorState.EXECUTING_STRATEGY
 
+            # 重复下发同一份全量重启策略时幂等跳过：当前 worker world 已经是
+            # 目标拓扑，再次无 barrier 重启会异步杀 worker。这里不能静默
+            # 丢弃，仍要上报成功并保持 RUNNING。
+            if self._strategy_requires_full_restart(
+                strategy
+            ) and self._strategy_matches_current_topology(strategy):
+                logger.info(
+                    "DEGRADE strategy already matches current topology "
+                    "(dp=%s, tp=%s); skipping redundant worker restart.",
+                    self.parallel_config.data_parallel_size,
+                    self.parallel_config.tensor_parallel_size,
+                )
+                self.executor_state = ExecutorState.RUNNING
+                self._report_deploy_status(
+                    strategy, DeployState.EXECUTOR_DEPLOY_SUCCESS
+                )
+                return True
+
             # Scheduler cleanup is now handled inside _cleanup_and_restart_workers
             # via _cleanup_scheduler_requests() for all DEGRADE scenarios
             self._cleanup_and_restart_workers()
@@ -1929,8 +2002,17 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             # dp_group / worker world 都是目标布局，重复全量重启反而会在没有
             # barrier 保护的情况下异步杀 worker。DP=1 没有跨 executor 通信域，
             # 保留原来的无条件重启语义。
-            if self.parallel_config.data_parallel_size > 1 and (
-                not self._strategy_requires_full_restart(strategy)
+            #
+            # 必须同时要求 backup_parallel_config 非空：故障 executor 若错过
+            # 了之前的 DEGRADE（trigger_decode_fault.sh 允许其 POST 失败），
+            # 它的 backup 为空且当前 dp/tp 仍等于 RECOVER 目标。此时“拓扑
+            # 已匹配”不能证明它的 worker 还活着，健康 executor 已重建目标
+            # barrier，若这里跳过会永久等待该 executor。
+            backup = getattr(self, "backup_parallel_config", {}) or {}
+            if (
+                self.parallel_config.data_parallel_size > 1
+                and backup
+                and not self._strategy_requires_full_restart(strategy)
             ):
                 logger.info(
                     "RECOVER strategy matches current topology "
@@ -1945,6 +2027,27 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 return True
 
             self._cleanup_and_restart_workers()
+
+            # 错过 DEGRADE 的 executor 首次 RECOVER 成功后补一份对称备份，
+            # 使后续重复 RECOVER 能命中上面的幂等分支，且后续 DEGRADE/
+            # RECOVER 的断言与其它 executor 一致。
+            if not backup:
+                current_config = self._get_current_engine_config(strategy)
+                if current_config is not None:
+                    self.backup_parallel_config = {
+                        "data_parallel_rank_local": (
+                            self.parallel_config.data_parallel_rank_local
+                        ),
+                        "data_parallel_rank": current_config.data_parallel_rank,
+                        "data_parallel_size": current_config.dp,
+                        "tensor_parallel_size": current_config.tp,
+                        "world_size": self.parallel_config.world_size,
+                    }
+                    logger.info(
+                        "Populated missing backup_parallel_config after "
+                        "RECOVER: %s",
+                        self.backup_parallel_config,
+                    )
 
             # dp=0 场景：空转状态
             if self.world_size == 0:
@@ -1982,6 +2085,21 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             # **所有 DP**（包括没有故障卡的 DP）都必须重启 worker，
             # 不能只重启故障卡所在的 DP。
             if self._strategy_requires_full_restart(strategy):
+                # 与 DEGRADE 相同的幂等边界：同一份异构/缩容策略重复下发时，
+                # worker world 已经是目标拓扑，不能再次无 barrier 杀 worker。
+                if self._strategy_matches_current_topology(strategy):
+                    logger.info(
+                        "PD_REBUILD strategy already matches current "
+                        "topology (dp=%s, tp=%s); skipping redundant worker "
+                        "restart.",
+                        self.parallel_config.data_parallel_size,
+                        self.parallel_config.tensor_parallel_size,
+                    )
+                    self.executor_state = ExecutorState.RUNNING
+                    self._report_deploy_status(
+                        strategy, DeployState.EXECUTOR_DEPLOY_SUCCESS
+                    )
+                    return True
                 current_config = self._get_current_engine_config(strategy)
                 new_tp = (
                     current_config.new_tp
@@ -2181,6 +2299,72 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             )
         return True
 
+    def _strategy_matches_current_topology(
+        self, strategy: DeployStrategy
+    ) -> bool:
+        """Whether a full-restart strategy already matches this executor.
+
+        Repeated DEGRADE / PD_REBUILD strategies are expected to be
+        idempotent: applying the same target topology again must not kill the
+        just-restarted workers (which would happen without barrier
+        protection) nor silently corrupt the current config.  Only use this
+        for strategies that ``_strategy_requires_full_restart`` says require
+        an all-executor restart.
+        """
+        try:
+            strategy_dict = self._convert_enums_to_values(
+                asdict(strategy)
+            )
+            return strategy_matches_current_topology(
+                strategy_dict,
+                current_tp=self.parallel_config.tensor_parallel_size,
+                current_dp=self.parallel_config.data_parallel_size,
+                current_heterogeneous_dp_config=(
+                    self.parallel_config.heterogeneous_dp_config
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to compare strategy with current topology; "
+                "treating it as a topology change: %s",
+                exc,
+            )
+            return False
+
+    def will_restart_workers_for_strategy(
+        self, strategy: DeployStrategy
+    ) -> bool:
+        """Return whether executing ``strategy`` will actually restart workers.
+
+        This mirrors the idempotency decisions in
+        ``_execute_degrade_strategy`` / ``_execute_pd_rebuild_strategy`` /
+        ``_execute_recover_strategy`` and lets the EngineCore patch skip
+        PD engine-id rotation and KV-connector metadata refresh when the
+        executor is going to short-circuit without restarting workers.
+        """
+        if strategy.deploy_type == DeployType.RECOVER:
+            backup = getattr(self, "backup_parallel_config", {}) or {}
+            if self.parallel_config.data_parallel_size > 1:
+                return not (
+                    backup
+                    and not self._strategy_requires_full_restart(strategy)
+                )
+            return True
+
+        if strategy.deploy_type in (
+            DeployType.DEGRADE,
+            DeployType.PD_REBUILD,
+        ):
+            if self._strategy_requires_full_restart(strategy):
+                return not self._strategy_matches_current_topology(strategy)
+            if strategy.deploy_type == DeployType.PD_REBUILD:
+                return self._is_fault_instance_for_pd(strategy)
+            # Legacy DEGRADE without full restart still restarts this
+            # executor's workers.
+            return True
+
+        return False
+
     def _get_healthy_npu_ids_from_strategy(self, strategy: DeployStrategy) -> list[str] | None:
         """从策略中获取当前节点健康的 NPU ID 列表。
 
@@ -2333,6 +2517,27 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         matched = False
         rm_data_parallel_rank = 0
 
+        # 存活组 barrier（get_surviving_dp_barrier_geometry）在纯 DP 缩容时
+        # 也会对幸存 executor 重新连续编号（例如 DP16->15 且 rank4 故障时，
+        # 原 rank5..15 分别变为新 rank4..14）。parallel_config 必须使用同
+        # 一套编号，否则 worker init_distributed_environment 用旧
+        # data_parallel_rank 计算出的全局 rank 会与新 dp_group 不一致，
+        # 15-rank init_process_group 将出现 rank0 缺失 / rank15 越界并挂死。
+        strategy_dict = self._convert_enums_to_values(asdict(strategy))
+        try:
+            renumbered_dp_rank = get_renumbered_dp_rank(strategy_dict)
+        except ValueError as exc:
+            # 与下方循环的旧行为保持一致：策略缺当前 executor 时告警并
+            # 继续使用 explicit data_parallel_rank / 当前配置，而不是让
+            # restart 直接失败。
+            logger.warning(
+                "Failed to compute renumbered DP rank for strategy "
+                "executor_id=%s: %s",
+                executor_id,
+                exc,
+            )
+            renumbered_dp_rank = None
+
         # 构建完整异构拓扑（跳过 new_tp/new_dp 均为 0 的空转 executor）。
         hetero_configs = []
         for conf in engine_parallel_config_list:
@@ -2368,12 +2573,13 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
         # 纯 DP 扩缩容（各 rank tp 不变且无显式非对称配比）继续走
         # 原有对称流程，避免 legacy 多机/EPLB 场景被 hetero 校验拒绝。
-        hetero_restart = any(
-            (
-                c.new_tp is not None and c.new_tp != c.tp
-            ) or bool(c.tp_asymmetric_shardings)
-            for c in engine_parallel_config_list
-        )
+        # 必须复用 utils.is_heterogeneous_restart 的语义：new_tp=0 /
+        # new_dp=0 的 scale-to-zero executor 不参与 TP 切分，因此不能算作
+        # 异构重启（DP16TP1 -> DP15TP1 应保持 heterogeneous_dp_config=None）。
+        # 局部用 ``new_tp != tp`` 判断会把故障 executor 的 1->0 误判为
+        # 异构，给所有存活 D rank 注入 tp=1 的 heterogeneous_dp_config，
+        # 使 decode 模型错误走 DeepSeek hetero 前向/组网分支。
+        hetero_restart = is_heterogeneous_restart(strategy_dict)
         hetero_configs_for_pc = hetero_configs if hetero_restart else None
         own_dp_rank = (
             next(
@@ -2384,7 +2590,7 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 ),
                 None,
             )
-            if hetero_restart else None
+            if hetero_restart else renumbered_dp_rank
         )
 
         for idx, engine_parallel_config in enumerate(engine_parallel_config_list):

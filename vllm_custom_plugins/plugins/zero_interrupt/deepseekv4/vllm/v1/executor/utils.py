@@ -5,6 +5,47 @@ from collections.abc import Sequence
 logger = logging.getLogger("vllm_custom_plugins")
 
 
+def reserve_restart_ports(parallel_config):
+    """Reserve the barrier ports and one fixed worker-world port.
+
+    Returns ``(BarrierPortPool, worker_world_port)``.  The two barrier ports
+    and the worker-world port are popped from ``parallel_config`` *in the
+    executor process*, before any worker inherits a config copy.  Every DP
+    executor runs this identical code path, so all of them reserve the same
+    numeric ports.
+
+    The worker-world port is then pinned back onto the config (see
+    :func:`pin_worker_world_port`).  It must NOT be popped again inside each
+    worker process: the per-worker config copies can drift apart across
+    generations (a scale-to-zero executor spawns no worker during DP shrink,
+    while the survivors consume one port), and a later RECOVER would make the
+    restored executor join a different TCPStore port than its peers.
+    """
+    if parallel_config.data_parallel_size <= 1:
+        return BarrierPortPool(), None
+
+    barrier_ports = [
+        parallel_config.get_next_dp_init_port() for _ in range(2)
+    ]
+    worker_world_port = parallel_config.get_next_dp_init_port()
+    pin_worker_world_port(parallel_config, worker_world_port)
+    return BarrierPortPool(barrier_ports), worker_world_port
+
+
+def pin_worker_world_port(parallel_config, worker_world_port) -> None:
+    """Point ``parallel_config``'s DP init-port source at one fixed port.
+
+    Worker processes call ``get_next_dp_init_port()`` while building their
+    global distributed world.  Clearing the port list and setting
+    ``data_parallel_master_port`` to the reserved value makes every worker
+    copy (and every restart generation) select the same TCPStore port.  Old
+    workers are fully terminated before the next generation starts, so the
+    port is free for reuse.
+    """
+    parallel_config._data_parallel_master_port_list = []
+    parallel_config.data_parallel_master_port = int(worker_world_port)
+
+
 class BarrierPortPool:
     """Round-robin pool of pre-reserved barrier rendezvous ports.
 
@@ -149,7 +190,14 @@ def get_heterogeneous_dp_config(zero_interrupt_config):
             continue
         ratios = conf.get("tp_asymmetric_shardings", None)
         if ratios is None and new_tp is not None and new_tp != conf.get("tp"):
-            ratios = _legacy_ratios(int(conf.get("tp")), tp_size)
+            # Delegate to the same fallback used by the weight loaders so the
+            # remainder direction can never drift apart again.
+            ratios = get_tp_asymmetric_shardings(
+                {
+                    "executor_id": conf.get("executor_id"),
+                    "engine_parallel_config": [conf],
+                }
+            )
         configs.append(
             {
                 "dp_rank": int(conf.get("data_parallel_rank", 0)),
@@ -202,15 +250,6 @@ def get_global_start_rank(zero_interrupt_config):
     )
 
 
-def _legacy_ratios(ori_tp: int, asym_tp: int) -> list[int]:
-    base = ori_tp // asym_tp
-    remainder = ori_tp % asym_tp
-    ratios = [base] * asym_tp
-    for i in range(remainder):
-        ratios[asym_tp - 1 - i] += 1
-    return ratios
-
-
 def _original_dp_rank(conf: dict) -> int:
     """Return the pre-restart DP rank of one engine_parallel_config entry."""
     rank = conf.get("data_parallel_rank", None)
@@ -246,6 +285,60 @@ def get_scale_to_zero_dp_ranks(zero_interrupt_config) -> set[int]:
     return scale_to_zero_ranks
 
 
+def strategy_matches_current_topology(
+    zero_interrupt_config,
+    current_tp: int,
+    current_dp: int,
+    current_heterogeneous_dp_config=None,
+) -> bool:
+    """Return True when a strategy would not change THIS executor's topology.
+
+    Used as the idempotency boundary for repeated DEGRADE/PD_REBUILD
+    strategies.  A repeated full-restart strategy must not restart workers
+    again without a barrier, but must also not silently drop a strategy whose
+    target topology differs from the executor's current one.
+    """
+    executor_id = str(zero_interrupt_config.get("executor_id", ""))
+    conf = _find_engine_parallel_config(
+        {"executor_id": executor_id,
+         "engine_parallel_config": zero_interrupt_config.get(
+             "engine_parallel_config", [])}
+    )
+    if conf is None:
+        return False
+
+    new_tp = conf.get("new_tp", None)
+    new_dp = conf.get("new_dp", None)
+    if new_tp is None:
+        new_tp = conf.get("tp", 1)
+    if new_dp is None:
+        new_dp = conf.get("dp", 1)
+    if int(current_tp) != int(new_tp) or int(current_dp) != int(new_dp):
+        return False
+
+    target_is_hetero = is_heterogeneous_restart(zero_interrupt_config)
+    current_is_hetero = current_heterogeneous_dp_config is not None
+    if current_is_hetero != target_is_hetero:
+        return False
+    if not target_is_hetero:
+        return True
+
+    target_configs = get_heterogeneous_dp_config(zero_interrupt_config)
+    current_configs = [
+        {
+            "dp_rank": int(cfg.dp_rank),
+            "tp_size": int(cfg.tp_size),
+            "tp_sharding_ratios": (
+                [int(r) for r in cfg.tp_sharding_ratios]
+                if cfg.tp_sharding_ratios is not None
+                else None
+            ),
+        }
+        for cfg in current_heterogeneous_dp_config
+    ]
+    return current_configs == target_configs
+
+
 def recover_requires_full_restart(
     backup: dict,
     current_tp: int,
@@ -274,6 +367,75 @@ def recover_requires_full_restart(
             and int(backup_dp) != int(current_dp)
         )
         or int(target_dp or 0) != int(current_dp or 0)
+    )
+
+
+def get_renumbered_dp_rank(zero_interrupt_config) -> int | None:
+    """Return this executor's contiguous rank among surviving DP executors.
+
+    Mirrors the survivor renumbering used by
+    :func:`get_surviving_dp_barrier_geometry`, but is usable by
+    ``_get_engine_parallel_config`` for pure DP shrink strategies as well
+    (where ``heterogeneous_dp_config`` stays None but the barrier still
+    renumbers the survivors).  A scale-to-zero executor returns ``None`` so
+    the caller can keep its original rank while it has no workers.
+    """
+    executor_id = str(zero_interrupt_config.get("executor_id", ""))
+    ordered = sorted(
+        zero_interrupt_config.get("engine_parallel_config", []),
+        key=_original_dp_rank,
+    )
+    active_rank = 0
+    for conf in ordered:
+        new_tp = conf.get("new_tp", None)
+        new_dp = conf.get("new_dp", None)
+        if new_tp is None:
+            new_tp = conf.get("tp", 1)
+        if new_dp is None:
+            new_dp = conf.get("dp", 1)
+        if int(new_tp) == 0 and int(new_dp) == 0:
+            if str(conf.get("executor_id", None)) == executor_id:
+                return None
+            continue
+        if str(conf.get("executor_id", None)) == executor_id:
+            return active_rank
+        active_rank += 1
+
+    raise ValueError(
+        f"executor_id={executor_id!r} was not found in "
+        "engine_parallel_config."
+    )
+
+
+def get_pd_scheduler_connector_topology(
+    parallel_config,
+    kv_port: int,
+) -> tuple[int, int, int]:
+    """Return the PD scheduler-connector topology after a restart.
+
+    The scheduler connector survives worker restarts, so every deployment
+    must refresh ``(side_channel_port, tp_size, max_device_id)`` from the
+    post-restart ``parallel_config``.  In particular, RECOVER from
+    DP4TP(3,4,4,4) back to DP4TP4 flips ``is_heterogeneous_tp`` to False;
+    only refreshing inside the hetero branch would leave the connector
+    advertising the old tp=3 / 15-device layout to the decode pool.
+    """
+    if getattr(parallel_config, "is_heterogeneous_tp", False):
+        port_offset = parallel_config.get_rank_offset_for_dp(
+            parallel_config.data_parallel_rank
+        )
+    else:
+        pcp_size = parallel_config.prefill_context_parallel_size
+        port_offset = (
+            parallel_config.data_parallel_rank
+            * parallel_config.tensor_parallel_size
+            * parallel_config.pipeline_parallel_size
+            * pcp_size
+        )
+    return (
+        kv_port + port_offset,
+        parallel_config.tensor_parallel_size,
+        parallel_config.world_size_across_dp,
     )
 
 

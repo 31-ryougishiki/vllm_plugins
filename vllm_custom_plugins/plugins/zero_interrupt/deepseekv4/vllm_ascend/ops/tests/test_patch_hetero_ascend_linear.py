@@ -354,6 +354,22 @@ class TestHeteroAscendLinearScaffolding(unittest.TestCase):
             [(4096, (3414,)), (4096, (4096, 1024))],
         )
 
+    def test_hetero_col_init_preserves_preexisting_output_sizes(self):
+        # AscendQKVParallelLinear sets its q/k/v split before calling
+        # AscendColumnParallelLinear.__init__ WITHOUT output_sizes; the
+        # patched initializer must keep that split instead of collapsing it.
+        layer = _FakeLayer()
+        layer.output_sizes = [1024, 512, 512]
+        self._col_cls.__init__(
+            layer,
+            input_size=4096,
+            output_size=2048,
+            bias=False,
+            prefix=layer.prefix,
+            output_sizes=None,
+        )
+        self.assertEqual(layer.output_sizes, [1024, 512, 512])
+
     def test_hetero_row_init_scaffolds_divisible_input_size(self):
         layer = _FakeLayer()
         self._row_cls.__init__(

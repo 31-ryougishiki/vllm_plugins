@@ -2,12 +2,13 @@ from setuptools import setup, find_packages
 import os
 import subprocess
 import shutil
+import sys
 
 
 # NOTE: [lqf] This is tmp solution to patch rotary_embedding related func
 def get_package_location(package_name):
     result = subprocess.run(
-        ['python3', '-c', f'import {package_name}; print({package_name}.__file__)'],
+        [sys.executable, '-c', f'import {package_name}; print({package_name}.__file__)'],
         capture_output=True, text=True
     )
     if result.returncode == 0:
@@ -44,7 +45,7 @@ def find_package_dir(pip_name, import_name, package_subdir, import_env=None):
     # 方式1: pip show
     try:
         pip_show_result = subprocess.run(
-            ['pip', 'show', pip_name],
+            [sys.executable, '-m', 'pip', 'show', pip_name],
             capture_output=True, text=True
         )
         if pip_show_result.returncode == 0:
@@ -71,7 +72,7 @@ def find_package_dir(pip_name, import_name, package_subdir, import_env=None):
     # 方式2: import fallback
     try:
         result = subprocess.run(
-            ['python3', '-c', f'import {import_name}; print({import_name}.__file__)'],
+            [sys.executable, '-c', f'import {import_name}; print({import_name}.__file__)'],
             capture_output=True, text=True, env=import_env
         )
         if result.returncode == 0:

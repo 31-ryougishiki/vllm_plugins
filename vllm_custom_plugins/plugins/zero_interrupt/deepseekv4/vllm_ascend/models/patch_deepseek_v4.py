@@ -294,7 +294,11 @@ def _patched_dsv4_attention_init(
     # it and refresh every DSA reference to the parameter.
     old_sink = self.attn_sink
     new_sink = nn.Parameter(
-        torch.empty(self.n_local_heads, dtype=old_sink.dtype)
+        torch.empty(
+            self.n_local_heads,
+            dtype=old_sink.dtype,
+            device=old_sink.device,
+        )
     )
     if old_sink is not None and old_sink.numel() > 0:
         copied = min(old_sink.numel(), new_sink.numel())
@@ -305,6 +309,13 @@ def _patched_dsv4_attention_init(
         dsa_attn.attn_sink = new_sink
         if inner is not None:
             inner.attn_sink = new_sink
+            # The DSA impl object keeps its own copy of attn_sink.  Without
+            # refreshing it, the non-CP DSA v1 kernels still consume the old
+            # uniform-size sink while the model parameter has already been
+            # resized/loaded with the ratio-aware head count.
+            impl = getattr(inner, "impl", None)
+            if impl is not None:
+                impl.attn_sink = new_sink
         modules = getattr(dsa_attn, "dsa_modules", None)
         if modules is not None:
             modules.attn_sink = new_sink

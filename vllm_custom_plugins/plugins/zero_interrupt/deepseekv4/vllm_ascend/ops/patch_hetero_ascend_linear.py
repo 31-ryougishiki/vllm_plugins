@@ -202,10 +202,17 @@ def _patched_col_init(
 ):
     # Preserve the original __init__'s `hasattr(self, "output_sizes")`
     # behaviour and make the Merged subclass path deterministic.
-    real_output_sizes = (
-        list(output_sizes) if output_sizes is not None else None
-    )
-    self.output_sizes = real_output_sizes or [output_size]
+    # AscendQKVParallelLinear sets its q/k/v split on ``self.output_sizes``
+    # BEFORE calling this initializer without an ``output_sizes`` argument;
+    # overwriting that split with ``[output_size]`` would turn the QKV layer
+    # into one fused partition.
+    if output_sizes is not None:
+        real_output_sizes = list(output_sizes)
+    elif hasattr(self, "output_sizes"):
+        real_output_sizes = list(self.output_sizes)
+    else:
+        real_output_sizes = [output_size]
+    self.output_sizes = real_output_sizes
     ratios = _ratios_for(disable_tp)
     self._tp_sharding_ratios = ratios
 
