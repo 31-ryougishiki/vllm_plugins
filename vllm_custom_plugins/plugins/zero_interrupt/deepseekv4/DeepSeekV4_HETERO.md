@@ -89,6 +89,25 @@
 > 的设备隔离/Ray 路径尚未接入，当前仍依赖每个 executor 独立设置
 > `ASCEND_RT_VISIBLE_DEVICES`。
 
+## 3.1 重启端口与幂等边界（场景 2/3 关键）
+
+- **worker-world 端口固定**：ITS executor 初始化时在 DP 端口池中额外保留
+  一个固定端口，并在每次 `_init_workers()`（含 scale-to-zero executor）
+  重新钉回 `ParallelConfig`。worker 进程不再各自从本地端口列表 pop，避免
+  DP16→15 时存活 executor 消费端口、缩零 executor 不消费，导致 RECOVER 时
+  恢复卡与其余 15 卡使用不同 TCPStore 端口而永久挂起。
+- **barrier 端口**：存活组 barrier 仍使用两槽轮转池；首次 RECOVER 且本
+  executor 没有 DEGRADE 备份（说明它可能错过了前一次缩容策略）时，确定性
+  选择第二槽端口，并强制重建目标 dp_group。健康 executor 在本次 RECOVER
+  轮转一次后，两端端口池重新对齐。
+- **重复策略幂等**：DEGRADE / PD_REBUILD 全量重启若目标拓扑与当前
+  `heterogeneous_dp_config`/tp/dp 完全一致，执行器只上报成功、不再杀
+  worker；RECOVER 只有在本 executor 持有非空 `backup_parallel_config`
+  且拓扑一致时才跳过，否则按全量重启处理。
+- **PD 元数据只在真实重启后刷新**：幂等跳过的策略不会轮换
+  `engine_id`、清空/刷新 scheduler connector 元数据，避免 scheduler 侧
+  新 engine_id 与未重启 worker 的旧 engine_id 不一致。
+
 ## 4 DeepSeek-V4 patch 清单
 
 所有 DeepSeek-V4 相关修改均以运行时 patch 实现，目录名与

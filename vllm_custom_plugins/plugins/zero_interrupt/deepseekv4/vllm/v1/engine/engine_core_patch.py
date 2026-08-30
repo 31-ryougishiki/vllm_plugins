@@ -738,8 +738,32 @@ def patch_engine_core() -> None:
             # 1. 通过修改executor的vllm_config, 可以修改worker connector的engine-id
             vllm_config = executor.vllm_config
 
-            # 仅在 PD 分离场景（kv_transfer_config 不为 None）下执行 engine_id 更新逻辑
-            if is_pd_separated(vllm_config):
+            # 幂等 RECOVER / 重复 DEGRADE 会在 executor 内短路，不会真正
+            # 重启 worker。此时绝不能轮换 engine_id 或刷新 connector 元数据：
+            # scheduler 侧会被改成新 id，而 worker 仍持有旧 id。
+            try:
+                will_restart = bool(
+                    executor.will_restart_workers_for_strategy(
+                        executor.current_strategy
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[PD] failed to check whether workers will restart; "
+                    "falling back to full-restart flag: %s",
+                    exc,
+                )
+                try:
+                    will_restart = bool(
+                        executor._strategy_requires_full_restart(
+                            executor.current_strategy
+                        )
+                    )
+                except Exception:
+                    will_restart = False
+
+            # 仅在 PD 分离场景且确实会重启 worker 时执行 engine_id 更新逻辑
+            if will_restart and is_pd_separated(vllm_config):
                 from uuid import uuid4
 
                 ori_engine_id = vllm_config.kv_transfer_config.engine_id
@@ -749,19 +773,11 @@ def patch_engine_core() -> None:
                 # 为 key 缓存远端元数据且不会主动失效，若 P 保持原 engine_id，
                 # D 会继续使用旧地址传输，PD 链路必然失败。因此 producer
                 # 全量重启时强制轮换 engine_id，让 D 对新 key 重新拉取元数据。
-                try:
-                    full_restart = bool(
-                        executor._strategy_requires_full_restart(
-                            executor.current_strategy
-                        )
+                full_restart = bool(
+                    executor._strategy_requires_full_restart(
+                        executor.current_strategy
                     )
-                except Exception as exc:
-                    logger.warning(
-                        "[PD] failed to check full-restart strategy, "
-                        "keeping current engine_id: %s",
-                        exc,
-                    )
-                    full_restart = False
+                )
                 kv_role = getattr(
                     vllm_config.kv_transfer_config, "kv_role", None
                 )
@@ -833,13 +849,13 @@ def patch_engine_core() -> None:
             # PD 分离且 worker 重启后，scheduler connector 里保存的仍是旧
             # worker 的 handshake 元数据。异构重启后端口/engine_id 都会变，
             # 必须从新 worker 重新收集并刷新，否则 decode 端会按旧端口
-            # 拉 KV，PD 链路无法恢复。
-            if success and is_pd_separated(vllm_config):
+            # 拉 KV，PD 链路无法恢复。幂等跳过的策略没有新 worker，不要刷新。
+            if success and will_restart and is_pd_separated(vllm_config):
                 if hasattr(executor, "update_kv_connector_metadata"):
                     executor.update_kv_connector_metadata(engine_core)
             
-            # 仅 PD 分离场景
-            if is_pd_separated(vllm_config):
+            # 仅 PD 分离且 worker 确实重启后刷新 scheduler connector 拓扑。
+            if success and will_restart and is_pd_separated(vllm_config):
                 # 5. 更新 scheduler connector 的 side_channel_port 及拓扑字段。
                 # 异构 TP（DP4TP(3,4,4,4)）下 DP 端口偏移是累计的
                 # 0/3/7/11，不能再用 dp_rank * tp_size 的均匀公式。
@@ -857,6 +873,7 @@ def patch_engine_core() -> None:
                     parallel_config,
                     vllm_config.kv_transfer_config.kv_port,
                 )
+                sched_kv_connector = engine_core.scheduler.get_kv_connector()
                 sched_kv_connector.connector_scheduler.side_channel_port = side_channel_port
                 sched_kv_connector.connector_scheduler.tp_size = scheduler_tp_size
                 sched_kv_connector.connector_scheduler.max_device_id = scheduler_max_device_id
@@ -874,12 +891,17 @@ def patch_engine_core() -> None:
                 setattr(engine_core, "zero_interrupt_mode", "stop")
 
         logger.debug(f"++++[mzm]++++Deployment strategy execution result: {success}++++[mzm]++++")
-        # STOP/DEGRADE: 如果 world_size 变为 0，进入空闲模式，发送空转通知
-        if success and executor.current_strategy.deploy_type in (DeployType.STOP, DeployType.DEGRADE):
-            logger.debug(f"++++[mzm]++++Strategy deploy type: {executor.current_strategy.deploy_type}, world_size: {getattr(executor, 'world_size', 'unknown')}++++[mzm]+++")
-            if getattr(executor, "world_size", 1) == 0:
-                logger.info("Strategy resulted in world_size=0, entering idle mode")
-                _send_idle_notification(engine_core)
+        # 任何策略（包括 PD_REBUILD 的 scale-to-zero executor）只要
+        # world_size 变为 0，都必须向 coordinator/client 发送空转通知。
+        # 否则 DPLB 客户端不知道该 engine 已 idle，继续向其路由 ADD，
+        # 而 idle engine 会丢弃这些请求导致客户端永久等待。
+        if success and getattr(executor, "world_size", 1) == 0:
+            logger.debug(
+                "++++[mzm]++++Strategy deploy type: %s, world_size: 0",
+                executor.current_strategy.deploy_type,
+            )
+            logger.info("Strategy resulted in world_size=0, entering idle mode")
+            _send_idle_notification(engine_core)
         # 如果 world_size 变为非 0，发送恢复通知给客户端
         if success and getattr(executor, "world_size", 0) > 0:
             _send_recovered_notification(engine_core)

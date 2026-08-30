@@ -26,6 +26,7 @@ is_heterogeneous_restart = _utils.is_heterogeneous_restart
 pin_worker_world_port = _utils.pin_worker_world_port
 recover_requires_full_restart = _utils.recover_requires_full_restart
 reserve_restart_ports = _utils.reserve_restart_ports
+strategy_matches_current_topology = _utils.strategy_matches_current_topology
 
 
 class TestHeteroUtils(unittest.TestCase):
@@ -179,6 +180,79 @@ class TestHeteroUtils(unittest.TestCase):
         }
         self.assertFalse(is_heterogeneous_restart(cfg))
         self.assertEqual(get_tp_asymmetric_shardings(cfg), [])
+
+    def test_strategy_matches_current_topology_for_repeated_dp_shrink(self):
+        cfg = {
+            "executor_id": "14",
+            "engine_parallel_config": [
+                {"executor_id": str(i), "dp": 16, "tp": 1,
+                 "data_parallel_rank": i, "new_dp": 15, "new_tp": 1}
+                for i in range(15)
+            ] + [
+                {"executor_id": "15", "dp": 16, "tp": 1,
+                 "data_parallel_rank": 15, "new_dp": 0, "new_tp": 0}
+            ],
+        }
+        # Healthy survivor after the first shrink.
+        self.assertTrue(
+            strategy_matches_current_topology(
+                cfg, current_tp=1, current_dp=15,
+                current_heterogeneous_dp_config=None,
+            )
+        )
+        # Scale-to-zero executor after the first shrink.
+        cfg_zero = {
+            "executor_id": "15",
+            "engine_parallel_config": cfg["engine_parallel_config"],
+        }
+        self.assertTrue(
+            strategy_matches_current_topology(
+                cfg_zero, current_tp=0, current_dp=0,
+                current_heterogeneous_dp_config=None,
+            )
+        )
+
+    def test_strategy_matches_current_topology_detects_change(self):
+        cfg = {
+            "executor_id": "14",
+            "engine_parallel_config": [
+                {"executor_id": str(i), "dp": 16, "tp": 1,
+                 "data_parallel_rank": i, "new_dp": 15, "new_tp": 1}
+                for i in range(15)
+            ] + [
+                {"executor_id": "15", "dp": 16, "tp": 1,
+                 "data_parallel_rank": 15, "new_dp": 0, "new_tp": 0}
+            ],
+        }
+        self.assertFalse(
+            strategy_matches_current_topology(
+                cfg, current_tp=1, current_dp=16,
+                current_heterogeneous_dp_config=None,
+            )
+        )
+
+    def test_strategy_matches_current_topology_for_repeated_hetero(self):
+        cfg = self._strategy()
+        cfg["executor_id"] = "0"
+        target = get_heterogeneous_dp_config(cfg)
+        current = [
+            type("H", (), {"dp_rank": c["dp_rank"], "tp_size": c["tp_size"],
+                           "tp_sharding_ratios": c["tp_sharding_ratios"]})
+            for c in target
+        ]
+        self.assertTrue(
+            strategy_matches_current_topology(
+                cfg, current_tp=3, current_dp=4,
+                current_heterogeneous_dp_config=current,
+            )
+        )
+        # A symmetric current topology does not match the hetero target.
+        self.assertFalse(
+            strategy_matches_current_topology(
+                cfg, current_tp=4, current_dp=4,
+                current_heterogeneous_dp_config=None,
+            )
+        )
 
     def test_surviving_dp_barrier_geometry_excludes_scale_to_zero(self):
         cfg = {

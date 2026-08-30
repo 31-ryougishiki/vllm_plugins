@@ -1067,8 +1067,20 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             if engine_core is not None else False
         )
         needs_target_dp_group = bool(scale_to_zero_ranks)
+        # An executor that missed the preceding DEGRADE has no
+        # backup_parallel_config.  Its current dp/tp and group size can look
+        # exactly like the RECOVER target, but the healthy executors already
+        # replaced the pre-restart group and will build a fresh target group;
+        # reusing the stale local group here would wait forever.  Force this
+        # executor into the same fresh target-group build.
+        missed_prior_degrade = bool(
+            strategy is not None
+            and strategy.deploy_type == DeployType.RECOVER
+            and not getattr(self, "backup_parallel_config", {})
+        )
         if surviving_dp_size is not None and (
-            dp_sync_excluded
+            missed_prior_degrade
+            or dp_sync_excluded
             or int(current_dp_size or 0) != int(surviving_dp_size)
             or (
                 old_dp_group_size is not None
@@ -1958,7 +1970,11 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                     self.parallel_config.data_parallel_size,
                     self.parallel_config.tensor_parallel_size,
                 )
-                self.executor_state = ExecutorState.RUNNING
+                self.executor_state = (
+                    ExecutorState.STOPPED
+                    if self.world_size == 0
+                    else ExecutorState.RUNNING
+                )
                 self._report_deploy_status(
                     strategy, DeployState.EXECUTOR_DEPLOY_SUCCESS
                 )
@@ -2095,7 +2111,11 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                         self.parallel_config.data_parallel_size,
                         self.parallel_config.tensor_parallel_size,
                     )
-                    self.executor_state = ExecutorState.RUNNING
+                    self.executor_state = (
+                        ExecutorState.STOPPED
+                        if self.world_size == 0
+                        else ExecutorState.RUNNING
+                    )
                     self._report_deploy_status(
                         strategy, DeployState.EXECUTOR_DEPLOY_SUCCESS
                     )
