@@ -75,6 +75,37 @@ vllm_plugins_hetero_test:
 
 ---
 
+## 0.2 测试仓脚本映射（vllm_plugins_hetero_test）
+
+三个场景的**完整测试入口**是 `pd_hetero/` 下的端到端编排脚本，它们自动完成
+“健康检查 → 基线请求 → 触发 → 等待恢复 → 复测 → 输出对比”；
+`decision_center/` 入口只是给编排脚本设置 `TRIGGER_MODE=dc` 的薄包装，
+旧手动触发脚本则只做“下发策略”，不负责请求校验。
+
+| 场景 | 端到端编排（P 节点执行） | 决策中心入口（P 节点） | 手动触发 | D 单机子测试（D 节点） |
+|---|---|---|---|---|
+| 场景 1 | `pd_hetero/run_scenario1.sh`（`TRIGGER_MODE=manual/dc`） | `decision_center/run_scenario1_dc.sh` | `trigger_hetero_restart.sh` | —（golden 对照用 `hetero_cp/`） |
+| 场景 2 | `pd_hetero/run_scenario2.sh`（`TRIGGER_MODE=ssh/local/skip/dc`） | `decision_center/run_scenario2_dc.sh` | `pd_hetero/decode/trigger_decode_fault.sh` | `pd_hetero/decode/run_decode_fault_alone.sh` |
+| 场景 3 | `pd_hetero/run_scenario3.sh`（`RECOVER_TARGET=both/prefill/decode`） | `decision_center/run_scenario3_dc.sh` | `trigger_prefill_recover.sh` + `pd_hetero/decode/trigger_decode_recover.sh` | `pd_hetero/decode/run_decode_recover_alone.sh` |
+| 全流程 | — | `decision_center/run_all_dc.sh`（场景 1 → 2 → 3） | — | — |
+
+配套脚本（不构成场景编号）：
+
+| 脚本 | 作用 |
+|---|---|
+| `install_vllm_plugins.sh` | 安装 wheel + 统一整文件替换，并做 import / patch / tool-parser 校验 |
+| `launch_prefill_hetero_test.sh` | P 节点拉起对称 `DP4TP4`（手动模式基座，默认无决策中心） |
+| `pd_hetero/decode/launch_decode_pd.sh` | D 节点拉起 `DP16TP1` |
+| `pd_hetero/common.sh` | 三个编排脚本的公共函数库：HTTP/日志等待、warmup、请求、输出对比、proxy/决策中心/D 端触发封装 |
+| `pd_hetero/proxy_instance.py` | PD 代理实例 `add/remove` 工具 |
+| `decision_center/launch_prefill_dc.sh` / `launch_decode_dc.sh` | 决策中心模式拉起 P/D 并注册（统一 `VLLM_SERVICE_ID`） |
+| `pd_hetero/proxy/start_proxy_pd.sh` + `load_balance_proxy_server.py` | PD 负载均衡代理（P 节点，默认端口 8000） |
+| `pd_hetero/send_pd_request.py` | 经代理发请求，输出 `RESULT_TEXT=` / `FINISH_REASON=` |
+| `pd_hetero/check_decode_unchanged.sh` | 校验场景 1 中 D 端 16 engine 健康且日志无 restart 记录 |
+| `decision_center/trigger_fault.sh` / `repair_devices.sh` | 决策中心通用触发/恢复命令 |
+
+---
+
 ## 1. 后续开发方向
 
 ### 方向 A：Decode DP16 -> DP15 的异构推理实现与精度问题解决
@@ -300,12 +331,83 @@ grep -R "Full-restart barrier passed" logs/decode/
 
 ### 5.4 旧手动触发脚本（仍兼容）
 
+以下脚本只负责“向 executor 下发策略”，不带请求与输出校验；完整测试优先用
+5.5 的 `pd_hetero/run_scenario*.sh`：
+
 ```bash
 bash trigger_hetero_restart.sh                # 场景 1 手动
 bash trigger_prefill_recover.sh               # 场景 3 P 恢复手动
 bash pd_hetero/decode/trigger_decode_fault.sh   # 场景 2 手动
 bash pd_hetero/decode/trigger_decode_recover.sh # 场景 3 D 恢复手动
 ```
+
+### 5.5 PD 端到端编排脚本（场景完整测试入口）
+
+- **场景 1 `pd_hetero/run_scenario1.sh`**（P 节点）：
+  1. 健康检查：P 4 个 engine + D 16 个 engine + 代理 `/healthcheck`；
+  2. PD 链路 warmup 覆盖全部 16 个 decoder，吸收首次 `recomputed`，
+     防止“正确文本 + 无关数据”的拼接污染；
+  3. 基线请求（temperature=0 贪心）存 `logs/pd_scenario1/pre_hetero.json`；
+  4. 触发 P `DP4TP(3,4,4,4)`（`manual` 直连 executor / `dc` 决策中心）；
+  5. 等待 P 4 个 `/health` + `Full-restart barrier passed` +
+     `KV connector metadata updated successfully`；
+  6. `check_decode_unchanged.sh` 证明 D 端 16 engine 未被重启；
+  7. 复测请求存 `post_hetero.json`，与基线 `choices[0].text` 默认完全一致。
+
+- **场景 2 `pd_hetero/run_scenario2.sh`**（P 节点）：
+  1. 健康检查 P 对称 + D `DP16TP1`，发基线请求；
+  2. 记录 P 端 restart 日志计数（用于证明 P 未变）；
+  3. 触发 D 降级：`ssh` / `local` / `skip`（已在 D 节点触发过）/
+     `dc`（决策中心）；故障 executor 缩到 `new_dp=0/new_tp=0`；
+  4. `dc` 模式下动态探测实际存活 decoder 数（决策中心可能因专家数整除
+     约束选择其它合法 DP 数），并摘除全部不可用 decoder；
+  5. 从代理摘除故障 decoder，warmup 覆盖存活 decoder，发复测请求；
+  6. 对比两次输出，并确认 P 端 restart 计数无新增。
+
+- **场景 3 `pd_hetero/run_scenario3.sh`**（P 节点）：
+  1. 前置校验：P 4 engine 在线（异构亦可）、D 15 健康 + 故障 executor
+     空转、代理在线；
+  2. P RECOVER `DP4TP(3,4,4,4) -> DP4TP4`，等待 barrier + KV 元数据恢复，
+     并确认 D 的 15 个 decoder 在 P 轮换 engine_id 后仍健康；
+  3. D RECOVER `DP15TP1 -> DP16TP1`：向全部 16 个 executor 下发，恢复的
+     executor 15 必须 `Full-restart barrier passed`（不是 skipped）；
+  4. 恢复的 decoder 15 加回代理，warmup 覆盖当前全部 decoder，发复测请求；
+  5. 按 `RECOVER_TARGET` 自动选择基线对比：
+     `both` → 场景 1 的 `pre_hetero.json`；`prefill` → 场景 2 的
+     `post_decode_fault.json`；`decode` → 场景 1 的 `post_hetero.json`；
+     也可用 `BASELINE_OUTPUT` 显式指定。
+
+- **D 单机子测试**（D 节点，不依赖 P 和代理）：
+  `run_decode_fault_alone.sh` = 场景 2 的“基线 → 降级 → 15 卡健康 →
+  复测对比”；`run_decode_recover_alone.sh` = 场景 3 的“15 健康 + 1 idle →
+  RECOVER → 16 卡健康 → 对比 `decode_fault_alone/pre_fault.json`”。
+
+- **决策中心薄包装**：`decision_center/run_scenario{1,2,3}_dc.sh` 只是设置
+  `TRIGGER_MODE=dc` 及节点/IP 后调用对应的 `pd_hetero/run_scenario*.sh`；
+  `run_all_dc.sh` 按 1 → 2 → 3 串联。决策中心模式要求 P/D 的 20 个
+  executor 使用同一个 `VLLM_SERVICE_ID`（默认 `pd-hetero-service`），
+  场景 3 恢复 both 时必须在一次 `repair/devices` 请求中上报全部坏卡。
+
+### 5.6 测试脚本关键环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `VLLM_ITS_DEEPSEEK_V4` | 1（所有 launch 脚本） | DeepSeek-V4 patch 族；手工启动时必须自己导出 |
+| `DECODE_HOST` | 必填 | decode 节点 IP |
+| `SSH_DECODE` | 空 | `TRIGGER_MODE=ssh` 时必填，如 `root@<ip>` |
+| `TRIGGER_MODE` | 场景1 `manual`；场景2/3 `ssh` | `manual` 直连 executor；`ssh` / `local` / `skip`（场景2）；`dc` 决策中心 |
+| `RECOVER_TARGET` | `both` | 场景3 恢复范围：`both` / `prefill` / `decode` |
+| `FAULT_NPU` | 3 | 场景1 故障卡，必须属于 DP0 的 NPU 0..3 |
+| `DECODE_FAULT_NPU` | 15 | 场景2/3 故障卡，范围 0..15 |
+| `REQUIRE_OUTPUT_MATCH` | 1 | 1=异构/缩容/恢复前后输出必须完全一致；0=仅要求非空 |
+| `BASELINE_OUTPUT` | 按 `RECOVER_TARGET` 自动选择 | 场景3 对比基线 JSON 路径 |
+| `WARMUP_REQUESTS` | 场景1=16；场景2 基线=16、降级后=15 | 成功预热请求数，必须覆盖全部 active decoder |
+| `WARMUP_RETRIES` / `WARMUP_INTERVAL` | 30 / 10 | 预热仍 recompute/失败时的额外重试次数与间隔（秒） |
+| `START_PREFILL` / `START_PROXY` | 1 | 编排脚本是否自动拉起 P / 代理 |
+| `RESTART_TIMEOUT` | 900 | 等待全量重启 / KV 恢复的超时秒数 |
+| `DECISION_CENTER_URL` | `http://7.246.78.79:8088` | `TRIGGER_MODE=dc` 时使用 |
+| `VLLM_SERVICE_ID` | `pd-hetero-service`（dc launch 脚本） | P/D 所有 executor 必须一致 |
+| `PROXY_PORT` | 8000 | PD 负载均衡代理端口（P 节点） |
 
 ---
 
