@@ -375,27 +375,40 @@ def _patched_token_dispatch_allgather(self, token_dispatch_input):
             from vllm.logger import init_logger as _init_logger
 
             _diag_logger = _init_logger(__name__)
-            _mapped_count = int((expert_map != -1).sum().item())
-            _mapped_ids = expert_map[expert_map != -1].tolist()
+            # expert_map is a global->local mapping: the non-(-1) INDICES are
+            # global expert ids, while the VALUES are this rank's local ids.
+            _mapped_global_ids = torch.where(expert_map != -1)[0].tolist()
+            _mapped_local_ids = expert_map[expert_map != -1].tolist()
             _diag_logger.warning_once(
                 "[hetero-moe diag] token_dispatch_allgather expert map: "
                 "num_experts=%s ep_size=%s num_experts_local=%s first=%s "
-                "last=%s len(expert_map)=%s mapped_ids=%s",
+                "last=%s len(expert_map)=%s mapped_global_ids=%s "
+                "mapped_local_ids=%s",
                 self.num_experts,
                 self.ep_size,
                 self.num_experts_local,
                 first_expert_idx,
                 last_expert_idx,
                 len(expert_map),
-                str(_mapped_ids),
+                str(_mapped_global_ids),
+                str(_mapped_local_ids),
             )
-            assert _mapped_count == self.num_experts_local, (
-                f"[hetero-moe diag] mapped expert count {_mapped_count} "
-                f"!= self.num_experts_local {self.num_experts_local}"
+            assert len(_mapped_global_ids) == self.num_experts_local, (
+                f"[hetero-moe diag] mapped global expert count "
+                f"{len(_mapped_global_ids)} != self.num_experts_local "
+                f"{self.num_experts_local}"
             )
-            assert _mapped_ids == list(range(first_expert_idx, last_expert_idx)), (
-                f"[hetero-moe diag] mapped global expert ids {_mapped_ids} "
-                f"!= expected range {list(range(first_expert_idx, last_expert_idx))}"
+            assert _mapped_global_ids == list(
+                range(first_expert_idx, last_expert_idx)
+            ), (
+                f"[hetero-moe diag] mapped global expert ids "
+                f"{_mapped_global_ids} != expected range "
+                f"{list(range(first_expert_idx, last_expert_idx))}"
+            )
+            assert _mapped_local_ids == list(range(self.num_experts_local)), (
+                f"[hetero-moe diag] mapped local expert ids "
+                f"{_mapped_local_ids} != expected range "
+                f"{list(range(self.num_experts_local))}"
             )
             self._hetero_map_checked = True
     else:
@@ -830,14 +843,20 @@ def _patched_ascend_fused_moe_init(self, *args, **kwargs):
             f"[hetero-moe diag] ascend_fused_moe_init mapped expert count "
             f"{_mapped_count} != local_num_experts {self.local_num_experts}"
         )
-        _mapped_ids = self._expert_map[self._expert_map != -1].tolist()
+        # expert_map maps global expert id (index) -> local expert id (value).
+        _mapped_global_ids = torch.where(self._expert_map != -1)[0].tolist()
+        _mapped_local_ids = self._expert_map[
+            self._expert_map != -1
+        ].tolist()
         _diag_logger.warning_once(
             "[hetero-moe diag] ascend_fused_moe_init local experts: "
-            "ep_size=%s ep_rank=%s local_num_experts=%s mapped_ids=%s",
+            "ep_size=%s ep_rank=%s local_num_experts=%s "
+            "mapped_global_ids=%s mapped_local_ids=%s",
             self.ep_size,
             self.ep_rank,
             self.local_num_experts,
-            str(_mapped_ids),
+            str(_mapped_global_ids),
+            str(_mapped_local_ids),
         )
     if self._expert_map is not None:
         logger.info_once(
