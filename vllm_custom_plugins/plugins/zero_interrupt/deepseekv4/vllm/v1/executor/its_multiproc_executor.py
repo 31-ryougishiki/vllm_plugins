@@ -725,6 +725,46 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
 
         return model_info
 
+    def _interrupt_inflight_worker_rpcs(self) -> None:
+        """Unblock worker RPCs that are stuck in the old DP world.
+
+        A full-restart strategy can arrive while the EngineCore busy loop is
+        blocked in a worker RPC (e.g. execute_dummy_batch) whose NPU task is
+        hanging on a collective that includes the faulted executor. Shutting
+        down the response queues makes the blocked dequeue raise, and the
+        patched collective_rpc converts that into a None response, so the
+        busy loop reaches _handle_shutdown and the full-restart barrier
+        without waiting for the ~240s NPU task timeout.
+
+        This method must never raise: it runs before recv_new_deployment is
+        set and before the busy-loop wakeup, so an exception here would block
+        the whole strategy handoff.
+        """
+        if hasattr(self, "_health_monitor") and self._health_monitor:
+            try:
+                self._health_monitor.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to stop health monitor before RPC interrupt: %s",
+                    exc,
+                )
+
+        interrupted = 0
+        for mq in list(getattr(self, "response_mqs", None) or []):
+            try:
+                mq.shutdown()
+                interrupted += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to shut down in-flight worker response queue: %s",
+                    exc,
+                )
+        logger.info(
+            "Inflight worker RPCs interrupted: %d response queues shut down "
+            "so the busy loop can reach the full-restart barrier.",
+            interrupted,
+        )
+
     def _on_deploy_strategy_received(self, strategy: DeployStrategy) -> None:
         """Callback when deployment strategy is received via HTTP.
 
@@ -733,6 +773,29 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         """
         logger.info(f"Received deployment strategy: {strategy.deploy_type.value}")
         self.current_strategy = strategy
+
+        # A full-restart strategy rebuilds the global worker world, so any
+        # worker RPC still running on the old world must not delay the
+        # EngineCore busy loop. Interrupt those RPCs before signaling the
+        # strategy: once recv_new_deployment is set the busy loop may start
+        # the restart and create new response queues, which must not be
+        # shut down.
+        full_restart = False
+        try:
+            full_restart = self._strategy_requires_full_restart(strategy)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Failed to determine whether strategy requires full restart",
+                exc_info=True,
+            )
+
+        if (
+            full_restart
+            and not self.recv_new_deployment.is_set()
+            and self.executor_state
+            in (ExecutorState.RUNNING, ExecutorState.WAITING_STRATEGY)
+        ):
+            self._interrupt_inflight_worker_rpcs()
 
         # Signal deployment event
         self.recv_new_deployment.set()
