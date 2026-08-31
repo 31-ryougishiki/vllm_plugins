@@ -147,9 +147,9 @@ def _patched_sync_metadata_across_dp(
             allow_dp_padding,
             is_draft_model,
             cudagraph_mode,
-            _diag_packed_tokens,
+            str(_diag_packed_tokens),
             max_tokens_across_dp,
-            num_tokens_after_padding.tolist(),
+            str(num_tokens_after_padding.tolist()),
         )
 
     return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode

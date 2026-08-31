@@ -56,7 +56,7 @@ def _hash_select_diag_once(
         tuple(input_ids.shape),
         moe_comm_type,
         flash_comm_v1_enabled,
-        per_dp_tp_sizes,
+        str(per_dp_tp_sizes),
     )
 
 
@@ -387,7 +387,7 @@ def _patched_token_dispatch_allgather(self, token_dispatch_input):
                 first_expert_idx,
                 last_expert_idx,
                 len(expert_map),
-                _mapped_ids,
+                str(_mapped_ids),
             )
             assert _mapped_count == self.num_experts_local, (
                 f"[hetero-moe diag] mapped expert count {_mapped_count} "
@@ -837,7 +837,7 @@ def _patched_ascend_fused_moe_init(self, *args, **kwargs):
             self.ep_size,
             self.ep_rank,
             self.local_num_experts,
-            _mapped_ids,
+            str(_mapped_ids),
         )
     if self._expert_map is not None:
         logger.info_once(
