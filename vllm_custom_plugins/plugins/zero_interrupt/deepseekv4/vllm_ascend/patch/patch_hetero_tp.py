@@ -15,6 +15,7 @@ Port of hetero_cp ``vllm_ascend/ascend_forward_context.py`` changes:
 from __future__ import annotations
 
 import math
+import os
 from contextlib import contextmanager
 from typing import Any
 
@@ -281,6 +282,14 @@ def _patched_select_a3_moe_comm_method(
     enable_fused_mc2: int,
 ):
     import vllm_ascend.ascend_forward_context as afc
+
+    if os.getenv("VLLM_ITS_A3_FORCE_ALLGATHER", "0") == "1":
+        from vllm.logger import init_logger as _init_logger
+
+        _init_logger(__name__).warning_once(
+            "A3 ALLGATHER force-enabled by env (DP metadata may change)"
+        )
+        return afc.MoECommType.ALLGATHER
 
     dispatch_ffn_combine_enable = get_ep_group().world_size <= 32
     num_experts = vllm_config.model_config.get_num_experts()

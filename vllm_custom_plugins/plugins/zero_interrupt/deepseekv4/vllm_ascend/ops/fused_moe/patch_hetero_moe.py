@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 _HETERO_MOE_PATCH_APPLIED = False
 _HASH_SELECT_DIAG_LOGGED = False
+_HASH_TOPK_DUMP_LOGGED = False
 
 
 def _hash_select_diag_once(
@@ -57,6 +58,37 @@ def _hash_select_diag_once(
         moe_comm_type,
         flash_comm_v1_enabled,
         str(per_dp_tp_sizes),
+    )
+
+
+def _hash_topk_dump_once(
+    _logger,
+    *,
+    input_ids,
+    topk_ids,
+    topk_weights,
+    moe_comm_type,
+):
+    """One-shot dump of the first real request's hash-routing topk.
+
+    Gated by VLLM_ITS_DUMP_HASH_TOPK=1 and a module-level flag so each
+    worker prints only the first non-profile hash call. This makes the
+    DP16 (default MC2) and DP15 (or forced-ALLGATHER) runs directly
+    comparable value by value.
+    """
+    import os as _os
+
+    global _HASH_TOPK_DUMP_LOGGED
+    if _HASH_TOPK_DUMP_LOGGED or _os.getenv("VLLM_ITS_DUMP_HASH_TOPK", "0") != "1":
+        return
+    _HASH_TOPK_DUMP_LOGGED = True
+    _logger.warning_once(
+        "[hetero-moe diag] hash topk dump: moe_comm_type=%s "
+        "input_ids16=%s topk_ids4=%s topk_weights4=%s",
+        moe_comm_type,
+        str(input_ids.detach().cpu().flatten()[:16].tolist()),
+        str(topk_ids.detach().cpu()[:4].float().tolist()),
+        str(topk_weights.detach().cpu()[:4].float().tolist()),
     )
 
 
@@ -692,6 +724,25 @@ def _patched_select_experts_with_fusion_ops(
             norm_type=2,
             out_flag=False,
         )
+        if (
+            tid2eid is not None
+            and not getattr(forward_context, "in_profile_run", False)
+        ):
+            import os as _os
+
+            if _os.getenv("VLLM_ITS_DUMP_HASH_TOPK", "0") == "1":
+                from vllm.logger import init_logger as _init_logger
+                from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm_ascend.ops.fused_moe import (  # noqa: E501
+                    patch_hetero_moe as _diag_mod,
+                )
+
+                _diag_mod._hash_topk_dump_once(
+                    _init_logger(__name__),
+                    input_ids=input_ids,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    moe_comm_type=forward_context.moe_comm_type,
+                )
         return topk_weights, topk_ids
     norm_type = 0 if scoring_func == "softmax" else 1
     if e_score_correction_bias is not None and e_score_correction_bias.dtype != router_logits.dtype:
