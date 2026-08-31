@@ -1475,6 +1475,26 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             # Step 1: Get KV cache specs from workers
             kv_cache_specs = self.get_kv_cache_specs()
             logger.info(f"Got kv_cache_specs: {len(kv_cache_specs)} workers")
+            _worker_block_sizes = []
+            for _i, _spec in enumerate(kv_cache_specs):
+                if _spec is None:
+                    _worker_block_sizes.append((_i, "None"))
+                elif isinstance(_spec, dict):
+                    _worker_block_sizes.append(
+                        (
+                            _i,
+                            [
+                                getattr(_v, "block_size", repr(_v))
+                                for _v in _spec.values()
+                            ],
+                        )
+                    )
+                else:
+                    _worker_block_sizes.append((_i, repr(_spec)))
+            logger.warning_once(
+                "[hetero-kv diag] worker kv_cache_specs block sizes: %s",
+                str(_worker_block_sizes),
+            )
             # [mzm] Add detailed logging for debugging KV cache spec issues
             for i, spec in enumerate(kv_cache_specs):
                 logger.debug(f"[mzm] kv_cache_specs[{i}]: type={type(spec).__name__}, "
@@ -1510,16 +1530,49 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
                 available_memory
             )
             logger.info(f"Generated kv_cache_configs: {len(kv_cache_configs)} configs")
+            _kv_config_desc = []
+            for _cfg in kv_cache_configs:
+                _groups = [
+                    getattr(
+                        getattr(_g, "kv_cache_spec", None),
+                        "block_size",
+                        repr(_g),
+                    )
+                    for _g in getattr(_cfg, "kv_cache_groups", [])
+                ]
+                _kv_config_desc.append(
+                    (getattr(_cfg, "num_blocks", None), _groups)
+                )
+            logger.warning_once(
+                "[hetero-kv diag] kv_cache_configs num_blocks/group "
+                "block_sizes: %s",
+                str(_kv_config_desc),
+            )
 
             # Step 4: Generate scheduler KV cache config and update vllm_config
             scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
             self.vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
             kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
-            if kv_cache_groups:
-                self.vllm_config.cache_config.block_size = min(
-                    g.kv_cache_spec.block_size for g in kv_cache_groups
-                )
+            # Do NOT take min(kv_cache_spec.block_size) here. DeepSeek-V4
+            # has heterogeneous per-group block sizes ({32,32,2,8}); min()
+            # would overwrite cache_config.block_size with 2 and the next
+            # restart would raise KeyError in _dsv4_block_sizes()[2].
+            # refresh_block_size() instead clamps the value to a legal
+            # DeepSeek-V4 block size (32/64/128).
+            from vllm_ascend.utils import refresh_block_size
+
+            refresh_block_size(self.vllm_config)
             self.vllm_config.validate_block_size()
+            logger.warning_once(
+                "[hetero-kv diag] executor kv config after refresh: "
+                "cache_config.block_size=%s "
+                "cache_config.num_gpu_blocks=%s scheduler_num_blocks=%s "
+                "len(kv_cache_groups)=%s",
+                self.vllm_config.cache_config.block_size,
+                self.vllm_config.cache_config.num_gpu_blocks,
+                scheduler_kv_cache_config.num_blocks,
+                len(kv_cache_groups),
+            )
 
             # Step 4.5: Rebuild the scheduler-side KVCacheManager from the
             # fresh config.  The scheduler was created before the restart and
@@ -1528,6 +1581,36 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             # contents belong to earlier requests ("coherent but unrelated"
             # completions).
             self._rebuild_scheduler_kv_cache_manager(scheduler_kv_cache_config)
+
+            # Step 4.7: Ascend Worker.initialize_from_config does not write
+            # self.cache_config.num_gpu_blocks from the passed KVCacheConfig
+            # (unlike the GPU worker), so the worker-side cache_config keeps
+            # the stale pre-restart value (e.g. 6928) and later allocation
+            # uses the wrong block count. initialize_cache is an existing
+            # worker RPC that updates num_gpu_blocks/num_cpu_blocks.
+            _first_kv_config = kv_cache_configs[0] if kv_cache_configs else None
+            logger.warning_once(
+                "[hetero-kv diag] before worker num_gpu_blocks sync: "
+                "executor=%s kv_cache_configs[0].num_blocks=%s",
+                self.vllm_config.cache_config.num_gpu_blocks,
+                getattr(_first_kv_config, "num_blocks", None),
+            )
+            try:
+                self.collective_rpc(
+                    "initialize_cache",
+                    args=(int(scheduler_kv_cache_config.num_blocks), 0),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to sync worker cache_config.num_gpu_blocks: %s",
+                    exc,
+                )
+            logger.warning_once(
+                "[hetero-kv diag] after worker num_gpu_blocks sync: "
+                "executor=%s kv_cache_configs[0].num_blocks=%s",
+                self.vllm_config.cache_config.num_gpu_blocks,
+                getattr(_first_kv_config, "num_blocks", None),
+            )
 
             # Step 5: Initialize workers with KV cache config
             self.initialize_from_config(kv_cache_configs)
