@@ -434,9 +434,16 @@ def patch_direct_register_custom_op():
         mutates_args=None,
         dispatch_key=None,
         tags=None,
+        target_lib=None,
+        **extra_kwargs,
     ):
-        check_key = f"{op_name}_{dispatch_key}"
-        if check_key in _registered_ops or _is_op_registered(f"vllm::{op_name}"):
+        # vLLM >= 0.23 会把 aiter/helion 等算子注册到独立的 Library，
+        # 调用方通过 target_lib 传入；该参数以及未来新增参数必须透传给
+        # 原函数，否则 ``functools.partial(direct_register_custom_op,
+        # target_lib=aiter_lib)`` 会在 import 期直接抛 TypeError。
+        namespace = getattr(target_lib, "ns", None) or "vllm"
+        check_key = f"{namespace}::{op_name}_{dispatch_key}"
+        if check_key in _registered_ops or _is_op_registered(f"{namespace}::{op_name}"):
             _registered_ops[check_key] = True
             return
         _registered_ops[check_key] = True
@@ -447,8 +454,11 @@ def patch_direct_register_custom_op():
             "mutates_args": mutates_args,
             "dispatch_key": dispatch_key,
         }
+        if target_lib is not None:
+            kwargs["target_lib"] = target_lib
         if tags is not None:
             kwargs["tags"] = tags
+        kwargs.update(extra_kwargs)
         return original_direct_register_custom_op(**kwargs)
     
     import vllm.utils.torch_utils
