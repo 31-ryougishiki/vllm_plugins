@@ -19,6 +19,10 @@ import torch
 from vllm.config import CUDAGraphMode
 
 _PATCHED = False
+_SAMPLE_DUMP_COUNT = 0
+_SAMPLE_DUMP_CAP = 2048
+_DP_META_DUMP_COUNT = 0
+_DP_META_DUMP_CAP = 2048
 
 
 def _patched_sync_metadata_across_dp(
@@ -152,6 +156,24 @@ def _patched_sync_metadata_across_dp(
             str(num_tokens_after_padding.tolist()),
         )
 
+    import os as _os
+    if _os.getenv("VLLM_ITS_DUMP_DP_META_EVERY", "0") == "1":
+        from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm_ascend.worker import (  # noqa: E501
+            patch_hetero_model_runner as _diag_mod,
+        )
+
+        _diag_mod._dp_meta_dump_every(
+            _init_logger(__name__),
+            num_tokens=num_tokens,
+            allow_dp_padding=allow_dp_padding,
+            is_draft_model=is_draft_model,
+            cudagraph_mode=cudagraph_mode,
+            packed_tokens=packed_tensor,
+            max_tokens_across_dp=max_tokens_across_dp,
+            num_tokens_after_padding=num_tokens_after_padding,
+            device_str=device_str,
+        )
+
     return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode
 
 
@@ -179,19 +201,137 @@ def _patched_profile_run(self):
         self.max_num_tokens = origin_max_num_tokens
 
 
+def _patched_sample_tokens(self, grammar_output):
+    """Optional per-step sampled-token dump for DP15-vs-DP16 triage.
+
+    Gated by VLLM_ITS_DUMP_SAMPLED_TOKENS=1.  The original ``sample_tokens``
+    is called unchanged; this wrapper only reads the returned sampled token
+    ids / draft ids afterwards so three identical requests can be compared
+    step by step without touching the sampler math.
+    """
+    import os as _os
+
+    _result = _ORIGINAL_SAMPLE_TOKENS(self, grammar_output)
+    if _os.getenv("VLLM_ITS_DUMP_SAMPLED_TOKENS", "0") != "1":
+        return _result
+
+    global _SAMPLE_DUMP_COUNT
+    if _SAMPLE_DUMP_COUNT >= _SAMPLE_DUMP_CAP:
+        return _result
+    _SAMPLE_DUMP_COUNT += 1
+
+    from vllm.logger import init_logger as _init_logger
+
+    _logger = _init_logger(__name__)
+
+    def _to_cpu_list(value, limit):
+        if value is None:
+            return None
+        if hasattr(value, "detach"):
+            value = value.detach().cpu()
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            _flat = []
+            for _v in value:
+                if isinstance(_v, (list, tuple)):
+                    _flat.extend(_v)
+                else:
+                    _flat.append(_v)
+            value = _flat
+        return list(value)[:limit]
+
+    _sampled = _draft = None
+    try:
+        _cpu_ids = getattr(_result, "sampled_token_ids_cpu", None)
+        _sampled = _to_cpu_list(
+            _cpu_ids if _cpu_ids is not None else getattr(
+                _result, "sampled_token_ids", None
+            ),
+            64,
+        )
+    except Exception as _exc:  # noqa: BLE001
+        _sampled = f"<unavailable: {type(_exc).__name__}>"
+    try:
+        _draft_ids = getattr(self, "_draft_token_ids", None)
+        _draft = _to_cpu_list(
+            _draft_ids if hasattr(_draft_ids, "cpu") else None,
+            64,
+        )
+    except Exception as _exc:  # noqa: BLE001
+        _draft = f"<unavailable: {type(_exc).__name__}>"
+    _logger.warning(
+        "[hetero-moe diag] sampled tokens #%s: num_reqs=%s sampled=%s draft=%s",
+        _SAMPLE_DUMP_COUNT,
+        getattr(getattr(self, "input_batch", None), "num_reqs", None),
+        str(_sampled),
+        str(_draft),
+    )
+    return _result
+
+
+def _dp_meta_dump_every(
+    _logger,
+    *,
+    num_tokens,
+    allow_dp_padding,
+    is_draft_model,
+    cudagraph_mode,
+    packed_tokens,
+    max_tokens_across_dp,
+    num_tokens_after_padding,
+    device_str,
+):
+    """Per-call DP metadata dump for cross-request shape triage.
+
+    The caller is a __code__-swapped function, so this helper lives in the
+    plugin module and is reached via an explicit module import.  Gated by
+    VLLM_ITS_DUMP_DP_META_EVERY=1 and capped so a long decode does not
+    flood dp logs.
+    """
+    import os as _os
+
+    global _DP_META_DUMP_COUNT
+    if (
+        _os.getenv("VLLM_ITS_DUMP_DP_META_EVERY", "0") != "1"
+        or _DP_META_DUMP_COUNT >= _DP_META_DUMP_CAP
+    ):
+        return
+    _DP_META_DUMP_COUNT += 1
+    _packed = packed_tokens.tolist()
+    _after = num_tokens_after_padding.tolist()
+    _logger.warning(
+        "[hetero-moe diag] dp-meta every#%s: num_tokens=%s allow_dp_padding=%s "
+        "is_draft_model=%s cudagraph_mode=%s device=%s packed=%s "
+        "max_across=%s after_padding=%s",
+        _DP_META_DUMP_COUNT,
+        num_tokens,
+        allow_dp_padding,
+        is_draft_model,
+        getattr(cudagraph_mode, "value", cudagraph_mode),
+        device_str,
+        str(_packed),
+        max_tokens_across_dp,
+        str(_after),
+    )
+
+
+_ORIGINAL_SAMPLE_TOKENS = None
 _ORIGINAL_PROFILE_RUN = None
 
 
 def apply_hetero_model_runner_patch():
-    global _PATCHED, _ORIGINAL_PROFILE_RUN
+    global _PATCHED, _ORIGINAL_PROFILE_RUN, _ORIGINAL_SAMPLE_TOKENS
     if _PATCHED:
         return
     import vllm_ascend.worker.model_runner_v1 as mod
 
     _ORIGINAL_PROFILE_RUN = mod.NPUModelRunner.profile_run
+    _ORIGINAL_SAMPLE_TOKENS = mod.NPUModelRunner.sample_tokens
     mod.NPUModelRunner._sync_metadata_across_dp.__code__ = (
         _patched_sync_metadata_across_dp.__code__
     )
     mod.__dict__["_ORIGINAL_PROFILE_RUN"] = _ORIGINAL_PROFILE_RUN
     mod.NPUModelRunner.profile_run = _patched_profile_run
+    mod.NPUModelRunner.sample_tokens = _patched_sample_tokens
     _PATCHED = True

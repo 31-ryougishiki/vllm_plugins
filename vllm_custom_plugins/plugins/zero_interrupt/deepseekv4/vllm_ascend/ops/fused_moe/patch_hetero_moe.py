@@ -28,7 +28,8 @@ import torch.nn.functional as F
 _HETERO_MOE_PATCH_APPLIED = False
 _HASH_SELECT_DIAG_LOGGED = False
 _HASH_TOPK_DUMP_LOGGED = False
-
+_HASH_TOPK_DUMP_COUNT = 0
+_HASH_TOPK_DUMP_CAP = 512
 
 def _hash_select_diag_once(
     _logger,
@@ -89,6 +90,50 @@ def _hash_topk_dump_once(
         str(input_ids.detach().cpu().flatten()[:16].tolist()),
         str(topk_ids.detach().cpu()[:4].float().tolist()),
         str(topk_weights.detach().cpu()[:4].float().tolist()),
+    )
+
+
+def _hash_topk_dump_every(
+    _logger,
+    *,
+    input_ids,
+    topk_ids,
+    topk_weights,
+    moe_comm_type,
+    router_rows,
+):
+    """Per-forward hash-topk dump for cross-request determinism triage.
+
+    Gated by VLLM_ITS_DUMP_HASH_TOPK_EVERY=1 and capped so a long
+    speculative decode does not flood the dp logs.  The dump is emitted for
+    every non-profile hash-select call, which lets us compare the same
+    prompt across repeated requests step by step: if the first-layer
+    prefill topk already differs between two identical requests, the
+    divergence starts in the input/hidden states before MoE; if the topk
+    rows agree but the generated text still differs, the divergence is
+    downstream (KV/attention, deeper layers, or speculative acceptance).
+    """
+    import os as _os
+
+    global _HASH_TOPK_DUMP_COUNT
+    if (
+        _os.getenv("VLLM_ITS_DUMP_HASH_TOPK_EVERY", "0") != "1"
+        or _HASH_TOPK_DUMP_COUNT >= _HASH_TOPK_DUMP_CAP
+    ):
+        return
+    _HASH_TOPK_DUMP_COUNT += 1
+    _ids = input_ids.detach().cpu().flatten()[:16].tolist()
+    _tk = topk_ids.detach().cpu()[:4].to(torch.int64).tolist()
+    _tw = topk_weights.detach().cpu()[:4].tolist()
+    _logger.warning(
+        "[hetero-moe diag] hash topk every#%s: moe_comm_type=%s rows=%s "
+        "input_ids16=%s topk_ids4=%s topk_weights4=%s",
+        _HASH_TOPK_DUMP_COUNT,
+        moe_comm_type,
+        router_rows,
+        str(_ids),
+        str(_tk),
+        str(_tw),
     )
 
 
@@ -742,6 +787,24 @@ def _patched_select_experts_with_fusion_ops(
                     topk_ids=topk_ids,
                     topk_weights=topk_weights,
                     moe_comm_type=forward_context.moe_comm_type,
+                )
+            if (
+                _os.getenv("VLLM_ITS_DUMP_HASH_TOPK_EVERY", "0") == "1"
+                and int(getattr(forward_context, "layer_idx", -1) or -1)
+                == 0
+            ):
+                from vllm.logger import init_logger as _init_logger
+                from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm_ascend.ops.fused_moe import (  # noqa: E501
+                    patch_hetero_moe as _diag_mod,
+                )
+
+                _diag_mod._hash_topk_dump_every(
+                    _init_logger(__name__),
+                    input_ids=input_ids,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    moe_comm_type=forward_context.moe_comm_type,
+                    router_rows=router_logits.shape[0],
                 )
         return topk_weights, topk_ids
     norm_type = 0 if scoring_func == "softmax" else 1
