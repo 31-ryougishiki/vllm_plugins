@@ -23,6 +23,7 @@ _SAMPLE_DUMP_COUNT = 0
 _SAMPLE_DUMP_CAP = 2048
 _DP_META_DUMP_COUNT = 0
 _DP_META_DUMP_CAP = 2048
+_IN_DUMMY_RUN = False
 
 
 def _patched_sync_metadata_across_dp(
@@ -317,21 +318,45 @@ def _dp_meta_dump_every(
 
 
 _ORIGINAL_SAMPLE_TOKENS = None
+_ORIGINAL_DUMMY_RUN = None
+
+
+def _patched_dummy_run(self, *args, **kwargs):
+    """Flag ``_dummy_run`` executions for the ALLGATHER MoE path.
+
+    Idle DP engines keep the collective world alive by continuously running
+    dummy batches.  MC2/FUSED_MC2 dispatch isolates those dummy rows per
+    source rank, but the ALLGATHER fallback pads every rank to
+    ``max_tokens_across_dp`` and then reduce-scatters: dummy rows from idle
+    ranks are summed into the real request's rows.  The flag published here
+    lets ``PrepareAndFinalizeWithAllGather.prepare`` zero the dummy
+    hidden/router contribution before the DP all-gather.
+    """
+    global _IN_DUMMY_RUN
+    _prev = _IN_DUMMY_RUN
+    _IN_DUMMY_RUN = True
+    try:
+        return _ORIGINAL_DUMMY_RUN(self, *args, **kwargs)
+    finally:
+        _IN_DUMMY_RUN = _prev
 _ORIGINAL_PROFILE_RUN = None
 
 
 def apply_hetero_model_runner_patch():
     global _PATCHED, _ORIGINAL_PROFILE_RUN, _ORIGINAL_SAMPLE_TOKENS
+    global _ORIGINAL_DUMMY_RUN
     if _PATCHED:
         return
     import vllm_ascend.worker.model_runner_v1 as mod
 
     _ORIGINAL_PROFILE_RUN = mod.NPUModelRunner.profile_run
     _ORIGINAL_SAMPLE_TOKENS = mod.NPUModelRunner.sample_tokens
+    _ORIGINAL_DUMMY_RUN = mod.NPUModelRunner._dummy_run
     mod.NPUModelRunner._sync_metadata_across_dp.__code__ = (
         _patched_sync_metadata_across_dp.__code__
     )
     mod.__dict__["_ORIGINAL_PROFILE_RUN"] = _ORIGINAL_PROFILE_RUN
     mod.NPUModelRunner.profile_run = _patched_profile_run
     mod.NPUModelRunner.sample_tokens = _patched_sample_tokens
+    mod.NPUModelRunner._dummy_run = _patched_dummy_run
     _PATCHED = True

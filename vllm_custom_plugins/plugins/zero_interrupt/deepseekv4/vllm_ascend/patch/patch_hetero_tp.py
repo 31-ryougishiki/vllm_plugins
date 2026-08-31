@@ -68,6 +68,22 @@ def _patched_set_ascend_forward_context(
         forward_context = get_forward_context()
         forward_context.draft_attn_metadatas = draft_attn_metadatas
         forward_context.input_ids = input_ids
+        try:
+            from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm_ascend.worker import (  # noqa: E501
+                patch_hetero_model_runner as _mrm_patch,
+            )
+
+            forward_context.is_dummy_run = bool(
+                getattr(_mrm_patch, "_IN_DUMMY_RUN", False)
+            )
+            if hasattr(forward_context, "additional_kwargs"):
+                forward_context.additional_kwargs["is_dummy_run"] = (
+                    forward_context.is_dummy_run
+                )
+        except Exception:  # noqa: BLE001 - patch not loaded yet
+            forward_context.is_dummy_run = False
+            if hasattr(forward_context, "additional_kwargs"):
+                forward_context.additional_kwargs["is_dummy_run"] = False
 
         import vllm_ascend.ascend_forward_context as afc
         from vllm_ascend.ops.fused_moe.moe_comm_method import (
@@ -377,7 +393,11 @@ def apply_hetero_forward_context_patch():
 
     # 允许 _EXTRA_CTX 代理读写异构 TP 的 per-DP token 布局字段。
     _extra_attrs = list(afc._ExtraForwardContextProxy.extra_attrs)
-    for _name in ("per_dp_padded_lengths", "per_dp_tp_sizes"):
+    for _name in (
+        "per_dp_padded_lengths",
+        "per_dp_tp_sizes",
+        "is_dummy_run",
+    ):
         if _name not in _extra_attrs:
             _extra_attrs.append(_name)
     afc._ExtraForwardContextProxy.extra_attrs = tuple(_extra_attrs)
