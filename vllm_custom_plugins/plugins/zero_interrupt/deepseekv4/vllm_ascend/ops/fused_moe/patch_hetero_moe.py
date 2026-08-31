@@ -26,6 +26,38 @@ import torch
 import torch.nn.functional as F
 
 _HETERO_MOE_PATCH_APPLIED = False
+_HASH_SELECT_DIAG_LOGGED = False
+
+
+def _hash_select_diag_once(
+    _logger,
+    *,
+    router_logits,
+    input_ids,
+    moe_comm_type,
+    flash_comm_v1_enabled,
+    per_dp_tp_sizes,
+):
+    """One-shot warning for the hash-select input alignment triage.
+
+    The caller is a __code__-swapped function and imports this helper inside
+    its own body; the flag lives here in the plugin module so no extra global
+    has to be injected into the patched vllm_ascend module.
+    """
+    global _HASH_SELECT_DIAG_LOGGED
+    if _HASH_SELECT_DIAG_LOGGED:
+        return
+    _HASH_SELECT_DIAG_LOGGED = True
+    _logger.warning_once(
+        "[hetero-moe diag] hash select input alignment: "
+        "router_logits=%s input_ids=%s moe_comm_type=%s "
+        "flash_comm_v1_enabled=%s per_dp_tp_sizes=%s",
+        tuple(router_logits.shape),
+        tuple(input_ids.shape),
+        moe_comm_type,
+        flash_comm_v1_enabled,
+        per_dp_tp_sizes,
+    )
 
 
 def _patch_code(target, new_func):
@@ -129,14 +161,59 @@ def _patched_prepare_allgather(
     if enable_sp() or enable_sp_by_pass() or getattr(_EXTRA_CTX, "per_dp_tp_sizes", None) is not None:
         return self._prepare_with_ep_group(hidden_states, router_logits, quant_type)
 
-    return self._prepare_with_dp_group(hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce)
+    prepare_output = self._prepare_with_dp_group(
+        hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce
+    )
+    _expected_rows = self.moe_config.dp_size * _EXTRA_CTX.max_tokens_across_dp
+    assert prepare_output.hidden_states.shape[0] == _expected_rows, (
+        f"[hetero-moe diag] prepare_allgather_dp gathered rows "
+        f"{prepare_output.hidden_states.shape[0]} != dp_size "
+        f"{self.moe_config.dp_size} * max_tokens_across_dp "
+        f"{_EXTRA_CTX.max_tokens_across_dp}"
+    )
+    if not getattr(self, "_prepare_allgather_diag_checked", False):
+        self._prepare_allgather_diag_checked = True
+        from vllm.logger import init_logger as _init_logger
+
+        _init_logger(__name__).warning_once(
+            "[hetero-moe diag] prepare_allgather_dp: local_rows=%s "
+            "max_tokens_across_dp=%s gathered_rows=%s",
+            hidden_states.shape[0],
+            _EXTRA_CTX.max_tokens_across_dp,
+            prepare_output.hidden_states.shape[0],
+        )
+    return prepare_output
 
 
 def _patched_finalize_allgather(self, hidden_states, reduce_results, padded_hidden_states_shape=None):
     if enable_sp() or enable_sp_by_pass() or getattr(_EXTRA_CTX, "per_dp_tp_sizes", None) is not None:
         return self._finalize_with_ep_group(hidden_states)
 
-    return self._finalize_with_dp_group(hidden_states, reduce_results)
+    _expected_rows = self.moe_config.dp_size * _EXTRA_CTX.max_tokens_across_dp
+    assert hidden_states.shape[0] == _expected_rows, (
+        f"[hetero-moe diag] finalize_allgather_dp input rows "
+        f"{hidden_states.shape[0]} != dp_size {self.moe_config.dp_size} "
+        f"* max_tokens_across_dp {_EXTRA_CTX.max_tokens_across_dp}"
+    )
+    out = self._finalize_with_dp_group(hidden_states, reduce_results)
+    if not self.enable_shared_expert_dp:
+        assert out.shape[0] == self.num_tokens, (
+            f"[hetero-moe diag] finalize_allgather_dp output rows "
+            f"{out.shape[0]} != self.num_tokens {self.num_tokens}"
+        )
+    if not getattr(self, "_finalize_allgather_diag_checked", False):
+        self._finalize_allgather_diag_checked = True
+        from vllm.logger import init_logger as _init_logger
+
+        _init_logger(__name__).warning_once(
+            "[hetero-moe diag] finalize_allgather_dp: input_rows=%s "
+            "expected_rows=%s output_rows=%s self.num_tokens=%s",
+            hidden_states.shape[0],
+            _expected_rows,
+            out.shape[0],
+            self.num_tokens,
+        )
+    return out
 
 
 def _patched_all_gather_input_id_with_dp_group(self, input_ids):
@@ -177,6 +254,11 @@ def _patched_all_gather_input_id_with_dp_group(self, input_ids):
             return get_ep_group().all_gather(input_ids, 0)
 
         max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
+        assert input_ids.shape[0] <= max_tokens_across_dp, (
+            f"[hetero-moe diag] input_ids rows {input_ids.shape[0]} exceed "
+            f"max_tokens_across_dp {max_tokens_across_dp}"
+        )
+        _local_input_rows = input_ids.shape[0]
         # NOTE: pad against the LOCAL input_ids length, not self.num_tokens.
         # In the EP-group prepare path self.num_tokens is set to the total
         # (gathered) token count, so the old reference never padded and the
@@ -204,7 +286,29 @@ def _patched_all_gather_input_id_with_dp_group(self, input_ids):
                 offset += tp_i * max_tokens_across_dp
             input_ids = torch.cat(parts, dim=0)
         else:
+            _log_input_gather = not getattr(
+                self, "_input_id_gather_diag_checked", False
+            )
             input_ids = self.moe_config.dp_group.all_gather(input_ids, 0)
+            assert input_ids.shape[0] == true_dp_size * max_tokens_across_dp, (
+                f"[hetero-moe diag] gathered input_ids rows "
+                f"{input_ids.shape[0]} != true_dp_size "
+                f"{true_dp_size} * max_tokens_across_dp "
+                f"{max_tokens_across_dp}"
+            )
+            if _log_input_gather:
+                self._input_id_gather_diag_checked = True
+                from vllm.logger import init_logger as _init_logger
+
+                _init_logger(__name__).warning_once(
+                    "[hetero-moe diag] input_id_dp_gather: local_rows=%s "
+                    "max_tokens_across_dp=%s self.num_tokens=%s "
+                    "gathered_rows=%s",
+                    _local_input_rows,
+                    max_tokens_across_dp,
+                    getattr(self, "num_tokens", None),
+                    input_ids.shape[0],
+                )
     return input_ids
 
 
@@ -263,6 +367,37 @@ def _patched_token_dispatch_allgather(self, token_dispatch_input):
         _rem = self.num_experts % self.ep_size
         first_expert_idx = _ep_rank * _base + min(_ep_rank, _rem)
         last_expert_idx = first_expert_idx + self.num_experts_local
+        if not getattr(self, "_hetero_map_checked", False):
+            # One-time NPU -> CPU sync: verify the remainder-aware expert
+            # range against the mapped expert ids.  This function is applied
+            # via __code__ replacement, so every new dependency must be a
+            # local import or a local variable.
+            from vllm.logger import init_logger as _init_logger
+
+            _diag_logger = _init_logger(__name__)
+            _mapped_count = int((expert_map != -1).sum().item())
+            _mapped_ids = expert_map[expert_map != -1].tolist()
+            _diag_logger.warning_once(
+                "[hetero-moe diag] token_dispatch_allgather expert map: "
+                "num_experts=%s ep_size=%s num_experts_local=%s first=%s "
+                "last=%s len(expert_map)=%s mapped_ids=%s",
+                self.num_experts,
+                self.ep_size,
+                self.num_experts_local,
+                first_expert_idx,
+                last_expert_idx,
+                len(expert_map),
+                _mapped_ids,
+            )
+            assert _mapped_count == self.num_experts_local, (
+                f"[hetero-moe diag] mapped expert count {_mapped_count} "
+                f"!= self.num_experts_local {self.num_experts_local}"
+            )
+            assert _mapped_ids == list(range(first_expert_idx, last_expert_idx)), (
+                f"[hetero-moe diag] mapped global expert ids {_mapped_ids} "
+                f"!= expected range {list(range(first_expert_idx, last_expert_idx))}"
+            )
+            self._hetero_map_checked = True
     else:
         first_expert_idx = 0
         last_expert_idx = self.num_experts_local
@@ -280,6 +415,30 @@ def _patched_token_dispatch_allgather(self, token_dispatch_input):
         act_quant_type=act_quant_type,
     )
     expert_tokens = expert_tokens.to(torch.int64)
+    # Cheap shape assert runs every call; the .item() diagnostics below sync
+    # only once per dispatcher instance.
+    assert expert_tokens.shape[0] == self.num_experts_local, (
+        f"[hetero-moe diag] npu_moe_init_routing returned "
+        f"expert_tokens.shape[0]={expert_tokens.shape[0]}, expected "
+        f"self.num_experts_local={self.num_experts_local}"
+    )
+    if not getattr(self, "_hetero_dispatch_shapes_checked", False):
+        from vllm.logger import init_logger as _init_logger
+
+        _init_logger(__name__).warning_once(
+            "[hetero-moe diag] token_dispatch_allgather shapes: "
+            "hidden_states=%s topk_ids=%s topk_min=%s topk_max=%s "
+            "sorted_hidden_states=%s expanded_row_idx=%s "
+            "expert_tokens_sum=%s",
+            tuple(hidden_states.shape),
+            tuple(topk_ids.shape),
+            int(topk_ids.min().item()),
+            int(topk_ids.max().item()),
+            tuple(sorted_hidden_states.shape),
+            tuple(expanded_row_idx.shape),
+            int(expert_tokens.sum().item()),
+        )
+        self._hetero_dispatch_shapes_checked = True
     group_list_type = 1  # `count` mode
 
     return MoETokenDispatchOutput(
@@ -479,6 +638,27 @@ def _patched_select_experts_with_fusion_ops(
                 chunk = input_ids.shape[0] // tp_size
                 input_ids = input_ids[tp_rank * chunk : (tp_rank + 1) * chunk].contiguous()
             input_ids = torch.where(input_ids == -1, 0, input_ids)
+            assert input_ids.shape[0] == router_logits.shape[0], (
+                f"[hetero-moe diag] hash select: input_ids rows "
+                f"{input_ids.shape[0]} != router_logits rows "
+                f"{router_logits.shape[0]}"
+            )
+            from vllm.logger import init_logger as _init_logger
+            from vllm_ascend.ascend_forward_context import (
+                _EXTRA_CTX as _diag_extra,
+            )
+            from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm_ascend.ops.fused_moe import (  # noqa: E501
+                patch_hetero_moe as _diag_mod,
+            )
+
+            _diag_mod._hash_select_diag_once(
+                _init_logger(__name__),
+                router_logits=router_logits,
+                input_ids=input_ids,
+                moe_comm_type=forward_context.moe_comm_type,
+                flash_comm_v1_enabled=forward_context.flash_comm_v1_enabled,
+                per_dp_tp_sizes=getattr(_diag_extra, "per_dp_tp_sizes", None),
+            )
         else:
             input_ids = None
             tid2eid_ones = None
@@ -638,6 +818,27 @@ def _patched_ascend_fused_moe_init(self, *args, **kwargs):
         self.local_num_experts += 1
     self.expert_map_manager._local_num_experts = self.local_num_experts
     self.expert_map_manager._expert_map = self._expert_map
+    if self._expert_map is not None:
+        # Whole-function __init__ binding keeps this module's globals, but
+        # import the logger locally anyway for consistency with the
+        # __code__-swapped diagnostics above.
+        from vllm.logger import init_logger as _init_logger
+
+        _diag_logger = _init_logger(__name__)
+        _mapped_count = int((self._expert_map != -1).sum().item())
+        assert _mapped_count == self.local_num_experts, (
+            f"[hetero-moe diag] ascend_fused_moe_init mapped expert count "
+            f"{_mapped_count} != local_num_experts {self.local_num_experts}"
+        )
+        _mapped_ids = self._expert_map[self._expert_map != -1].tolist()
+        _diag_logger.warning_once(
+            "[hetero-moe diag] ascend_fused_moe_init local experts: "
+            "ep_size=%s ep_rank=%s local_num_experts=%s mapped_ids=%s",
+            self.ep_size,
+            self.ep_rank,
+            self.local_num_experts,
+            _mapped_ids,
+        )
     if self._expert_map is not None:
         logger.info_once(
             "[fused_moe/layer] Expert parallelism is enabled."

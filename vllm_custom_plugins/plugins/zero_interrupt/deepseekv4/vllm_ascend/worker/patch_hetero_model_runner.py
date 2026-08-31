@@ -33,6 +33,9 @@ def _patched_sync_metadata_across_dp(
     from vllm.config import CUDAGraphMode as _CUDAGraphMode
     from vllm.logger import init_logger as _init_logger
 
+    _diag_packed_tokens = None
+    _log_dp_meta_once = False
+
     if self.dp_size == 1:
         return num_tokens, None, cudagraph_mode
 
@@ -100,6 +103,12 @@ def _patched_sync_metadata_across_dp(
     packed_tensor[0][self.dp_rank] = num_tokens
     packed_tensor[1][self.dp_rank] = cudagraph_mode.value
     dist.all_reduce(packed_tensor, group=group)
+    if not is_hetero and not getattr(self, "_dp_meta_diag_logged", False):
+        # One-time NPU -> CPU sync for triage only; the instance flag keeps
+        # every later call on the cheap path.
+        _diag_packed_tokens = packed_tensor[0].tolist()
+        _log_dp_meta_once = True
+        self._dp_meta_diag_logged = True
     if is_hetero:
         tp_sizes = [
             self.vllm_config.parallel_config.get_tp_size_for_dp(i)
@@ -127,6 +136,21 @@ def _patched_sync_metadata_across_dp(
         )
     else:
         num_tokens_after_padding = num_tokens_across_dp.cpu()
+
+    if _log_dp_meta_once:
+        _init_logger(__name__).warning_once(
+            "[hetero-moe diag] DP metadata sync: num_tokens=%s "
+            "allow_dp_padding=%s is_draft_model=%s cudagraph_mode=%s "
+            "packed_tokens=%s max_tokens_across_dp=%s "
+            "num_tokens_after_padding=%s",
+            num_tokens,
+            allow_dp_padding,
+            is_draft_model,
+            cudagraph_mode,
+            _diag_packed_tokens,
+            max_tokens_across_dp,
+            num_tokens_after_padding.tolist(),
+        )
 
     return max_tokens_across_dp, num_tokens_after_padding, synced_cudagraph_mode
 
