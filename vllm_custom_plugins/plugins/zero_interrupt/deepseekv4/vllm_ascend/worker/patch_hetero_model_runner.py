@@ -17,8 +17,39 @@ import math
 import torch
 
 from vllm.config import CUDAGraphMode
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _PATCHED = False
+
+
+def _indivisible_experts_fallback(self) -> bool:
+    """Return True when the number of experts no longer divides dp_size.
+
+    After a DP shrink (e.g. DP16 -> DP15 for a 256-expert model) the patched
+    A3 MoE communicator selector falls back to ALLGATHER for every token
+    count (see patch_hetero_tp.py). That turns off the skip path in
+    ``should_skip_allreduce_across_dp_group``, so ``_sync_metadata_across_dp``
+    performs a real DP all_reduce for the first time. Keep that all_reduce on
+    the NPU group in this case: the CPU gloo path may return dirty data on A3,
+    and a corrupt max_tokens_across_dp shifts the all-gathered input_ids
+    relative to hidden_states/router_logits in the hash-routed layers,
+    producing wrong experts.
+    """
+    try:
+        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+        if get_ascend_device_type() != AscendDeviceType.A3:
+            return False
+        num_experts = self.vllm_config.model_config.get_num_experts()
+        return (
+            isinstance(num_experts, int)
+            and num_experts > 0
+            and num_experts % self.dp_size != 0
+        )
+    except Exception:
+        return False
 
 
 def _patched_sync_metadata_across_dp(
@@ -50,18 +81,31 @@ def _patched_sync_metadata_across_dp(
             self.vllm_config.parallel_config, "is_heterogeneous_tp", False
         )
     )
+    # Older vllm-ascend wheels predating #10046 have no
+    # AscendConfig.dp_allreduce_on_npu attribute, so never read it directly.
+    dp_allreduce_on_npu = bool(
+        getattr(self.ascend_config, "dp_allreduce_on_npu", False)
+    )
     if is_hetero:
-        device_str = "npu" if self.ascend_config.dp_allreduce_on_npu else "cpu"
         group = (
             get_ep_group().device_group
-            if device_str == "npu" else get_ep_group().cpu_group
+            if dp_allreduce_on_npu else get_ep_group().cpu_group
         )
+        device_str = "npu" if dp_allreduce_on_npu else "cpu"
     else:
-        device_str, group = (
-            ("npu", get_dp_group().device_group)
-            if self.ascend_config.dp_allreduce_on_npu
-            else ("cpu", get_dp_group().cpu_group)
+        use_npu = dp_allreduce_on_npu or _indivisible_experts_fallback(self)
+        group = (
+            get_dp_group().device_group
+            if use_npu else get_dp_group().cpu_group
         )
+        device_str = "npu" if use_npu else "cpu"
+        if use_npu and not dp_allreduce_on_npu:
+            logger.warning_once(
+                "A3 remainder fallback: DP metadata all_reduce uses the "
+                "NPU device group (num_experts=%s, dp_size=%s).",
+                self.vllm_config.model_config.get_num_experts(),
+                self.dp_size,
+            )
     packed_tensor = torch.zeros(
         2, self.dp_size, device=device_str, dtype=torch.int32
     )
