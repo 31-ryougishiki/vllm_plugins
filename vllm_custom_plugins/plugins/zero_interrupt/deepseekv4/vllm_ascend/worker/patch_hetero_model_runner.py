@@ -102,6 +102,36 @@ def _patched_sync_metadata_across_dp(
                 self.vllm_config.model_config.get_num_experts(),
                 self.dp_size,
             )
+    # The ALLGATHER dummy-zero fix in PrepareAndFinalizeWithAllGather.prepare
+    # contains a Python conditional.  During FULL-graph capture that branch is
+    # evaluated once with is_dummy_run=True and the zeroing is baked into the
+    # captured graph; replaying that graph for a REAL request would zero real
+    # MoE inputs.  For the A3 indivisible-expert fallback, keep dummy/graph
+    # capture runs on FULL graphs but force REAL forwards to eager mode.
+    #
+    # This MUST be applied before the DP all_reduce: the real rank packs
+    # NONE into the shared mode tensor, `_post_process_cudagraph_mode` takes
+    # the min across ranks, and every rank (including the dummy ranks paired
+    # with this real request) then converges to NONE.  Forcing only the local
+    # real rank AFTER the all_reduce leaves dummy ranks on FULL, desynchronizes
+    # cudagraph_mode across the DP group, and deadlocks the following
+    # ALLGATHER MoE step.
+    try:
+        from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm_ascend.worker import (  # noqa: E501
+            patch_hetero_model_runner as _mrm_patch,
+        )
+
+        _is_dummy = bool(getattr(_mrm_patch, "_IN_DUMMY_RUN", False))
+    except Exception:  # noqa: BLE001 - patch module not loaded yet
+        _is_dummy = False
+    if indivisible_on_a3 and not is_hetero and not _is_dummy:
+        cudagraph_mode = _CUDAGraphMode.NONE
+        _init_logger(__name__).warning_once(
+            "A3 remainder fallback: forcing real forward to "
+            "cudagraph_mode=NONE (dummy-zero ALLGATHER graph is not "
+            "safe to replay for real requests)."
+        )
+
     packed_tensor = torch.zeros(
         2, self.dp_size, device=device_str, dtype=torch.int32
     )
@@ -132,28 +162,6 @@ def _patched_sync_metadata_across_dp(
     synced_cudagraph_mode = _CUDAGraphMode(
         mrm._post_process_cudagraph_mode(packed_tensor)
     )
-
-    # The ALLGATHER dummy-zero fix in PrepareAndFinalizeWithAllGather.prepare
-    # contains a Python conditional.  During FULL-graph capture that branch is
-    # evaluated once with is_dummy_run=True and the zeroing is baked into the
-    # captured graph; replaying that graph for a REAL request would zero real
-    # MoE inputs.  For the A3 indivisible-expert fallback, keep dummy/graph
-    # capture runs on FULL graphs but force REAL forwards to eager mode.
-    try:
-        from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm_ascend.worker import (  # noqa: E501
-            patch_hetero_model_runner as _mrm_patch,
-        )
-
-        _is_dummy = bool(getattr(_mrm_patch, "_IN_DUMMY_RUN", False))
-    except Exception:  # noqa: BLE001 - patch module not loaded yet
-        _is_dummy = False
-    if indivisible_on_a3 and not is_hetero and not _is_dummy:
-        synced_cudagraph_mode = _CUDAGraphMode.NONE
-        _init_logger(__name__).warning_once(
-            "A3 remainder fallback: forcing real forward to "
-            "cudagraph_mode=NONE (dummy-zero ALLGATHER graph is not "
-            "safe to replay for real requests)."
-        )
 
     if allow_dp_padding or is_draft_model:
         num_tokens_after_padding = torch.tensor(
