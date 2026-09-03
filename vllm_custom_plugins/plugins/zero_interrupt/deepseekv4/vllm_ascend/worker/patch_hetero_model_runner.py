@@ -23,7 +23,6 @@ _SAMPLE_DUMP_COUNT = 0
 _SAMPLE_DUMP_CAP = 2048
 _DP_META_DUMP_COUNT = 0
 _DP_META_DUMP_CAP = 2048
-_IN_DUMMY_RUN = False
 
 
 def _patched_sync_metadata_across_dp(
@@ -102,36 +101,6 @@ def _patched_sync_metadata_across_dp(
                 self.vllm_config.model_config.get_num_experts(),
                 self.dp_size,
             )
-    # The ALLGATHER dummy-zero fix in PrepareAndFinalizeWithAllGather.prepare
-    # contains a Python conditional.  During FULL-graph capture that branch is
-    # evaluated once with is_dummy_run=True and the zeroing is baked into the
-    # captured graph; replaying that graph for a REAL request would zero real
-    # MoE inputs.  For the A3 indivisible-expert fallback, keep dummy/graph
-    # capture runs on FULL graphs but force REAL forwards to eager mode.
-    #
-    # This MUST be applied before the DP all_reduce: the real rank packs
-    # NONE into the shared mode tensor, `_post_process_cudagraph_mode` takes
-    # the min across ranks, and every rank (including the dummy ranks paired
-    # with this real request) then converges to NONE.  Forcing only the local
-    # real rank AFTER the all_reduce leaves dummy ranks on FULL, desynchronizes
-    # cudagraph_mode across the DP group, and deadlocks the following
-    # ALLGATHER MoE step.
-    try:
-        from vllm_custom_plugins.plugins.zero_interrupt.deepseekv4.vllm_ascend.worker import (  # noqa: E501
-            patch_hetero_model_runner as _mrm_patch,
-        )
-
-        _is_dummy = bool(getattr(_mrm_patch, "_IN_DUMMY_RUN", False))
-    except Exception:  # noqa: BLE001 - patch module not loaded yet
-        _is_dummy = False
-    if indivisible_on_a3 and not is_hetero and not _is_dummy:
-        cudagraph_mode = _CUDAGraphMode.NONE
-        _init_logger(__name__).warning_once(
-            "A3 remainder fallback: forcing real forward to "
-            "cudagraph_mode=NONE (dummy-zero ALLGATHER graph is not "
-            "safe to replay for real requests)."
-        )
-
     packed_tensor = torch.zeros(
         2, self.dp_size, device=device_str, dtype=torch.int32
     )
@@ -251,16 +220,6 @@ def _patched_sample_tokens(self, grammar_output):
         return _result
     _SAMPLE_DUMP_COUNT += 1
 
-    # Debug-only: the async sampler output is copied to CPU on a separate
-    # stream.  Wait for that copy before reading the values, otherwise the
-    # dump shows the previous/uninitialized tensor contents.
-    try:
-        _event = getattr(_result, "async_copy_ready_event", None)
-        if _event is not None:
-            _event.synchronize()
-    except Exception:  # noqa: BLE001 - logging must not break sampling
-        pass
-
     from vllm.logger import init_logger as _init_logger
 
     _logger = _init_logger(__name__)
@@ -358,45 +317,21 @@ def _dp_meta_dump_every(
 
 
 _ORIGINAL_SAMPLE_TOKENS = None
-_ORIGINAL_DUMMY_RUN = None
-
-
-def _patched_dummy_run(self, *args, **kwargs):
-    """Flag ``_dummy_run`` executions for the ALLGATHER MoE path.
-
-    Idle DP engines keep the collective world alive by continuously running
-    dummy batches.  MC2/FUSED_MC2 dispatch isolates those dummy rows per
-    source rank, but the ALLGATHER fallback pads every rank to
-    ``max_tokens_across_dp`` and then reduce-scatters: dummy rows from idle
-    ranks are summed into the real request's rows.  The flag published here
-    lets ``PrepareAndFinalizeWithAllGather.prepare`` zero the dummy
-    hidden/router contribution before the DP all-gather.
-    """
-    global _IN_DUMMY_RUN
-    _prev = _IN_DUMMY_RUN
-    _IN_DUMMY_RUN = True
-    try:
-        return _ORIGINAL_DUMMY_RUN(self, *args, **kwargs)
-    finally:
-        _IN_DUMMY_RUN = _prev
 _ORIGINAL_PROFILE_RUN = None
 
 
 def apply_hetero_model_runner_patch():
     global _PATCHED, _ORIGINAL_PROFILE_RUN, _ORIGINAL_SAMPLE_TOKENS
-    global _ORIGINAL_DUMMY_RUN
     if _PATCHED:
         return
     import vllm_ascend.worker.model_runner_v1 as mod
 
     _ORIGINAL_PROFILE_RUN = mod.NPUModelRunner.profile_run
     _ORIGINAL_SAMPLE_TOKENS = mod.NPUModelRunner.sample_tokens
-    _ORIGINAL_DUMMY_RUN = mod.NPUModelRunner._dummy_run
     mod.NPUModelRunner._sync_metadata_across_dp.__code__ = (
         _patched_sync_metadata_across_dp.__code__
     )
     mod.__dict__["_ORIGINAL_PROFILE_RUN"] = _ORIGINAL_PROFILE_RUN
     mod.NPUModelRunner.profile_run = _patched_profile_run
     mod.NPUModelRunner.sample_tokens = _patched_sample_tokens
-    mod.NPUModelRunner._dummy_run = _patched_dummy_run
     _PATCHED = True

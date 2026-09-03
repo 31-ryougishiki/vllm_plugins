@@ -235,15 +235,6 @@ def _patched_prepare_allgather(
     # cannot be used here either — it is False for decode batches
     # (num_tokens <= 1000), which would silently fall into the broken
     # DP path.  The hetero-aware gates live in the custom ops.
-    if getattr(_EXTRA_CTX, "is_dummy_run", False):
-        # Idle DP engines keep the collective world alive by continuously
-        # executing dummy batches.  MC2/FUSED_MC2 dispatch isolates those
-        # dummy rows per source rank, but ALLGATHER pads every rank to
-        # max_tokens_across_dp and reduce-scatters, so dummy rows would be
-        # summed into the real request's rows.  Zero the dummy
-        # hidden/router contribution before it enters the gather.
-        hidden_states = torch.zeros_like(hidden_states)
-        router_logits = torch.zeros_like(router_logits)
     if enable_sp() or enable_sp_by_pass() or getattr(_EXTRA_CTX, "per_dp_tp_sizes", None) is not None:
         return self._prepare_with_ep_group(hidden_states, router_logits, quant_type)
 
