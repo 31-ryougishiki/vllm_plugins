@@ -203,6 +203,22 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         # Call parent class init
         super().__init__(vllm_config, monitor_workers)
 
+        # Record the block_size that was actually handed to the worker
+        # processes at spawn time.  During KV-cache setup EngineCore can
+        # later rewrite ``vllm_config.cache_config.block_size`` (it takes
+        # min(group block sizes) and the DeepSeek-V4 refresh clamps that to a
+        # legal value such as 32), but the already-running workers keep the
+        # original value (e.g. 128).  In PD-disaggregated mode only one side
+        # may restart; spawning replacement workers with the mutated value
+        # makes producer/consumer KV block topologies diverge and breaks
+        # Mooncake block-id mapping after the restart.
+        self._its_worker_block_size = self.vllm_config.cache_config.block_size
+        logger.info(
+            "Recorded worker cache_config.block_size=%s for zero-interrupt "
+            "worker restarts.",
+            self._its_worker_block_size,
+        )
+
     def _get_runtime_status(self) -> dict[str, Any]:
         """Return executor runtime fields for the ITS /status endpoint.
 
@@ -1380,6 +1396,12 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         """
         logger.info("Restarting all workers with current VllmConfig")
 
+        # Every worker restart path funnels through here.  Restore the
+        # spawn-time block_size before new workers are built so a
+        # single-side PD restart cannot change the local KV block topology
+        # while the other side keeps its old topology.
+        self._restore_worker_block_size_for_restart()
+
         try:
             # Heterogeneous TP (e.g. DP4TP4 -> DP4TP(3,4,4,4)) rebuilds the
             # global worker world and all MoE communication groups.  Before
@@ -1554,11 +1576,19 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
             self.vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
             kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
             # Do NOT take min(kv_cache_spec.block_size) here. DeepSeek-V4
-            # has heterogeneous per-group block sizes ({32,32,2,8}); min()
-            # would overwrite cache_config.block_size with 2 and the next
-            # restart would raise KeyError in _dsv4_block_sizes()[2].
-            # refresh_block_size() instead clamps the value to a legal
-            # DeepSeek-V4 block size (32/64/128).
+            # has heterogeneous per-group block sizes (e.g. {128,128,8,32}
+            # or {32,32,2,8}); min() would overwrite cache_config.block_size
+            # with an illegal value and the next restart would raise KeyError
+            # in _dsv4_block_sizes()[2].
+            #
+            # refresh_block_size() clamps the value to a legal DeepSeek-V4
+            # block size (32/64/128), but it must be fed the block_size
+            # recorded when the CURRENT workers were spawned
+            # (_restore_worker_block_size_for_restart already restored it),
+            # not the value EngineCore mutated after startup.  Otherwise a
+            # decode-only PD restart would rebuild workers at 32 while the
+            # untouched prefiller still uses 128, and Mooncake's per-group
+            # block-id alignment breaks.
             from vllm_ascend.utils import refresh_block_size
 
             refresh_block_size(self.vllm_config)
@@ -2168,6 +2198,34 @@ class ITSMultiprocExecutor(AscendMultiprocExecutor):
         # Reset futures queue
         self.futures_queue = deque[FutureWrapper]()
         logger.info("Message queues setup complete")
+
+    def _restore_worker_block_size_for_restart(self) -> None:
+        """Keep replacement workers on the same KV block topology.
+
+        The executor process and the already-running workers can disagree on
+        ``cache_config.block_size``: EngineCore mutates the executor-side copy
+        after the workers were spawned.  Replacement workers are built from the
+        executor-side VllmConfig, so restore the spawn-time value before
+        restarting.  This is critical for PD-disaggregated DeepSeek-V4: the
+        prefiller is not restarted by a decode-only degrade, and mixing a
+        freshly restarted decode side (block_size=32) with the untouched
+        prefiller (block_size=128) produces remote/local block-id lists of
+        different lengths, which crashes ``group_concurrent_contiguous``.
+        """
+        recorded = getattr(self, "_its_worker_block_size", None)
+        if recorded is None:
+            return
+        current = self.vllm_config.cache_config.block_size
+        if current == recorded:
+            return
+        logger.warning(
+            "Restoring cache_config.block_size %s -> %s before worker "
+            "restart so replacement workers keep the KV block topology of "
+            "the current workers.",
+            current,
+            recorded,
+        )
+        self.vllm_config.cache_config.block_size = recorded
 
     def _update_vllm_config_for_restart(self) -> None:
         """Update VllmConfig with current strategy before worker restart.
